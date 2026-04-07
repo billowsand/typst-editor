@@ -1,0 +1,8 @@
+node_modules
+dist
+target
+template
+.codex
+.claude
+CLAUDE.md
+tinymist-main
