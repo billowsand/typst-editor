@@ -1,9 +1,11 @@
-use crate::compiler::CompilerState;
+use crate::compiler::{CompileResult, CompilerState, OutlineItem, OutlinePosition};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use std::sync::mpsc::channel;
-use std::thread;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, State};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use typst::foundations::{Content, NativeElement, Packed, StyleChain};
 use typst::introspection::Introspector;
 use typst::layout::{Frame, FrameItem, Point, Position, Size};
@@ -32,15 +34,6 @@ pub struct JumpResult {
     pub position: Option<PositionResult>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct OutlineItem {
-    pub title: String,
-    pub level: usize,
-    pub file: Option<String>,
-    pub offset: Option<usize>,
-    pub position: Option<PositionResult>,
-}
-
 /// Return type for `export_pdf_dialog`: distinguishes cancel from success.
 #[derive(Debug, Serialize)]
 pub enum ExportResult {
@@ -66,8 +59,11 @@ pub fn open_file(
     file_path: String,
     content: String,
 ) -> Result<crate::compiler::CompileResult, String> {
+    let _guard = state.compile_lock();
     state.open(&file_path, &content)?;
-    Ok(state.update_file_and_compile(&file_path, &content))
+    let mut result = state.update_file_and_compile(&file_path, &content);
+    populate_outline(&state, &mut result);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -76,9 +72,12 @@ pub fn set_preview_entry(
     file_path: String,
     content: String,
 ) -> Result<crate::compiler::CompileResult, String> {
+    let _guard = state.compile_lock();
     state.open(&file_path, &content)?;
     state.pin_preview_entry(Some(&file_path))?;
-    Ok(state.update_file_and_compile(&file_path, &content))
+    let mut result = state.update_file_and_compile(&file_path, &content);
+    populate_outline(&state, &mut result);
+    Ok(result)
 }
 
 #[tauri::command]
@@ -147,34 +146,76 @@ pub async fn export_pdf_dialog(
 
 // ── Compilation ─────────────────────────────────────────────
 
+/// Atomic counter for compile request deduplication
+static COMPILE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 #[tauri::command]
 pub fn compile_current(
     state: State<'_, CompilerState>,
     file_path: String,
     content: String,
 ) -> crate::compiler::CompileResult {
-    // Spawn a dedicated thread for compilation to avoid blocking the UI.
-    // Results are sent back via channel and we block on receiving them.
-    let (tx, rx) = channel();
-    let inner = state.inner.clone();
+    let request_id = COMPILE_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
+    state.note_compile_request(request_id);
 
-    thread::spawn(move || {
-        let state = crate::compiler::CompilerState { inner };
-        let result = state.update_file_and_compile(&file_path, &content);
-        tx.send(result).ok();
-    });
+    let _guard = state.compile_lock();
+    {
+        let inner_state = state.inner.read();
+        if request_id < inner_state.current_request_id {
+            drop(inner_state);
+            let mut result = get_current_compilation_result(&state);
+            populate_outline(&state, &mut result);
+            return result;
+        }
+    }
 
-    // Block on the result - but the compilation is happening in the spawned thread
-    rx.recv()
-        .unwrap_or_else(|_| crate::compiler::CompileResult {
+    let mut result = state.update_file_and_compile_with_id(request_id, &file_path, &content);
+    populate_outline(&state, &mut result);
+    result
+}
+
+/// Get the current compilation result from the compiler state.
+fn get_current_compilation_result(
+    state: &State<'_, CompilerState>,
+) -> crate::compiler::CompileResult {
+    let compiler_state = state.inner.read();
+    if let Some(doc) = &compiler_state.document {
+        crate::compiler::CompileResult {
+            success: compiler_state.last_compile_ok,
+            page_count: doc.pages.len(),
+            page_hashes: compiler_state.page_hashes.clone(),
+            outline: vec![],
+            errors: vec![],
+            warnings: vec![],
+            duration_ms: 0,
+            entry_path: compiler_state
+                .preview_entry
+                .clone()
+                .map(|p| p.display().to_string()),
+        }
+    } else {
+        crate::compiler::CompileResult {
             success: false,
             page_count: 0,
             page_hashes: vec![],
-            errors: vec!["Channel error".into()],
+            outline: vec![],
+            errors: vec!["No document available".into()],
             warnings: vec![],
             duration_ms: 0,
             entry_path: None,
-        })
+        }
+    }
+}
+
+fn populate_outline(state: &State<'_, CompilerState>, result: &mut CompileResult) {
+    if !result.success {
+        result.outline.clear();
+        return;
+    }
+
+    result.outline = state
+        .with_document(|world, doc| build_document_outline(world, doc.introspector()))
+        .unwrap_or_default();
 }
 
 #[tauri::command]
@@ -457,7 +498,7 @@ fn build_document_outline(
                 level: heading.resolve_level(StyleChain::default()).get(),
                 file: has_location.then_some(file),
                 offset: has_location.then_some(offset),
-                position: Some(PositionResult {
+                position: Some(OutlinePosition {
                     page: doc_pos.page.get(),
                     x: doc_pos.point.x.to_pt(),
                     y: doc_pos.point.y.to_pt(),
@@ -469,6 +510,104 @@ fn build_document_outline(
 
 fn plain_outline_title(content: &Content) -> String {
     content.plain_text().trim().to_string()
+}
+
+// ── Font Discovery ──────────────────────────────────────────
+
+/// Return all font family names discovered by typst-kit's font searcher.
+/// Triggers font discovery if it hasn't run yet (uses the same global cache
+/// that the compiler uses, so there's no double-scan penalty).
+#[tauri::command]
+pub fn list_system_fonts() -> Vec<String> {
+    let fonts = crate::compiler::world::get_or_init_fonts();
+    let mut families: Vec<String> = fonts
+        .book
+        .families()
+        .map(|(name, _)| name.to_string())
+        .collect();
+    families.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    families.dedup();
+    families
+}
+
+// ── File System Operations ───────────────────────────────────
+
+/// Create a new empty file (creates parent directories as needed).
+#[tauri::command]
+pub fn create_file(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("Cannot create parent dirs: {e}"))?;
+    }
+    if p.exists() {
+        return Err(format!("File already exists: {path}"));
+    }
+    std::fs::File::create(p).map_err(|e| format!("Cannot create file: {e}"))?;
+    Ok(())
+}
+
+/// Create a directory (and all parent directories).
+#[tauri::command]
+pub fn create_directory(path: String) -> Result<(), String> {
+    std::fs::create_dir_all(&path).map_err(|e| format!("Cannot create directory: {e}"))
+}
+
+/// Delete a file or directory (directories are removed recursively).
+#[tauri::command]
+pub fn delete_path(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if p.is_dir() {
+        std::fs::remove_dir_all(p).map_err(|e| format!("Cannot delete directory: {e}"))
+    } else {
+        std::fs::remove_file(p).map_err(|e| format!("Cannot delete file: {e}"))
+    }
+}
+
+/// Rename or move a file or directory.
+#[tauri::command]
+pub fn rename_path(old_path: String, new_path: String) -> Result<(), String> {
+    if std::path::Path::new(&new_path).exists() {
+        return Err(format!("Target already exists: {new_path}"));
+    }
+    std::fs::rename(&old_path, &new_path).map_err(|e| format!("Cannot rename: {e}"))
+}
+
+/// Reveal a file or folder in the native file manager.
+#[tauri::command]
+pub fn reveal_in_explorer(path: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        // /select highlights the item; use the parent dir if it's a directory
+        let arg = if std::path::Path::new(&path).is_dir() {
+            path.clone()
+        } else {
+            format!("/select,{path}")
+        };
+        std::process::Command::new("explorer")
+            .raw_arg(&arg)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", &path])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let dir = std::path::Path::new(&path)
+            .parent()
+            .unwrap_or(std::path::Path::new("/"))
+            .to_string_lossy()
+            .into_owned();
+        std::process::Command::new("xdg-open")
+            .arg(&dir)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn effective_heading_span(heading: &Packed<HeadingElem>) -> Span {

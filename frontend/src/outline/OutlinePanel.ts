@@ -47,6 +47,10 @@ export function clearOutlinePanel(): void {
   renderOutlineState("empty", []);
 }
 
+export function setOutlineItems(items: OutlineItem[]): void {
+  renderOutlineState(items.length > 0 ? "ready" : "empty", items);
+}
+
 export function updateOutlineActiveItem(file: string | null, offset: number | null): void {
   activeFile = file;
   activeOffset = offset;

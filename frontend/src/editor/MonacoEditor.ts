@@ -14,17 +14,22 @@ import {
 } from "../preview/PreviewPanel";
 import {
   clearOutlinePanel,
-  refreshOutlinePanel,
+  setOutlineItems,
   updateOutlineActiveItem,
 } from "../outline/OutlinePanel";
 import { showEmptyWorkspace, showWorkspaceLayout } from "../workspace/WorkspaceShell";
 
 let editor: monaco.editor.IStandaloneCodeEditor | null = null;
+let onFileChangeCb: ((path: string | null) => void) | null = null;
+
+/** Register a callback that fires whenever the active file path changes. */
+export function onEditorFileChange(cb: (path: string | null) => void): void {
+  onFileChangeCb = cb;
+}
 let compileTimeout:    ReturnType<typeof setTimeout> | null = null;
 let cursorSyncTimeout: ReturnType<typeof setTimeout> | null = null;
 let selSyncTimeout:    ReturnType<typeof setTimeout> | null = null;
 let hoverSyncTimeout:  ReturnType<typeof setTimeout> | null = null;
-let outlineRefreshTimeout: ReturnType<typeof setTimeout> | null = null;
 let compileStatusTimeout: ReturnType<typeof setTimeout> | null = null;
 // Prevents sync loop when we programmatically move the editor cursor from a preview click
 // Use a counter instead of boolean to handle nested operations correctly
@@ -47,6 +52,18 @@ let previewHoverRequestId = 0;
 let previewHoverTargetKey = "";
 let sourceHoverDecorationIds: string[] = [];
 let sourceHoverTarget: { file: string; offset: number } | null = null;
+let latestCursorRequestId = 0;
+let offsetCache:
+  | {
+    model: monaco.editor.ITextModel;
+    versionId: number;
+    lineStartChars: number[];
+    lineStartBytes: number[];
+    eol: string;
+    eolCharLength: number;
+    eolByteLength: number;
+  }
+  | null = null;
 
 interface OpenDocument {
   path: string;
@@ -306,6 +323,7 @@ export function setCurrentFilePath(path: string | null): void {
   }
   updateStatusFile(path);
   renderTabs();
+  onFileChangeCb?.(path);
 }
 
 // ─── Zoom ─────────────────────────────────────────────────────────
@@ -328,6 +346,7 @@ interface CompileResult {
   success: boolean;
   page_count: number;
   page_hashes: number[];
+  outline: import("../outline/OutlinePanel").OutlineItem[];
   errors: string[];
   duration_ms?: number;
   entry_path?: string | null;
@@ -369,10 +388,13 @@ export async function compileAndPreview(): Promise<void> {
       lastSuccessfulPageCount = result.page_count;
       updatePageStatus(result.page_count);
       await renderAllPages(result.page_count, result.page_hashes);
-      scheduleOutlineRefresh();
+      setOutlineItems(result.outline ?? []);
+      syncOutlineActiveFromEditor();
       updateStatus("success",
         `Compiled in ${result.duration_ms ?? "?"}ms · ${result.page_count} page(s)`);
       clearDiagnostics();
+    } else if (isTransientCompileResult(result)) {
+      updateStatus("compiling", "Syncing preview…");
     } else {
       updatePageStatus(0);
       clearOutlinePanel();
@@ -393,16 +415,6 @@ function scheduleCompile(delay = 650): void {
   compileTimeout = setTimeout(() => {
     compileTimeout = null;
     void compileAndPreview();
-  }, delay);
-}
-
-function scheduleOutlineRefresh(delay = 120): void {
-  if (outlineRefreshTimeout) clearTimeout(outlineRefreshTimeout);
-  outlineRefreshTimeout = setTimeout(() => {
-    outlineRefreshTimeout = null;
-    void refreshOutlinePanel().then(() => {
-      syncOutlineActiveFromEditor();
-    });
   }, delay);
 }
 
@@ -467,12 +479,12 @@ async function saveCurrentFile(): Promise<void> {
       updateStatus("error", result.errors.join("; "));
       return;
     }
-    resetPreviewState();
     previewEntryPath = result.entry_path ?? previewEntryPath;
     lastSuccessfulPageCount = result.page_count;
     updatePageStatus(result.page_count);
     await renderAllPages(result.page_count, result.page_hashes);
-    scheduleOutlineRefresh();
+    setOutlineItems(result.outline ?? []);
+    syncOutlineActiveFromEditor();
     updateStatus("success", "Saved");
   } catch (e) {
     updateStatus("error", `Save failed: ${e}`);
@@ -511,7 +523,7 @@ export async function jumpToFileOffset(
   if (!model) return;
 
   // offset from Rust is a UTF-8 byte offset; Monaco needs a UTF-16 char offset
-  const charOffset = utf8ByteOffsetToMonacoOffset(model.getValue(), offset);
+  const charOffset = utf8ByteOffsetToMonacoOffset(model, offset);
   const pos = model.getPositionAt(charOffset);
   suppressCursorSync++;
   editor.setPosition(pos);
@@ -533,7 +545,7 @@ export async function revealSourceOffsetInPreview(
   if (!model || currentFilePath !== path) return;
 
   // offset from Rust is a UTF-8 byte offset; Monaco needs a UTF-16 char offset
-  const charOffset = utf8ByteOffsetToMonacoOffset(model.getValue(), offset);
+  const charOffset = utf8ByteOffsetToMonacoOffset(model, offset);
   const pos = model.getPositionAt(charOffset);
   try {
     const positions = await invoke<PagePos[]>("jump_from_cursor", {
@@ -560,10 +572,97 @@ export async function revealSourceOffsetInPreview(
 
 /**
  * Convert a UTF-8 byte offset (from Rust/Typst) to a Monaco/JS character offset.
- * Walks the text character-by-character, counting UTF-8 bytes, until reaching
- * the target byte count.
+ * Uses cached line start indices so large documents don't rescan the whole text.
  */
-function utf8ByteOffsetToMonacoOffset(text: string, byteOffset: number): number {
+function utf8ByteOffsetToMonacoOffset(model: monaco.editor.ITextModel, byteOffset: number): number {
+  const cache = getOffsetCache(model);
+  const lineIndex = findFloorIndex(cache.lineStartBytes, byteOffset);
+  const lineNumber = lineIndex + 1;
+  const lineText = model.getLineContent(lineNumber);
+  const lineStartChar = cache.lineStartChars[lineIndex] ?? 0;
+  const lineStartByte = cache.lineStartBytes[lineIndex] ?? 0;
+  const lineByteLength = utf8BytesForText(lineText);
+  const localByteOffset = Math.max(0, byteOffset - lineStartByte);
+
+  if (localByteOffset <= lineByteLength) {
+    return lineStartChar + utf8ByteOffsetInTextToCharOffset(lineText, localByteOffset);
+  }
+
+  const eolByteOffset = Math.min(localByteOffset - lineByteLength, cache.eolByteLength);
+  return lineStartChar + lineText.length + utf8ByteOffsetInTextToCharOffset(cache.eol, eolByteOffset);
+}
+
+/**
+ * Convert a Monaco/JS character offset to a UTF-8 byte offset (for Rust/Typst).
+ */
+function monacoOffsetToUtf8ByteOffset(model: monaco.editor.ITextModel, charOffset: number): number {
+  const cache = getOffsetCache(model);
+  const lineIndex = findFloorIndex(cache.lineStartChars, charOffset);
+  const lineNumber = lineIndex + 1;
+  const lineText = model.getLineContent(lineNumber);
+  const lineStartChar = cache.lineStartChars[lineIndex] ?? 0;
+  const lineStartByte = cache.lineStartBytes[lineIndex] ?? 0;
+  const localCharOffset = Math.max(0, charOffset - lineStartChar);
+
+  if (localCharOffset <= lineText.length) {
+    return lineStartByte + utf8BytesForText(lineText.slice(0, localCharOffset));
+  }
+
+  const eolCharOffset = Math.min(localCharOffset - lineText.length, cache.eolCharLength);
+  return lineStartByte + utf8BytesForText(lineText) + utf8BytesForText(cache.eol.slice(0, eolCharOffset));
+}
+
+function getOffsetCache(model: monaco.editor.ITextModel): NonNullable<typeof offsetCache> {
+  const versionId = model.getVersionId();
+  if (offsetCache?.model === model && offsetCache.versionId === versionId) {
+    return offsetCache;
+  }
+
+  const lineCount = model.getLineCount();
+  const eol = model.getEOL();
+  const eolCharLength = eol.length;
+  const eolByteLength = utf8BytesForText(eol);
+  const lineStartChars = new Array<number>(lineCount);
+  const lineStartBytes = new Array<number>(lineCount);
+  let charCursor = 0;
+  let byteCursor = 0;
+
+  for (let i = 1; i <= lineCount; i++) {
+    const index = i - 1;
+    lineStartChars[index] = charCursor;
+    lineStartBytes[index] = byteCursor;
+    const lineText = model.getLineContent(i);
+    charCursor += lineText.length;
+    byteCursor += utf8BytesForText(lineText);
+    if (i !== lineCount) {
+      charCursor += eolCharLength;
+      byteCursor += eolByteLength;
+    }
+  }
+
+  offsetCache = { model, versionId, lineStartChars, lineStartBytes, eol, eolCharLength, eolByteLength };
+  return offsetCache;
+}
+
+function utf8BytesForText(text: string): number {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xD800 && code < 0xDC00) {
+      bytes += 4;
+      i++;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function utf8ByteOffsetInTextToCharOffset(text: string, byteOffset: number): number {
   let bytes = 0;
   let i = 0;
   while (i < text.length && bytes < byteOffset) {
@@ -573,9 +672,8 @@ function utf8ByteOffsetToMonacoOffset(text: string, byteOffset: number): number 
     } else if (code < 0x800) {
       bytes += 2;
     } else if (code >= 0xD800 && code < 0xDC00) {
-      // Surrogate pair — 4 UTF-8 bytes, 2 UTF-16 code units
       bytes += 4;
-      i++; // skip low surrogate (outer loop adds 1 more → total advance = 2)
+      i++;
     } else {
       bytes += 3;
     }
@@ -584,25 +682,22 @@ function utf8ByteOffsetToMonacoOffset(text: string, byteOffset: number): number 
   return i;
 }
 
-/**
- * Convert a Monaco/JS character offset to a UTF-8 byte offset (for Rust/Typst).
- */
-function monacoOffsetToUtf8ByteOffset(text: string, charOffset: number): number {
-  let bytes = 0;
-  for (let i = 0; i < charOffset && i < text.length; i++) {
-    const code = text.charCodeAt(i);
-    if (code < 0x80) {
-      bytes += 1;
-    } else if (code < 0x800) {
-      bytes += 2;
-    } else if (code >= 0xD800 && code < 0xDC00) {
-      bytes += 4; // surrogate pair
-      i++;        // skip low surrogate
+function findFloorIndex(values: number[], target: number): number {
+  let low = 0;
+  let high = values.length - 1;
+  let best = 0;
+
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    if (values[mid] <= target) {
+      best = mid;
+      low = mid + 1;
     } else {
-      bytes += 3;
+      high = mid - 1;
     }
   }
-  return bytes;
+
+  return best;
 }
 
 // ─── Bidirectional Sync ───────────────────────────────────────────
@@ -618,12 +713,15 @@ async function syncCursorToPreview(position: monaco.Position): Promise<void> {
   if (lastSuccessfulPageCount === 0) return;
   if (Date.now() - lastEditTime < 400) return;
 
+  const requestId = ++latestCursorRequestId;
   try {
     const positions = await invoke<PagePos[]>("jump_from_cursor", {
       filePath: currentFilePath,
       line: position.lineNumber - 1,
       character: position.column - 1,
     });
+    // Discard stale responses
+    if (requestId !== latestCursorRequestId) return;
     const previewPos = pickBestPreviewPosition(positions);
     if (previewPos) {
       highlightCursorInPreview(previewPos, { scroll: false, persistent: true });
@@ -887,9 +985,8 @@ function applySourceHoverDecoration(file: string, offset: number): void {
   if (!model) return;
 
   // offset from Rust is UTF-8 bytes; convert to Monaco UTF-16 char offset
-  const text = model.getValue();
-  const charStart = utf8ByteOffsetToMonacoOffset(text, offset);
-  const charEnd   = utf8ByteOffsetToMonacoOffset(text, offset + 1);
+  const charStart = utf8ByteOffsetToMonacoOffset(model, offset);
+  const charEnd   = utf8ByteOffsetToMonacoOffset(model, offset + 1);
   const start = model.getPositionAt(charStart);
   const end   = model.getPositionAt(charEnd);
   sourceHoverDecorationIds = editor.deltaDecorations(sourceHoverDecorationIds, [{
@@ -928,7 +1025,7 @@ function syncOutlineActiveFromEditor(): void {
   // getOffsetAt returns a UTF-16 char offset; convert to UTF-8 byte offset
   // so it can be compared correctly against Rust/Typst outline item offsets
   const charOffset = model.getOffsetAt(pos);
-  const byteOffset = monacoOffsetToUtf8ByteOffset(model.getValue(), charOffset);
+  const byteOffset = monacoOffsetToUtf8ByteOffset(model, charOffset);
   updateOutlineActiveItem(currentFilePath, byteOffset);
 }
 
@@ -1052,12 +1149,16 @@ async function closeCurrentTab(): Promise<void> {
   await closeDocument(doc.path);
 }
 
-async function closeDocument(path: string): Promise<void> {
+/**
+ * Close a document and return true if successful, false if cancelled by user.
+ * This function is exported for use by FileTree during rename/delete operations.
+ */
+async function closeDocument(path: string): Promise<boolean> {
   const doc = openDocuments.get(path);
-  if (!doc) return;
+  if (!doc) return true;
 
   if (doc.dirty && !window.confirm(`"${doc.path.split(/[\\/]/).pop()}" 有未保存修改，确定关闭吗？`)) {
-    return;
+    return false; // User cancelled
   }
 
   const wasActive = currentFilePath === path;
@@ -1080,7 +1181,7 @@ async function closeDocument(path: string): Promise<void> {
     updateStatus("success", "Ready");
     await invoke("reset_session");
     showEmptyWorkspace();
-    return;
+    return true;
   }
 
   if (wasActive) {
@@ -1090,6 +1191,37 @@ async function closeDocument(path: string): Promise<void> {
   } else {
     renderTabs();
   }
+  return true;
+}
+
+/**
+ * Close all documents under a given directory path (including subdirectories).
+ * Returns true if all documents were closed successfully, false if any closure was cancelled.
+ * This function is exported for use by FileTree during directory rename/delete operations.
+ */
+export async function closeDocumentsUnderPath(dirPath: string): Promise<boolean> {
+  const sep = dirPath.includes("\\") ? "\\" : "/";
+  const normalizedDirPath = dirPath.endsWith(sep) ? dirPath : dirPath + sep;
+
+  // Find all documents under this directory
+  const docsToClose: string[] = [];
+  for (const [path, doc] of openDocuments.entries()) {
+    const normalizedDocPath = path.endsWith(sep) ? path : path + sep;
+    if (normalizedDocPath.startsWith(normalizedDirPath)) {
+      docsToClose.push(path);
+    }
+  }
+
+  // Close documents in reverse order (so the currently open one is closed last)
+  for (const path of docsToClose.reverse()) {
+    const closed = await closeDocument(path);
+    if (!closed) {
+      // User cancelled - abort the operation
+      return false;
+    }
+  }
+
+  return true;
 }
 
 async function compileOpenDocument(doc: OpenDocument): Promise<void> {
@@ -1105,10 +1237,12 @@ async function compileOpenDocument(doc: OpenDocument): Promise<void> {
       lastSuccessfulPageCount = result.page_count;
       updatePageStatus(result.page_count);
       await renderAllPages(result.page_count, result.page_hashes);
-      scheduleOutlineRefresh();
+      setOutlineItems(result.outline ?? []);
       updateStatus("success", `Compiled · ${result.page_count} page(s)`);
       clearDiagnostics();
       syncOutlineActiveFromEditor();
+    } else if (isTransientCompileResult(result)) {
+      updateStatus("compiling", "Syncing preview…");
     } else {
       updatePageStatus(0);
       clearOutlinePanel();
@@ -1143,7 +1277,7 @@ async function setCurrentDocumentAsPreviewEntry(): Promise<void> {
     lastSuccessfulPageCount = result.page_count;
     updatePageStatus(result.page_count);
     await renderAllPages(result.page_count, result.page_hashes);
-    scheduleOutlineRefresh();
+    setOutlineItems(result.outline ?? []);
     updateStatus("success", "Preview entry updated");
     clearDiagnostics();
     syncOutlineActiveFromEditor();
@@ -1325,6 +1459,9 @@ function registerTypstLanguage(): void {
   });
 }
 
+// ─── Re-exports for FileTree ──────────────────────────────────────
+export { closeDocument };
+
 // ─── UI Helpers ───────────────────────────────────────────────────
 export function updateStatus(type: "success" | "error" | "compiling", message: string): void {
   const el = document.getElementById("compile-status");
@@ -1354,6 +1491,16 @@ function updatePageStatus(pageCount: number): void {
 function updateZoomStatus(zoom: number): void {
   const el = document.getElementById("status-zoom-bar");
   if (el) el.textContent = `${Math.round(zoom * 100)}%`;
+}
+
+function isTransientCompileResult(result: CompileResult): boolean {
+  if (result.success || result.errors.length === 0) return false;
+  return result.errors.some((err) =>
+    err.includes("Stale compilation request")
+    || err.includes("Stale compilation result discarded")
+    || err.includes("No pending content available")
+    || err.includes("Lock acquisition failed for pending compilation")
+  );
 }
 
 function clearDiagnostics(): void {

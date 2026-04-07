@@ -18,6 +18,12 @@ use typst_kit::package::{default_package_cache_path, default_package_path};
 /// Global font cache – searched once, reused forever.
 static FONTS: OnceLock<Fonts> = OnceLock::new();
 
+/// Initialize (if needed) and return the global font set.
+/// Called by both the compiler and the `list_system_fonts` command.
+pub fn get_or_init_fonts() -> &'static Fonts {
+    FONTS.get_or_init(|| FontSearcher::new().search())
+}
+
 /// Implements `typst::World` for the editor.
 ///
 /// Resolves files relative to a project root directory (the parent of the
@@ -122,6 +128,16 @@ impl TypstWorld {
     /// Get the project root directory.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub fn main_path(&self) -> &Path {
+        &self.main_path
+    }
+
+    pub fn reset_touched_paths(&mut self) {
+        let mut touched = self.touched_paths.lock();
+        touched.clear();
+        touched.insert(self.main_path.clone());
     }
 
     pub fn source_by_path(&self, file_path: &str) -> Option<Source> {

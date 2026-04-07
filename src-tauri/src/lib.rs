@@ -28,6 +28,12 @@ pub fn run() {
             commands::get_document_outline,
             commands::resolve_project_root,
             commands::list_dir,
+            commands::list_system_fonts,
+            commands::create_file,
+            commands::create_directory,
+            commands::delete_path,
+            commands::rename_path,
+            commands::reveal_in_explorer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

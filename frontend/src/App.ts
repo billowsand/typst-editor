@@ -2,9 +2,10 @@ import {
   initEditor, getEditor, setZoom, getZoom,
   setMonacoTheme, setEditorFont,
   pickFilePath, openFileAtPath, hasUnsavedDocuments, jumpToFileOffset, revealSourceOffsetInPreview,
+  onEditorFileChange,
 } from "./editor/MonacoEditor";
 import { initPreview } from "./preview/PreviewPanel";
-import { initFileTree, loadTree } from "./file-tree/FileTree";
+import { initFileTree, loadTree, setTreeActiveFile } from "./file-tree/FileTree";
 import { initOutlinePanel, type OutlineItem } from "./outline/OutlinePanel";
 import { initWorkspaceShell } from "./workspace/WorkspaceShell";
 import { invoke } from "@tauri-apps/api/core";
@@ -12,22 +13,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 
 // ─── Types ────────────────────────────────────────────────────────
 type Theme = "light" | "dark";
-
-// ─── Font catalogue ───────────────────────────────────────────────
-const FONT_FAMILIES: Record<string, string> = {
-  system:    "ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace",
-  fira:      "'Fira Code', monospace",
-  jetbrains: "'JetBrains Mono', monospace",
-  cascadia:  "'Cascadia Code', monospace",
-  source:    "'Source Code Pro', monospace",
-  ibm:       "'IBM Plex Mono', monospace",
-  roboto:    "'Roboto Mono', monospace",
-  menlo:     "Menlo, monospace",
-  monaco:    "'Monaco', monospace",
-  consolas:  "Consolas, monospace",
-  courier:   "'Courier New', Courier, monospace",
-  custom:    "",
-};
 
 // ─── Preference helpers ───────────────────────────────────────────
 function pref(key: string, fallback: string): string {
@@ -39,9 +24,17 @@ function setPref(key: string, val: string): void {
 }
 
 function savedTheme(): Theme    { return pref("theme", "dark") as Theme; }
-function savedFontKey(): string { return pref("font-key", "system"); }
-function savedFontSize(): number { return parseInt(pref("font-size", "14"), 10); }
-function savedCustomFont(): string { return pref("font-custom", ""); }
+function savedFontFamily(): string { return pref("font-family", ""); }
+function savedFontSize(): number   { return parseInt(pref("font-size", "14"), 10); }
+
+// Common monospace fonts pinned at top of the font list for fast access
+const PINNED_FONTS = [
+  "JetBrains Mono", "Fira Code", "Cascadia Code", "Source Code Pro",
+  "IBM Plex Mono", "Roboto Mono", "Menlo", "Monaco", "Consolas",
+  "Courier New", "SF Mono",
+];
+
+const SYSTEM_FALLBACK = "ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace";
 
 // ─── Theme ────────────────────────────────────────────────────────
 function applyTheme(theme: Theme): void {
@@ -53,18 +46,10 @@ function applyTheme(theme: Theme): void {
 }
 
 // ─── Font ─────────────────────────────────────────────────────────
-function applyFont(key: string, size: number, customName?: string): void {
-  let css: string;
-  if (key === "custom") {
-    const name = customName ?? savedCustomFont();
-    css = name ? `'${name}', monospace` : FONT_FAMILIES.system;
-  } else {
-    css = FONT_FAMILIES[key] ?? FONT_FAMILIES.system;
-  }
-  setPref("font-key", key);
+function applyFont(family: string, size: number): void {
+  const css = family ? `'${family}', monospace` : SYSTEM_FALLBACK;
+  setPref("font-family", family);
   setPref("font-size", String(size));
-  if (key === "custom" && customName) setPref("font-custom", customName);
-  setPref("font-css", css);
   setEditorFont(css, size);
 }
 
@@ -80,7 +65,6 @@ export function createApp(): {
 
   const themeIcon = savedTheme() === "dark" ? "☀" : "🌙";
   const fontSize  = savedFontSize();
-  const fontKey   = savedFontKey();
 
   // ── Toolbar ──────────────────────────────────────────────────────
   const toolbar = document.createElement("div");
@@ -129,26 +113,22 @@ export function createApp(): {
 
         <div class="settings-group">
           <div class="settings-section-title">编辑器字体</div>
-          <select id="font-family-select">
-            <option value="system">System Default</option>
-            <option value="fira">Fira Code</option>
-            <option value="jetbrains">JetBrains Mono</option>
-            <option value="cascadia">Cascadia Code</option>
-            <option value="source">Source Code Pro</option>
-            <option value="ibm">IBM Plex Mono</option>
-            <option value="roboto">Roboto Mono</option>
-            <option value="menlo">Menlo</option>
-            <option value="monaco">Monaco</option>
-            <option value="consolas">Consolas</option>
-            <option value="courier">Courier New</option>
-            <option value="custom">自定义…</option>
-          </select>
+          <div class="font-current-label" id="font-current-label">
+            ${pref("font-family", "") || "System Default"}
+          </div>
           <input
             type="text"
-            id="font-custom-input"
-            placeholder="字体名称，例如 Hack"
-            style="display:none; margin-top:4px"
+            id="font-search"
+            class="font-search-input"
+            placeholder="搜索字体名称…"
+            autocomplete="off"
+            spellcheck="false"
           />
+          <div class="font-list-wrap">
+            <div class="font-list" id="font-list">
+              <div class="font-list-placeholder">点击搜索框加载字体列表</div>
+            </div>
+          </div>
         </div>
 
         <div class="settings-divider"></div>
@@ -243,8 +223,6 @@ export function createApp(): {
   setupGutterDrag(treeGutter, sidebarPane, true, null);
   setupGutterDrag(gutter, editorPane, false, previewPane);
 
-  // Restore font UI (needs DOM)
-  setTimeout(() => restoreFontUI(fontKey), 0);
 
   return {
     editorContainer: editorPane,
@@ -274,8 +252,11 @@ export async function initApp(): Promise<void> {
   setupWindowControls();          // ← frameless window controls
   await initFileTree(fileTreeContainer);
 
+  // Wire editor active file → tree highlight
+  onEditorFileChange((path) => setTreeActiveFile(path));
+
   // Apply saved font
-  applyFont(savedFontKey(), savedFontSize(), savedCustomFont());
+  applyFont(savedFontFamily(), savedFontSize());
 }
 
 async function handleOutlineSelect(item: OutlineItem): Promise<void> {
@@ -369,20 +350,10 @@ async function syncMaximizeState(
   } catch { /* non-Tauri preview context */ }
 }
 
-// ─── Font UI Restore ──────────────────────────────────────────────
-function restoreFontUI(key: string): void {
-  const sel = document.getElementById("font-family-select") as HTMLSelectElement | null;
-  if (sel) sel.value = key;
-  if (key === "custom") {
-    const inp = document.getElementById("font-custom-input") as HTMLInputElement | null;
-    if (inp) {
-      inp.style.display = "block";
-      inp.value = savedCustomFont();
-    }
-  }
-}
-
 // ─── Settings Panel ───────────────────────────────────────────────
+let systemFontsCache: string[] | null = null;
+let fontsLoading = false;
+
 function setupSettingsPanel(): void {
   const btn      = document.getElementById("btn-settings");
   const dropdown = document.getElementById("settings-dropdown");
@@ -394,6 +365,7 @@ function setupSettingsPanel(): void {
     if (hidden) {
       dropdown.removeAttribute("hidden");
       btn.classList.add("panel-open");
+      void ensureFontsLoaded();
     } else {
       dropdown.setAttribute("hidden", "");
       btn.classList.remove("panel-open");
@@ -409,33 +381,99 @@ function setupSettingsPanel(): void {
     }
   });
 
-  const fontSel   = document.getElementById("font-family-select") as HTMLSelectElement | null;
-  const custInput = document.getElementById("font-custom-input")  as HTMLInputElement | null;
-  const slider    = document.getElementById("font-size-slider")   as HTMLInputElement | null;
+  // ── Font search ──────────────────────────────────────────────────
+  const searchInput = document.getElementById("font-search") as HTMLInputElement | null;
+  searchInput?.addEventListener("focus", () => void ensureFontsLoaded());
+  searchInput?.addEventListener("input", () => {
+    renderFontList(searchInput.value.trim());
+  });
+
+  // ── Font size slider ─────────────────────────────────────────────
+  const slider    = document.getElementById("font-size-slider") as HTMLInputElement | null;
   const sizeLabel = document.getElementById("font-size-display");
-
-  fontSel?.addEventListener("change", () => {
-    const key = fontSel.value;
-    if (key === "custom") {
-      if (custInput) custInput.style.display = "block";
-    } else {
-      if (custInput) custInput.style.display = "none";
-      applyFont(key, slider ? parseInt(slider.value, 10) : savedFontSize());
-    }
-  });
-
-  custInput?.addEventListener("input", () => {
-    const name = custInput.value.trim();
-    if (name) applyFont("custom", slider ? parseInt(slider.value, 10) : savedFontSize(), name);
-  });
 
   slider?.addEventListener("input", () => {
     const size = parseInt(slider.value, 10);
     if (sizeLabel) sizeLabel.textContent = `${size}px`;
-    const key  = fontSel?.value ?? savedFontKey();
-    const name = custInput?.value.trim();
-    applyFont(key, size, name);
+    applyFont(savedFontFamily(), size);
   });
+}
+
+async function ensureFontsLoaded(): Promise<void> {
+  if (systemFontsCache || fontsLoading) return;
+  fontsLoading = true;
+
+  const listEl = document.getElementById("font-list");
+  if (listEl) {
+    listEl.innerHTML = '<div class="font-list-placeholder">正在加载系统字体…</div>';
+  }
+
+  try {
+    const fonts = await invoke<string[]>("list_system_fonts");
+    systemFontsCache = fonts;
+  } catch {
+    systemFontsCache = [...PINNED_FONTS];
+  } finally {
+    fontsLoading = false;
+  }
+
+  renderFontList("");
+}
+
+function renderFontList(filter: string): void {
+  const listEl = document.getElementById("font-list");
+  if (!listEl || !systemFontsCache) return;
+
+  const q = filter.toLowerCase();
+  const all = systemFontsCache;
+
+  // Split into pinned + others
+  const pinnedHit  = PINNED_FONTS.filter(f => !q || f.toLowerCase().includes(q));
+  const systemHit  = all.filter(f =>
+    !PINNED_FONTS.includes(f) && (!q || f.toLowerCase().includes(q))
+  );
+
+  if (pinnedHit.length === 0 && systemHit.length === 0) {
+    listEl.innerHTML = '<div class="font-list-placeholder">未找到匹配字体</div>';
+    return;
+  }
+
+  listEl.innerHTML = "";
+  const curFamily = savedFontFamily();
+
+  const addItem = (name: string, style?: string): void => {
+    const el = document.createElement("button");
+    el.className = "font-list-item";
+    if (name === curFamily) el.classList.add("active");
+    if (style) el.style.cssText = style;
+    el.textContent = name;
+    el.title = name;
+    el.addEventListener("click", () => {
+      listEl.querySelectorAll(".font-list-item").forEach(i => i.classList.remove("active"));
+      el.classList.add("active");
+      const label = document.getElementById("font-current-label");
+      if (label) label.textContent = name;
+      const slider = document.getElementById("font-size-slider") as HTMLInputElement | null;
+      applyFont(name, slider ? parseInt(slider.value, 10) : savedFontSize());
+    });
+    listEl.appendChild(el);
+  };
+
+  if (pinnedHit.length > 0) {
+    const sep = document.createElement("div");
+    sep.className = "font-list-sep";
+    sep.textContent = "常用字体";
+    listEl.appendChild(sep);
+    pinnedHit.forEach(f => addItem(f, `font-family: '${f}', monospace`));
+  }
+
+  if (systemHit.length > 0) {
+    const sep = document.createElement("div");
+    sep.className = "font-list-sep";
+    sep.textContent = filter ? `系统字体 (${systemHit.length})` : "系统字体";
+    listEl.appendChild(sep);
+    systemHit.forEach(f => addItem(f));
+  }
 }
 
 // ─── Toolbar Buttons ──────────────────────────────────────────────
