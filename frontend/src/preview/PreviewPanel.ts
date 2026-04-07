@@ -78,7 +78,11 @@ export function resetPreviewContent(): void {
 export function replacePreviewPageSvg(
   pageIndex: number,
   svg: string,
-  onClick: (event: MouseEvent, svgEl: SVGSVGElement, pageIndex: number) => void,
+  handlers: {
+    onClick?: (event: MouseEvent, svgEl: SVGSVGElement, pageIndex: number) => void;
+    onHover?: (event: MouseEvent, svgEl: SVGSVGElement, pageIndex: number) => void;
+    onLeave?: (event: MouseEvent, svgEl: SVGSVGElement, pageIndex: number) => void;
+  },
 ): boolean {
   const node = ensurePreviewPageNode(pageIndex);
   const wrapper = document.createElement("div");
@@ -86,7 +90,15 @@ export function replacePreviewPageSvg(
   const svgEl = wrapper.firstElementChild as SVGSVGElement | null;
   if (!svgEl) return false;
 
-  svgEl.addEventListener("click", (event) => onClick(event, svgEl, pageIndex));
+  if (handlers.onClick) {
+    svgEl.addEventListener("click", (event) => handlers.onClick?.(event, svgEl, pageIndex));
+  }
+  if (handlers.onHover) {
+    svgEl.addEventListener("mousemove", (event) => handlers.onHover?.(event, svgEl, pageIndex));
+  }
+  if (handlers.onLeave) {
+    svgEl.addEventListener("mouseleave", (event) => handlers.onLeave?.(event, svgEl, pageIndex));
+  }
   node.replaceChildren(svgEl);
   return true;
 }

@@ -12,17 +12,26 @@ import {
   scrollPreviewToPosition,
   trimPreviewPages,
 } from "../preview/PreviewPanel";
-import { clearOutlinePanel, refreshOutlinePanel } from "../outline/OutlinePanel";
+import {
+  clearOutlinePanel,
+  refreshOutlinePanel,
+  updateOutlineActiveItem,
+} from "../outline/OutlinePanel";
 import { showEmptyWorkspace, showWorkspaceLayout } from "../workspace/WorkspaceShell";
 
 let editor: monaco.editor.IStandaloneCodeEditor | null = null;
 let compileTimeout:    ReturnType<typeof setTimeout> | null = null;
 let cursorSyncTimeout: ReturnType<typeof setTimeout> | null = null;
 let selSyncTimeout:    ReturnType<typeof setTimeout> | null = null;
+let hoverSyncTimeout:  ReturnType<typeof setTimeout> | null = null;
+let outlineRefreshTimeout: ReturnType<typeof setTimeout> | null = null;
+let compileStatusTimeout: ReturnType<typeof setTimeout> | null = null;
 // Prevents sync loop when we programmatically move the editor cursor from a preview click
 // Use a counter instead of boolean to handle nested operations correctly
 let suppressCursorSync = 0;
 let suppressProgrammaticCompile = false;
+// Tracks last user edit timestamp — used to suppress expensive cursor sync during active typing
+let lastEditTime = 0;
 
 let currentFilePath         = "";
 let previewEntryPath        = "";
@@ -32,6 +41,10 @@ let renderedPageHashes: number[] = [];
 let tabsHost: HTMLDivElement | null = null;
 let editorHost: HTMLDivElement | null = null;
 let tabContextMenu: HTMLDivElement | null = null;
+let previewHoverRequestId = 0;
+let previewHoverTargetKey = "";
+let sourceHoverDecorationIds: string[] = [];
+let sourceHoverTarget: { file: string; offset: number } | null = null;
 
 interface OpenDocument {
   path: string;
@@ -161,12 +174,12 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
   clearOutlinePanel();
   updateStatus("success", "Ready");
 
-  // ── Live compile (debounced 300 ms) ───────────────────────────
+  // ── Live compile (debounced 650 ms) ──────────────────────────
   editor.onDidChangeModelContent(() => {
+    lastEditTime = Date.now();
     updateActiveDocumentState();
     if (suppressProgrammaticCompile) return;
-    if (compileTimeout) clearTimeout(compileTimeout);
-    compileTimeout = setTimeout(compileAndPreview, 300);
+    scheduleCompile();
   });
 
   // ── Cursor → Preview (user-initiated only, debounced 120 ms) ────
@@ -182,10 +195,11 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
         const sel = editor?.getSelection();
         if (sel && sel.isEmpty()) {
           removeSyncOverlays("selection-hl");
-          syncCursorToPreview(e.position);
+          void syncCursorToPreview(e.position);
         }
       }, 120);
     }
+    syncOutlineActiveFromEditor();
   });
 
   const initialPos = editor.getPosition();
@@ -199,8 +213,22 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
       removeSyncOverlays("selection-hl");
     } else {
       if (selSyncTimeout) clearTimeout(selSyncTimeout);
-      selSyncTimeout = setTimeout(() => syncSelectionToPreview(sel), 200);
+      selSyncTimeout = setTimeout(() => void syncSelectionToPreview(sel), 200);
     }
+  });
+
+  editor.onMouseMove((e) => {
+    const { position } = e.target;
+    if (!position) return;
+    if (hoverSyncTimeout) clearTimeout(hoverSyncTimeout);
+    hoverSyncTimeout = setTimeout(() => {
+      void syncHoverToPreview(position);
+    }, 150);
+  });
+
+  editor.onMouseLeave(() => {
+    if (hoverSyncTimeout) clearTimeout(hoverSyncTimeout);
+    clearPreviewSourceHover();
   });
 
   // ── Keyboard shortcuts ─────────────────────────────────────────
@@ -305,7 +333,12 @@ export async function compileAndPreview(): Promise<void> {
   if (!currentFilePath) return;
   const content   = editor.getValue();
   const requestId = ++latestCompileRequestId;
-  updateStatus("compiling", "Compiling…");
+  if (compileStatusTimeout) clearTimeout(compileStatusTimeout);
+  compileStatusTimeout = setTimeout(() => {
+    if (requestId === latestCompileRequestId) {
+      updateStatus("compiling", "Syncing preview…");
+    }
+  }, 180);
 
   try {
     const result = await invoke<CompileResult>("compile_current", {
@@ -313,13 +346,17 @@ export async function compileAndPreview(): Promise<void> {
       content,
     });
     if (requestId < latestCompileRequestId) return; // stale
+    if (compileStatusTimeout) {
+      clearTimeout(compileStatusTimeout);
+      compileStatusTimeout = null;
+    }
 
     if (result.success) {
       previewEntryPath = result.entry_path ?? previewEntryPath;
       lastSuccessfulPageCount = result.page_count;
       updatePageStatus(result.page_count);
       await renderAllPages(result.page_count, result.page_hashes);
-      await refreshOutlinePanel();
+      scheduleOutlineRefresh();
       updateStatus("success",
         `Compiled in ${result.duration_ms ?? "?"}ms · ${result.page_count} page(s)`);
       clearDiagnostics();
@@ -330,8 +367,30 @@ export async function compileAndPreview(): Promise<void> {
       showDiagnostics(result.errors);
     }
   } catch (e) {
+    if (compileStatusTimeout) {
+      clearTimeout(compileStatusTimeout);
+      compileStatusTimeout = null;
+    }
     updateStatus("error", `Error: ${e}`);
   }
+}
+
+function scheduleCompile(delay = 650): void {
+  if (compileTimeout) clearTimeout(compileTimeout);
+  compileTimeout = setTimeout(() => {
+    compileTimeout = null;
+    void compileAndPreview();
+  }, delay);
+}
+
+function scheduleOutlineRefresh(delay = 120): void {
+  if (outlineRefreshTimeout) clearTimeout(outlineRefreshTimeout);
+  outlineRefreshTimeout = setTimeout(() => {
+    outlineRefreshTimeout = null;
+    void refreshOutlinePanel().then(() => {
+      syncOutlineActiveFromEditor();
+    });
+  }, delay);
 }
 
 // ─── File Operations ──────────────────────────────────────────────
@@ -400,7 +459,7 @@ async function saveCurrentFile(): Promise<void> {
     lastSuccessfulPageCount = result.page_count;
     updatePageStatus(result.page_count);
     await renderAllPages(result.page_count, result.page_hashes);
-    await refreshOutlinePanel();
+    scheduleOutlineRefresh();
     updateStatus("success", "Saved");
   } catch (e) {
     updateStatus("error", `Save failed: ${e}`);
@@ -438,14 +497,99 @@ export async function jumpToFileOffset(
   const model = editor.getModel();
   if (!model) return;
 
-  const pos = model.getPositionAt(offset);
+  // offset from Rust is a UTF-8 byte offset; Monaco needs a UTF-16 char offset
+  const charOffset = utf8ByteOffsetToMonacoOffset(model.getValue(), offset);
+  const pos = model.getPositionAt(charOffset);
   suppressCursorSync++;
   editor.setPosition(pos);
   editor.revealPositionInCenter(pos);
   editor.focus();
+  syncOutlineActiveFromEditor();
   setTimeout(() => {
     suppressCursorSync = Math.max(0, suppressCursorSync - 1);
   }, 50);
+}
+
+export async function revealSourceOffsetInPreview(
+  path: string,
+  offset: number,
+  behavior: ScrollBehavior = "auto",
+): Promise<void> {
+  if (!editor) return;
+  const model = editor.getModel();
+  if (!model || currentFilePath !== path) return;
+
+  // offset from Rust is a UTF-8 byte offset; Monaco needs a UTF-16 char offset
+  const charOffset = utf8ByteOffsetToMonacoOffset(model.getValue(), offset);
+  const pos = model.getPositionAt(charOffset);
+  try {
+    const positions = await invoke<PagePos[]>("jump_from_cursor", {
+      filePath: path,
+      line: pos.lineNumber - 1,
+      character: pos.column - 1,
+    });
+    const previewPos = pickBestPreviewPosition(positions);
+    if (previewPos) {
+      highlightCursorInPreview(previewPos, { scroll: true, behavior, persistent: true });
+    }
+  } catch {
+    // ignore sync failures
+  }
+}
+
+// ─── Offset Conversion ────────────────────────────────────────────
+//
+// Rust (Typst) reports source offsets as **UTF-8 byte offsets**.
+// Monaco internally uses **UTF-16 code-unit offsets** (same as JS string indices).
+// For pure-ASCII files these are identical, but CJK characters are 3 UTF-8 bytes
+// and 1 UTF-16 code unit, so without conversion outline navigation lands at the
+// wrong position in files with Chinese content.
+
+/**
+ * Convert a UTF-8 byte offset (from Rust/Typst) to a Monaco/JS character offset.
+ * Walks the text character-by-character, counting UTF-8 bytes, until reaching
+ * the target byte count.
+ */
+function utf8ByteOffsetToMonacoOffset(text: string, byteOffset: number): number {
+  let bytes = 0;
+  let i = 0;
+  while (i < text.length && bytes < byteOffset) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xD800 && code < 0xDC00) {
+      // Surrogate pair — 4 UTF-8 bytes, 2 UTF-16 code units
+      bytes += 4;
+      i++; // skip low surrogate (outer loop adds 1 more → total advance = 2)
+    } else {
+      bytes += 3;
+    }
+    i++;
+  }
+  return i;
+}
+
+/**
+ * Convert a Monaco/JS character offset to a UTF-8 byte offset (for Rust/Typst).
+ */
+function monacoOffsetToUtf8ByteOffset(text: string, charOffset: number): number {
+  let bytes = 0;
+  for (let i = 0; i < charOffset && i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (code >= 0xD800 && code < 0xDC00) {
+      bytes += 4; // surrogate pair
+      i++;        // skip low surrogate
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
 }
 
 // ─── Bidirectional Sync ───────────────────────────────────────────
@@ -457,6 +601,9 @@ async function syncCursorToPreview(position: monaco.Position): Promise<void> {
   const model = editor?.getModel();
   if (!model) return;
   if (!currentFilePath) return;
+  // Skip sync if no compiled output exists yet, or if the user is actively typing
+  if (lastSuccessfulPageCount === 0) return;
+  if (Date.now() - lastEditTime < 400) return;
 
   try {
     const positions = await invoke<PagePos[]>("jump_from_cursor", {
@@ -464,7 +611,10 @@ async function syncCursorToPreview(position: monaco.Position): Promise<void> {
       line: position.lineNumber - 1,
       character: position.column - 1,
     });
-    if (positions.length > 0) highlightCursorInPreview(positions[0]);
+    const previewPos = pickBestPreviewPosition(positions);
+    if (previewPos) {
+      highlightCursorInPreview(previewPos, { scroll: false, persistent: true });
+    }
   } catch { /* ignore */ }
 }
 
@@ -522,6 +672,7 @@ async function handlePreviewClick(
     });
 
     if (result.type === "file" && result.offset != null && result.file && editor) {
+      applySourceHoverDecoration(result.file, result.offset);
       await jumpToFileOffset(result.file, result.offset, false);
     } else if (result.type === "url" && result.url) {
       window.open(result.url, "_blank", "noopener,noreferrer");
@@ -531,19 +682,70 @@ async function handlePreviewClick(
   } catch { /* ignore */ }
 }
 
+async function syncHoverToPreview(position: monaco.Position): Promise<void> {
+  const model = editor?.getModel();
+  if (!model || !currentFilePath) return;
+  // Skip hover sync if no compiled output, or if actively typing
+  if (lastSuccessfulPageCount === 0) return;
+  if (Date.now() - lastEditTime < 600) return;
+
+  try {
+    const positions = await invoke<PagePos[]>("jump_from_cursor", {
+      filePath: currentFilePath,
+      line: position.lineNumber - 1,
+      character: position.column - 1,
+    });
+    const previewPos = pickBestPreviewPosition(positions);
+    if (previewPos) {
+      applyHoverAtPreviewPosition(previewPos);
+    }
+  } catch {
+    // ignore sync failures
+  }
+}
+
+async function handlePreviewHover(
+  event: MouseEvent,
+  svgEl: SVGSVGElement,
+  pageIndex: number,
+): Promise<void> {
+  const pagePoint = clientPointToPagePoint(svgEl, event.clientX, event.clientY);
+  const hoverKey = `${pageIndex}:${Math.round(pagePoint.x)}:${Math.round(pagePoint.y)}`;
+  if (hoverKey === previewHoverTargetKey) return;
+  previewHoverTargetKey = hoverKey;
+
+  const requestId = ++previewHoverRequestId;
+  try {
+    const result = await invoke<JumpResult>("jump_from_click", {
+      page: pageIndex + 1,
+      x: pagePoint.x,
+      y: pagePoint.y,
+    });
+    if (requestId !== previewHoverRequestId) return;
+
+    if (result.type === "file" && result.offset != null && result.file) {
+      // Show a subtle hover line at the hovered position (overlay approach, no SVG fill changes)
+      highlightHoverInPreview({ page: pageIndex + 1, x: pagePoint.x, y: pagePoint.y });
+      applySourceHoverDecoration(result.file, result.offset);
+    } else {
+      clearPreviewSourceHover();
+    }
+  } catch {
+    if (requestId === previewHoverRequestId) clearPreviewSourceHover();
+  }
+}
+
 // ─── Highlight Helpers ────────────────────────────────────────────
 
 function removeSyncOverlays(cls: string): void {
   document.querySelectorAll(`.highlight-overlay.${cls}`).forEach(el => el.remove());
 }
 
-/**
- * Show a full-width horizontal highlight at the cursor position on the preview page.
- * Scroll the preview so the cursor position is centered.
- */
-function highlightCursorInPreview(pos: PagePos): void {
+function highlightCursorInPreview(
+  pos: PagePos,
+  options: { scroll?: boolean; behavior?: ScrollBehavior; persistent?: boolean } = {},
+): void {
   removeSyncOverlays("cursor-hl");
-
   const pane = getPreviewPane();
   const svgEl = getPreviewPageSvg(pos.page);
   const panePoint = pagePointToPanePoint(pos);
@@ -561,10 +763,13 @@ function highlightCursorInPreview(pos: PagePos): void {
   overlay.style.height = "24px";
 
   getPreviewContent()?.appendChild(overlay);
-  scrollPreviewToPosition(pos);
-
-  setTimeout(() => overlay.classList.add("fade"), 1500);
-  setTimeout(() => overlay.remove(), 2000);
+  if (options.scroll) {
+    scrollPreviewToPosition(pos, options.behavior ?? "smooth");
+  }
+  if (!options.persistent) {
+    setTimeout(() => overlay.classList.add("fade"), 1500);
+    setTimeout(() => overlay.remove(), 2000);
+  }
 }
 
 /**
@@ -627,6 +832,93 @@ function highlightRangeInPreview(start: PagePos, end: PagePos, clearFirst = true
   scrollPreviewToPosition(start);
 }
 
+function pickBestPreviewPosition(positions: PagePos[]): PagePos | null {
+  if (positions.length === 0) return null;
+  return positions[positions.length - 1] ?? positions[0] ?? null;
+}
+
+function applyHoverAtPreviewPosition(pos: PagePos): void {
+  // Use the cursor-hl overlay (already persistent) — no separate SVG element coloring needed
+  highlightCursorInPreview(pos, { scroll: false, persistent: true });
+}
+
+/**
+ * Draw a subtle "hover" overlay at the given page position.
+ * Uses the .hover-hl overlay class so it doesn't affect SVG element fill/stroke.
+ */
+function highlightHoverInPreview(pos: PagePos): void {
+  removeSyncOverlays("hover-hl");
+  const pane = getPreviewPane();
+  const svgEl = getPreviewPageSvg(pos.page);
+  const panePoint = pagePointToPanePoint(pos);
+  if (!pane || !svgEl || !panePoint) return;
+
+  const overlay = document.createElement("div");
+  overlay.className = "highlight-overlay hover-hl";
+  overlay.style.left   = `${panePoint.left}px`;
+  overlay.style.top    = `${panePoint.top - 10}px`;
+  overlay.style.width  = `${panePoint.pageWidth}px`;
+  overlay.style.height = "22px";
+
+  getPreviewContent()?.appendChild(overlay);
+}
+
+function applySourceHoverDecoration(file: string, offset: number): void {
+  sourceHoverTarget = { file, offset };
+  if (!editor || currentFilePath !== file) {
+    clearSourceHoverDecoration();
+    return;
+  }
+
+  const model = editor.getModel();
+  if (!model) return;
+
+  // offset from Rust is UTF-8 bytes; convert to Monaco UTF-16 char offset
+  const text = model.getValue();
+  const charStart = utf8ByteOffsetToMonacoOffset(text, offset);
+  const charEnd   = utf8ByteOffsetToMonacoOffset(text, offset + 1);
+  const start = model.getPositionAt(charStart);
+  const end   = model.getPositionAt(charEnd);
+  sourceHoverDecorationIds = editor.deltaDecorations(sourceHoverDecorationIds, [{
+    range: new monaco.Range(
+      start.lineNumber,
+      start.column,
+      end.lineNumber,
+      Math.max(start.column + 1, end.column),
+    ),
+    options: {
+      className: "editor-source-hover",
+      stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
+    },
+  }]);
+}
+
+function clearSourceHoverDecoration(): void {
+  sourceHoverDecorationIds = editor?.deltaDecorations(sourceHoverDecorationIds, []) ?? [];
+}
+
+function clearPreviewSourceHover(): void {
+  previewHoverTargetKey = "";
+  sourceHoverTarget = null;
+  clearSourceHoverDecoration();
+  removeSyncOverlays("hover-hl");
+}
+
+function syncOutlineActiveFromEditor(): void {
+  const model = editor?.getModel();
+  const pos = editor?.getPosition();
+  if (!model || !pos || !currentFilePath) {
+    updateOutlineActiveItem(null, null);
+    return;
+  }
+
+  // getOffsetAt returns a UTF-16 char offset; convert to UTF-8 byte offset
+  // so it can be compared correctly against Rust/Typst outline item offsets
+  const charOffset = model.getOffsetAt(pos);
+  const byteOffset = monacoOffsetToUtf8ByteOffset(model.getValue(), charOffset);
+  updateOutlineActiveItem(currentFilePath, byteOffset);
+}
+
 // ─── Rendering ────────────────────────────────────────────────────
 export async function renderAllPages(
   pageCount: number,
@@ -634,27 +926,44 @@ export async function renderAllPages(
 ): Promise<void> {
   trimPreviewPages(pageCount);
 
+  // Collect indices of pages that actually changed (hash-based skip)
+  const changedPages: number[] = [];
   for (let i = 0; i < pageCount; i++) {
-    const pageHash = pageHashes[i];
-    const pageNode = ensurePreviewPageNode(i);
-    if (renderedPageHashes[i] === pageHash) continue; // unchanged
-
-    try {
-      const svg = await invoke<string>("render_page", { page: i });
-      // Discard if hash changed while awaiting (newer compile running)
-      if (pageHash !== pageHashes[i]) continue;
-      if (!replacePreviewPageSvg(i, svg, handlePreviewClick)) continue;
-      renderedPageHashes[i] = pageHash;
-      pageNode.classList.add("page-updated");
-      setTimeout(() => pageNode.classList.remove("page-updated"), 120);
-    } catch { break; }
+    ensurePreviewPageNode(i);
+    if (renderedPageHashes[i] !== pageHashes[i]) changedPages.push(i);
   }
 
+  // Render changed pages in parallel — render_page only reads from the compiled document
+  await Promise.all(
+    changedPages.map((i) => renderSinglePage(i, pageHashes))
+  );
+
   renderedPageHashes.length = pageCount;
+}
+
+async function renderSinglePage(i: number, pageHashes: number[]): Promise<void> {
+  const capturedHash = pageHashes[i];
+  const pageNode = ensurePreviewPageNode(i);
+  try {
+    const svg = await invoke<string>("render_page", { page: i });
+    // Discard result if a newer compile has already produced a different hash
+    if (capturedHash !== pageHashes[i]) return;
+    if (!replacePreviewPageSvg(i, svg, {
+      onClick: handlePreviewClick,
+      onHover: handlePreviewHover,
+      onLeave: () => clearPreviewSourceHover(),
+    })) return;
+    renderedPageHashes[i] = capturedHash;
+    pageNode.classList.add("page-updated");
+    setTimeout(() => pageNode.classList.remove("page-updated"), 80);
+  } catch { /* ignore individual page render errors */ }
 }
 function resetPreviewState(): void {
   latestCompileRequestId++;
   renderedPageHashes = [];
+  clearPreviewSourceHover();
+  removeSyncOverlays("cursor-hl");
+  removeSyncOverlays("selection-hl");
   resetPreviewContent();
 }
 
@@ -708,6 +1017,12 @@ async function switchToDocument(doc: OpenDocument, refreshPreview = true): Promi
   }
   editor.focus();
   updateActiveDocumentState();
+  syncOutlineActiveFromEditor();
+  if (sourceHoverTarget?.file === doc.path) {
+    applySourceHoverDecoration(sourceHoverTarget.file, sourceHoverTarget.offset);
+  } else {
+    clearSourceHoverDecoration();
+  }
   if (refreshPreview) {
     resetPreviewState();
     await compileOpenDocument(doc);
@@ -743,6 +1058,7 @@ async function closeDocument(path: string): Promise<void> {
     renderTabs();
     clearDiagnostics();
     clearOutlinePanel();
+    updateOutlineActiveItem(null, null);
     updatePageStatus(0);
     updateStatus("success", "Ready");
     await invoke("reset_session");
@@ -772,9 +1088,10 @@ async function compileOpenDocument(doc: OpenDocument): Promise<void> {
       lastSuccessfulPageCount = result.page_count;
       updatePageStatus(result.page_count);
       await renderAllPages(result.page_count, result.page_hashes);
-      await refreshOutlinePanel();
+      scheduleOutlineRefresh();
       updateStatus("success", `Compiled · ${result.page_count} page(s)`);
       clearDiagnostics();
+      syncOutlineActiveFromEditor();
     } else {
       updatePageStatus(0);
       clearOutlinePanel();
@@ -809,9 +1126,10 @@ async function setCurrentDocumentAsPreviewEntry(): Promise<void> {
     lastSuccessfulPageCount = result.page_count;
     updatePageStatus(result.page_count);
     await renderAllPages(result.page_count, result.page_hashes);
-    await refreshOutlinePanel();
+    scheduleOutlineRefresh();
     updateStatus("success", "Preview entry updated");
     clearDiagnostics();
+    syncOutlineActiveFromEditor();
   } catch (e) {
     updateStatus("error", `Failed to set preview entry: ${e}`);
   }

@@ -178,9 +178,27 @@ html, body {
   pointer-events: none;
 }
 
-.status.success  { color: var(--c-success); }
-.status.error    { color: var(--c-error); }
-.status.compiling { color: var(--c-warning); }
+.status.success {
+  color: var(--c-success);
+  background: color-mix(in srgb, var(--c-success) 10%, var(--c-btn));
+  border-color: color-mix(in srgb, var(--c-success) 25%, transparent);
+}
+.status.error {
+  color: var(--c-error);
+  background: color-mix(in srgb, var(--c-error) 10%, var(--c-btn));
+  border-color: color-mix(in srgb, var(--c-error) 25%, transparent);
+}
+.status.compiling {
+  color: var(--c-warning);
+  background: color-mix(in srgb, var(--c-warning) 10%, var(--c-btn));
+  border-color: color-mix(in srgb, var(--c-warning) 25%, transparent);
+  animation: status-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.55; }
+}
 
 /* ─── Windows 11 Window Controls ────────────────────────────── */
 /*
@@ -509,6 +527,7 @@ html, body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
 }
 
 .status-chip.wide {
@@ -675,6 +694,15 @@ html, body {
   background: var(--c-item-hover);
 }
 
+.outline-item.active {
+  background: var(--c-item-active);
+  color: var(--c-accent);
+}
+
+.outline-item.active .outline-level {
+  color: var(--c-accent);
+}
+
 .outline-item.level-1 {
   font-weight: 700;
 }
@@ -694,6 +722,11 @@ html, body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.editor-source-hover {
+  background: color-mix(in srgb, var(--c-error) 12%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--c-error) 55%, transparent);
 }
 
 /* ─── Editor Pane ────────────────────────────────────────────── */
@@ -857,7 +890,7 @@ html, body {
 }
 
 .preview-page.page-updated {
-  animation: page-refresh 110ms ease-out;
+  animation: page-refresh 120ms ease-out;
 }
 
 .preview-content svg {
@@ -872,8 +905,13 @@ html, body {
 }
 
 @keyframes page-refresh {
-  from { opacity: 0.90; }
-  to   { opacity: 1; }
+  from { opacity: 0.88; filter: brightness(1.04); }
+  to   { opacity: 1;    filter: brightness(1); }
+}
+
+/* Preview SVGs are click-navigable — show pointer on hover */
+.preview-content svg {
+  cursor: pointer;
 }
 
 /* ─── Highlight Overlays ─────────────────────────────────────── */
@@ -887,14 +925,24 @@ html, body {
 
 /* Cursor position indicator: full-width line with left accent */
 .highlight-overlay.cursor-hl {
-  background: var(--hl-cursor-bg);
-  border-left: 3px solid var(--hl-cursor-line);
+  background: linear-gradient(90deg, color-mix(in srgb, var(--hl-cursor-line) 18%, transparent), transparent 30%);
+  border-left: 2px solid var(--hl-cursor-line);
 }
 
 /* Text selection range highlight */
 .highlight-overlay.selection-hl {
   background: var(--hl-sel-bg);
   border: 1.5px solid var(--hl-sel-border);
+}
+
+/* Preview hover indicator: very subtle, shows clickable line without changing text color */
+.highlight-overlay.hover-hl {
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--c-accent) 10%, transparent),
+    transparent 50%
+  );
+  border-left: 2px solid color-mix(in srgb, var(--c-accent) 30%, transparent);
+  transition: none;
 }
 
 .highlight-overlay.fade { opacity: 0; }

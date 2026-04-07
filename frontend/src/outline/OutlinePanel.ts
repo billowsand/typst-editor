@@ -14,6 +14,10 @@ export interface OutlineItem {
 
 let outlineContainer: HTMLDivElement | null = null;
 let onSelectOutlineItem: ((item: OutlineItem) => void) | null = null;
+let currentItems: OutlineItem[] = [];
+let currentState: "loading" | "empty" | "error" | "ready" = "empty";
+let activeFile: string | null = null;
+let activeOffset: number | null = null;
 
 export function initOutlinePanel(
   container: HTMLDivElement,
@@ -27,7 +31,9 @@ export function initOutlinePanel(
 export async function refreshOutlinePanel(): Promise<void> {
   if (!outlineContainer) return;
 
-  renderOutlineState("loading", []);
+  if (currentItems.length === 0) {
+    renderOutlineState("loading", []);
+  }
 
   try {
     const items = await invoke<OutlineItem[]>("get_document_outline");
@@ -41,11 +47,26 @@ export function clearOutlinePanel(): void {
   renderOutlineState("empty", []);
 }
 
+export function updateOutlineActiveItem(file: string | null, offset: number | null): void {
+  activeFile = file;
+  activeOffset = offset;
+
+  if (!outlineContainer || currentState !== "ready") return;
+  syncActiveOutlineDom();
+}
+
 function renderOutlineState(
   state: "loading" | "empty" | "error" | "ready",
   items: OutlineItem[],
 ): void {
   if (!outlineContainer) return;
+  if (state === currentState && state === "ready" && isSameOutline(items, currentItems)) {
+    currentItems = items;
+    syncActiveOutlineDom();
+    return;
+  }
+  currentState = state;
+  currentItems = items;
   outlineContainer.replaceChildren();
 
   const header = document.createElement("div");
@@ -84,10 +105,60 @@ function renderOutlineState(
     title.className = "outline-title";
     title.textContent = item.title;
 
+    row.dataset.file = item.file ?? "";
+    row.dataset.offset = item.offset != null ? String(item.offset) : "";
     row.append(level, title);
     row.addEventListener("click", () => onSelectOutlineItem?.(item));
     list.appendChild(row);
   }
 
   outlineContainer.appendChild(list);
+  syncActiveOutlineDom();
+}
+
+function syncActiveOutlineDom(): void {
+  if (!outlineContainer) return;
+
+  const activeIndex = findActiveOutlineIndex(currentItems, activeFile, activeOffset);
+  const rows = outlineContainer.querySelectorAll<HTMLButtonElement>(".outline-item");
+
+  rows.forEach((row, index) => {
+    const isActive = index === activeIndex;
+    row.classList.toggle("active", isActive);
+    if (isActive) {
+      row.setAttribute("aria-current", "true");
+    } else {
+      row.removeAttribute("aria-current");
+    }
+  });
+}
+
+function findActiveOutlineIndex(
+  items: OutlineItem[],
+  file: string | null,
+  offset: number | null,
+): number {
+  if (!file || offset == null) return -1;
+
+  let activeIndex = -1;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+    if (item.file !== file || item.offset == null) continue;
+    if (item.offset <= offset) activeIndex = i;
+  }
+  return activeIndex;
+}
+
+function isSameOutline(a: OutlineItem[], b: OutlineItem[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((item, index) => {
+    const other = b[index];
+    return item.title === other.title
+      && item.level === other.level
+      && item.file === other.file
+      && item.offset === other.offset
+      && item.position?.page === other.position?.page
+      && item.position?.x === other.position?.x
+      && item.position?.y === other.position?.y;
+  });
 }

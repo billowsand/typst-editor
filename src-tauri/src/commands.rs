@@ -257,11 +257,18 @@ pub fn list_dir(path: String) -> Result<Vec<FileEntry>, String> {
 pub fn jump_from_cursor(
     state: State<'_, CompilerState>,
     file_path: String,
-    cursor: usize,
+    line: u32,
+    character: u32,
 ) -> Vec<PositionResult> {
     state
         .with_document(|world, doc| {
             let Some(source) = world.source_by_path(&file_path) else {
+                return Vec::new();
+            };
+            let Some(cursor) = source
+                .lines()
+                .line_column_to_byte(line as usize, character as usize)
+            else {
                 return Vec::new();
             };
             let positions = typst_ide::jump_from_cursor(doc, &source, cursor);

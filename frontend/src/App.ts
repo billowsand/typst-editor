@@ -1,10 +1,9 @@
 import {
   initEditor, getEditor, setZoom, getZoom,
   setMonacoTheme, setEditorFont,
-  pickFilePath, openFileAtPath, hasUnsavedDocuments, jumpToFileOffset,
+  pickFilePath, openFileAtPath, hasUnsavedDocuments, jumpToFileOffset, revealSourceOffsetInPreview,
 } from "./editor/MonacoEditor";
 import { initPreview } from "./preview/PreviewPanel";
-import { scrollPreviewToPosition } from "./preview/PreviewPanel";
 import { initFileTree, loadTree } from "./file-tree/FileTree";
 import { initOutlinePanel, type OutlineItem } from "./outline/OutlinePanel";
 import { initWorkspaceShell } from "./workspace/WorkspaceShell";
@@ -280,9 +279,7 @@ export async function initApp(): Promise<void> {
 }
 
 async function handleOutlineSelect(item: OutlineItem): Promise<void> {
-  if (item.position) {
-    scrollPreviewToPosition(item.position);
-  }
+  // Outline navigates the editor only — preview follows the editor cursor via its own sync path
   if (item.file && item.offset != null) {
     await jumpToFileOffset(item.file, item.offset, false);
   }
@@ -489,12 +486,12 @@ async function promptOpenFile(fileTreeContainer: HTMLDivElement): Promise<void> 
   const path = await pickFilePath();
   if (!path) return;
 
-  const treeTask = invoke<string | null>("resolve_project_root", { filePath: path })
+  // Fire-and-forget: load tree independently, don't block file opening
+  void invoke<string | null>("resolve_project_root", { filePath: path })
     .then((root) => root ? loadTree(fileTreeContainer, root, 0) : undefined)
     .catch(() => undefined);
 
   await openFileAtPath(path);
-  await treeTask;
 }
 
 function setupPreviewZoom(): void {
