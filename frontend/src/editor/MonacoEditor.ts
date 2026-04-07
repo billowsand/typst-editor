@@ -32,6 +32,8 @@ let suppressCursorSync = 0;
 let suppressProgrammaticCompile = false;
 // Tracks last user edit timestamp — used to suppress expensive cursor sync during active typing
 let lastEditTime = 0;
+// Tracks the last line number synced to the outline — outline sync skips column-only changes
+let lastOutlineSyncLine = -1;
 
 let currentFilePath         = "";
 let previewEntryPath        = "";
@@ -50,7 +52,8 @@ interface OpenDocument {
   path: string;
   model: monaco.editor.ITextModel;
   viewState: monaco.editor.ICodeEditorViewState | null;
-  savedContent: string;
+  /** Monaco alternative version ID at the time of last save — O(1) dirty check */
+  savedVersionId: number;
   dirty: boolean;
 }
 
@@ -159,13 +162,18 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
     tabSize: 2,
     autoClosingBrackets: "always",
     autoClosingQuotes: "always",
-    autoIndent: "full",
-    renderLineHighlight: "all",
+    // "keep" just preserves the current line's indentation on Enter — far cheaper than
+    // "full" which runs a full syntax analysis pass on every keystroke
+    autoIndent: "keep",
+    renderLineHighlight: "line",
     fontLigatures: true,
     smoothScrolling: true,
     cursorSmoothCaretAnimation: "on",
-    renderWhitespace: "selection",
-    bracketPairColorization: { enabled: true },
+    renderWhitespace: "none",
+    // Bracket colorization requires a full bracket-matching pass on every edit;
+    // the Typst tokenizer doesn't benefit from it enough to justify the cost
+    bracketPairColorization: { enabled: false },
+    occurrencesHighlight: "off",
   });
 
   setCurrentFilePath(null);
@@ -199,7 +207,12 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
         }
       }, 120);
     }
-    syncOutlineActiveFromEditor();
+    // Outline heading boundaries are line-level — skip the O(n) byte-offset conversion
+    // when only the column changed (e.g. typing characters on the same line)
+    if (e.position.lineNumber !== lastOutlineSyncLine) {
+      lastOutlineSyncLine = e.position.lineNumber;
+      syncOutlineActiveFromEditor();
+    }
   });
 
   const initialPos = editor.getPosition();
@@ -443,7 +456,7 @@ async function saveCurrentFile(): Promise<void> {
   try {
     await invoke("save_file", { content, filePath: path });
     if (activeDoc) {
-      activeDoc.savedContent = content;
+      activeDoc.savedVersionId = activeDoc.model.getAlternativeVersionId();
       activeDoc.dirty = false;
       renderTabs();
     }
@@ -979,7 +992,7 @@ function createDocument(path: string, content: string): OpenDocument {
     path,
     model,
     viewState: null,
-    savedContent: content,
+    savedVersionId: model.getAlternativeVersionId(),
     dirty: false,
   };
 
@@ -994,8 +1007,11 @@ function getActiveDocument(): OpenDocument | null {
 function updateActiveDocumentState(): void {
   const doc = getActiveDocument();
   if (!doc) return;
-  doc.dirty = doc.model.getValue() !== doc.savedContent;
-  renderTabs();
+  // O(1) version counter — avoids full string copy + comparison on every keystroke
+  const wasDirty = doc.dirty;
+  doc.dirty = doc.model.getAlternativeVersionId() !== doc.savedVersionId;
+  // Only touch the DOM when dirty state actually flips (first edit, or after save)
+  if (doc.dirty !== wasDirty) renderTabs();
 }
 
 async function switchToDocument(doc: OpenDocument, refreshPreview = true): Promise<void> {
@@ -1016,6 +1032,7 @@ async function switchToDocument(doc: OpenDocument, refreshPreview = true): Promi
     editor.restoreViewState(doc.viewState);
   }
   editor.focus();
+  lastOutlineSyncLine = -1; // force outline sync on next cursor event for this document
   updateActiveDocumentState();
   syncOutlineActiveFromEditor();
   if (sourceHoverTarget?.file === doc.path) {
