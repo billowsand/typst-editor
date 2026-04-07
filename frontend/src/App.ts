@@ -1,9 +1,14 @@
 import {
-  initEditor, getEditor, setZoom, getZoom,
-  setMonacoTheme, setEditorFont,
-  pickFilePath, openFileAtPath, hasUnsavedDocuments, jumpToFileOffset, revealSourceOffsetInPreview,
+  hasUnsavedDocumentsAsync,
+  jumpToFileOffset,
   onEditorFileChange,
-} from "./editor/MonacoEditor";
+  openFileAtPath,
+  pickFilePath,
+  registerEditorContainer,
+  runEditorAction,
+  setEditorFont,
+  setMonacoTheme,
+} from "./editor/editorApi";
 import { initPreview } from "./preview/PreviewPanel";
 import { initFileTree, loadTree, setTreeActiveFile } from "./file-tree/FileTree";
 import { initOutlinePanel, type OutlineItem } from "./outline/OutlinePanel";
@@ -35,6 +40,7 @@ const PINNED_FONTS = [
 ];
 
 const SYSTEM_FALLBACK = "ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace";
+let currentZoom = 1.0;
 
 // ─── Theme ────────────────────────────────────────────────────────
 function applyTheme(theme: Theme): void {
@@ -234,6 +240,7 @@ export function createApp(): {
 
 export async function initApp(): Promise<void> {
   const { editorContainer, previewContainer, fileTreeContainer, outlineContainer } = createApp();
+  registerEditorContainer(editorContainer);
   initPreview(previewContainer);
   initOutlinePanel(outlineContainer, handleOutlineSelect);
   initWorkspaceShell({
@@ -245,7 +252,6 @@ export async function initApp(): Promise<void> {
     previewPane: previewContainer,
     onOpen: () => promptOpenFile(fileTreeContainer),
   });
-  await initEditor(editorContainer);
   bindToolbarButtons(fileTreeContainer);
   setupPreviewZoom();
   setupSettingsPanel();
@@ -282,10 +288,13 @@ function setupWindowControls(): void {
 
   closeBtn?.addEventListener("click", (e) => {
     e.stopPropagation();
-    if (hasUnsavedDocuments() && !window.confirm("仍有未保存文件，确定关闭应用吗？")) {
-      return;
-    }
-    win.close();
+    void (async () => {
+      if (await hasUnsavedDocumentsAsync()
+        && !window.confirm("仍有未保存文件，确定关闭应用吗？")) {
+        return;
+      }
+      win.close();
+    })();
   });
 
   minimizeBtn?.addEventListener("click", (e) => {
@@ -399,6 +408,25 @@ function setupSettingsPanel(): void {
   });
 }
 
+function setZoom(zoom: number): void {
+  currentZoom = zoom;
+  const content = document.querySelector<HTMLElement>(".preview-content");
+  if (content) {
+    content.style.transform = `scale(${zoom})`;
+    content.style.transformOrigin = "top center";
+  }
+  updateZoomStatus(zoom);
+}
+
+function getZoom(): number {
+  return currentZoom;
+}
+
+function updateZoomStatus(zoom: number): void {
+  const el = document.getElementById("status-zoom-bar");
+  if (el) el.textContent = `${Math.round(zoom * 100)}%`;
+}
+
 async function ensureFontsLoaded(): Promise<void> {
   if (systemFontsCache || fontsLoading) return;
   fontsLoading = true;
@@ -497,11 +525,11 @@ function bindToolbarButtons(fileTreeContainer: HTMLDivElement): void {
   });
 
   document.getElementById("btn-save")?.addEventListener("click", () => {
-    getEditor()?.getAction("save-file")?.run();
+    void runEditorAction("save-file");
   });
 
   document.getElementById("btn-export")?.addEventListener("click", () => {
-    getEditor()?.getAction("export-pdf")?.run();
+    void runEditorAction("export-pdf");
   });
 
   document.getElementById("btn-zoom-in")?.addEventListener("click", () => {

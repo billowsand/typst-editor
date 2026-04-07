@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { openFileFromTree, closeDocument, closeDocumentsUnderPath } from "../editor/MonacoEditor";
+import { closeDocument, closeDocumentsUnderPath, openFileFromTree } from "../editor/editorApi";
 
 // ─── Types ────────────────────────────────────────────────────────
 

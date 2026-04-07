@@ -8,6 +8,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(CompilerState::new())
+        .setup(|_| {
+            std::thread::spawn(|| {
+                let _ = crate::compiler::world::get_or_init_fonts();
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             commands::read_text_file,
             commands::open_file,

@@ -1,4 +1,4 @@
-import * as monaco from "monaco-editor";
+import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
 import { invoke } from "@tauri-apps/api/core";
 import {
   clientPointToPagePoint,
@@ -75,6 +75,18 @@ interface OpenDocument {
 }
 
 const openDocuments = new Map<string, OpenDocument>();
+
+function scheduleCursorPreviewSync(delay = 120): void {
+  if (cursorSyncTimeout) clearTimeout(cursorSyncTimeout);
+  cursorSyncTimeout = setTimeout(() => {
+    const currentEditor = editor;
+    const sel = currentEditor?.getSelection();
+    const pos = currentEditor?.getPosition();
+    if (!currentEditor || !sel || !pos || !sel.isEmpty()) return;
+    removeSyncOverlays("selection-hl");
+    void syncCursorToPreview(pos);
+  }, delay);
+}
 
 // ─── Monaco Theme Definitions ─────────────────────────────────────
 function defineMonacoThemes(): void {
@@ -208,22 +220,11 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
   });
 
   // ── Cursor → Preview (user-initiated only, debounced 120 ms) ────
-  // Explicit=3 covers keyboard; NotSet=0 covers mouse clicks.
   // We suppress sync when we move the cursor programmatically (preview→editor).
   editor.onDidChangeCursorPosition((e) => {
     updateCursorStatus(e.position.lineNumber, e.position.column);
     if (suppressCursorSync > 0) return;
-    const r = monaco.editor.CursorChangeReason;
-    if (e.reason === r.Explicit || e.reason === r.NotSet) {
-      if (cursorSyncTimeout) clearTimeout(cursorSyncTimeout);
-      cursorSyncTimeout = setTimeout(() => {
-        const sel = editor?.getSelection();
-        if (sel && sel.isEmpty()) {
-          removeSyncOverlays("selection-hl");
-          void syncCursorToPreview(e.position);
-        }
-      }, 120);
-    }
+    scheduleCursorPreviewSync();
     // Outline heading boundaries are line-level — skip the O(n) byte-offset conversion
     // when only the column changed (e.g. typing characters on the same line)
     if (e.position.lineNumber !== lastOutlineSyncLine) {
@@ -241,6 +242,7 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
     if (sel.isEmpty()) {
       // Selection cleared — remove selection overlays
       removeSyncOverlays("selection-hl");
+      if (suppressCursorSync === 0) scheduleCursorPreviewSync(80);
     } else {
       if (selSyncTimeout) clearTimeout(selSyncTimeout);
       selSyncTimeout = setTimeout(() => void syncSelectionToPreview(sel), 200);
