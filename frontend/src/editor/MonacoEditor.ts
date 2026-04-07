@@ -458,11 +458,11 @@ async function syncCursorToPreview(position: monaco.Position): Promise<void> {
   if (!model) return;
   if (!currentFilePath) return;
 
-  const offset = model.getOffsetAt(position);
   try {
     const positions = await invoke<PagePos[]>("jump_from_cursor", {
       filePath: currentFilePath,
-      cursor: offset,
+      line: position.lineNumber - 1,
+      character: position.column - 1,
     });
     if (positions.length > 0) highlightCursorInPreview(positions[0]);
   } catch { /* ignore */ }
@@ -474,14 +474,22 @@ async function syncSelectionToPreview(sel: monaco.Selection): Promise<void> {
   if (!model) return;
   if (!currentFilePath) return;
 
-  const startOff = model.getOffsetAt(sel.getStartPosition());
-  const endOff   = model.getOffsetAt(sel.getEndPosition());
-  if (startOff === endOff) return;
+  const startPos = sel.getStartPosition();
+  const endPos   = sel.getEndPosition();
+  if (startPos.equals(endPos)) return;
 
   try {
     const [startPositions, endPositions] = await Promise.all([
-      invoke<PagePos[]>("jump_from_cursor", { filePath: currentFilePath, cursor: startOff }),
-      invoke<PagePos[]>("jump_from_cursor", { filePath: currentFilePath, cursor: endOff }),
+      invoke<PagePos[]>("jump_from_cursor", {
+        filePath: currentFilePath,
+        line: startPos.lineNumber - 1,
+        character: startPos.column - 1,
+      }),
+      invoke<PagePos[]>("jump_from_cursor", {
+        filePath: currentFilePath,
+        line: endPos.lineNumber - 1,
+        character: endPos.column - 1,
+      }),
     ]);
 
     if (startPositions.length > 0 && endPositions.length > 0) {

@@ -140,7 +140,8 @@ html, body {
 .title-drag {
   display: flex;
   align-items: center;
-  padding: 0 8px;
+  min-width: 92px;
+  padding: 0 12px 0 8px;
   flex-shrink: 0;
 }
 
@@ -160,7 +161,6 @@ html, body {
 .toolbar-spacer {
   flex: 1 1 0;
   min-width: 0;
-  /* data-tauri-drag-region on this element */
 }
 
 /* Status floats inside the spacer */

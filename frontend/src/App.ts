@@ -95,7 +95,7 @@ export function createApp(): {
 
   toolbar.innerHTML = `
     <!-- Draggable title area (left, before buttons) -->
-    <div class="title-drag" data-tauri-drag-region>
+    <div class="title-drag">
       <span class="app-title">Typst</span>
     </div>
 
@@ -171,7 +171,7 @@ export function createApp(): {
     </div>
 
     <!-- Flex spacer: takes remaining space and acts as drag region -->
-    <div class="toolbar-spacer" data-tauri-drag-region></div>
+    <div class="toolbar-spacer"></div>
 
     <!-- Windows 11-style window controls (right edge, flush) -->
     <div class="win-controls">
@@ -241,8 +241,8 @@ export function createApp(): {
   `;
   app.appendChild(statusBar);
 
-  setupGutterDrag(treeGutter, sidebarPane, true);
-  setupGutterDrag(gutter, editorPane, false);
+  setupGutterDrag(treeGutter, sidebarPane, true, null);
+  setupGutterDrag(gutter, editorPane, false, previewPane);
 
   // Restore font UI (needs DOM)
   setTimeout(() => restoreFontUI(fontKey), 0);
@@ -297,6 +297,7 @@ const SVG_REST = `<svg viewBox="0 0 10 10"><rect x="2" y="0" width="8" height="8
 function setupWindowControls(): void {
   const win = getCurrentWindow();
 
+  const toolbar = document.querySelector(".toolbar") as HTMLDivElement | null;
   const closeBtn    = document.getElementById("wc-close")    as HTMLButtonElement | null;
   const minimizeBtn = document.getElementById("wc-minimize") as HTMLButtonElement | null;
   const maximizeBtn = document.getElementById("wc-maximize") as HTMLButtonElement | null;
@@ -320,12 +321,22 @@ function setupWindowControls(): void {
     await syncMaximizeState(win, maximizeBtn);
   });
 
-  // Double-click on any drag region → toggle maximize
-  document.querySelectorAll<HTMLElement>("[data-tauri-drag-region]").forEach((el) => {
-    el.addEventListener("dblclick", async () => {
-      await win.toggleMaximize();
-      await syncMaximizeState(win, maximizeBtn);
-    });
+  toolbar?.addEventListener("mousedown", async (e) => {
+    if (e.button !== 0) return;
+    const target = e.target as HTMLElement | null;
+    if (!target || isToolbarInteractiveTarget(target)) return;
+    if (e.detail > 1) return;
+    e.preventDefault();
+    try {
+      await win.startDragging();
+    } catch { /* non-Tauri preview context */ }
+  });
+
+  toolbar?.addEventListener("dblclick", async (e) => {
+    const target = e.target as HTMLElement | null;
+    if (!target || isToolbarInteractiveTarget(target)) return;
+    await win.toggleMaximize();
+    await syncMaximizeState(win, maximizeBtn);
   });
 
   // Re-sync icon when OS snaps or resizes the window externally
@@ -341,6 +352,12 @@ function setupWindowControls(): void {
 
   // Initial icon sync
   syncMaximizeState(win, maximizeBtn);
+}
+
+function isToolbarInteractiveTarget(target: HTMLElement): boolean {
+  return Boolean(target.closest(
+    "button, input, select, textarea, a, .settings-container, .settings-dropdown"
+  ));
 }
 
 async function syncMaximizeState(
@@ -504,12 +521,26 @@ function updateZoomLabel(): void {
 function setupGutterDrag(
   gutter: HTMLDivElement,
   pane: HTMLDivElement,
-  isFixed: boolean
+  isFixed: boolean,
+  previewPane: HTMLDivElement | null
 ): void {
   let dragging = false;
+  let startMouseX = 0;
+  let startGutterLeft = 0;
+  let startEditorWidth = 0;
+  let startPreviewWidth = 0;
+  let gutterWidth = 0;
 
   gutter.addEventListener("mousedown", (e) => {
     dragging = true;
+    startMouseX = e.clientX;
+    const gutterRect = gutter.getBoundingClientRect();
+    startGutterLeft = gutterRect.left;
+    gutterWidth = gutterRect.width;
+    startEditorWidth = pane.offsetWidth;
+    if (previewPane) {
+      startPreviewWidth = previewPane.offsetWidth;
+    }
     gutter.classList.add("dragging");
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
@@ -518,18 +549,30 @@ function setupGutterDrag(
 
   document.addEventListener("mousemove", (e) => {
     if (!dragging) return;
-    const parent     = pane.parentElement!;
+    const parent = pane.parentElement!;
     const parentRect = parent.getBoundingClientRect();
+    const delta = e.clientX - startMouseX;
+
     if (isFixed) {
-      const w = e.clientX - parentRect.left;
+      // Sidebar starts at container left, so gutter.left - container.left = sidebar width
+      const w = startGutterLeft + delta - parentRect.left;
       pane.style.flexBasis = `${Math.max(120, Math.min(420, w))}px`;
       pane.style.flexShrink = "0";
     } else {
-      const w = e.clientX - parentRect.left;
-      pane.style.flexBasis = `${w}px`;
+      // Use startEditorWidth + delta — avoids including sibling widths in the calculation
+      const minW = Math.max(parentRect.width * 0.2, 200);
+      const maxW = Math.min(parentRect.width * 0.8, 800);
+      const clampedW = Math.max(minW, Math.min(maxW, startEditorWidth + delta));
+      pane.style.flexBasis = `${clampedW}px`;
       pane.style.flexShrink = "0";
-      pane.style.minWidth = `${Math.max(parentRect.width * 0.2, 200)}px`;
-      pane.style.maxWidth = `${Math.min(parentRect.width * 0.8, 800)}px`;
+
+      if (previewPane) {
+        const totalWidth = startEditorWidth + gutterWidth + startPreviewWidth;
+        const newPreviewWidth = totalWidth - gutterWidth - clampedW;
+        previewPane.style.flexBasis = `${Math.max(200, newPreviewWidth)}px`;
+        previewPane.style.flexShrink = "0";
+        previewPane.style.flexGrow = "0";
+      }
     }
   });
 
@@ -539,5 +582,13 @@ function setupGutterDrag(
     gutter.classList.remove("dragging");
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
+
+    // Let preview pane fill remaining space via flex: 1 (CSS default)
+    // Editor pane keeps its flexBasis to maintain the split position
+    if (previewPane) {
+      previewPane.style.flexBasis = "";
+      previewPane.style.flexShrink = "";
+      previewPane.style.flexGrow = "";
+    }
   });
 }
