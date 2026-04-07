@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use typst::diag::FileError;
 use typst::foundations::{Bytes, Datetime};
@@ -9,7 +11,6 @@ use typst::utils::LazyHash;
 use typst::Library;
 use typst::LibraryExt;
 use typst::World;
-use std::sync::OnceLock;
 
 use typst_kit::fonts::{FontSearcher, Fonts};
 use typst_kit::package::{default_package_cache_path, default_package_path};
@@ -25,10 +26,16 @@ static FONTS: OnceLock<Fonts> = OnceLock::new();
 pub struct TypstWorld {
     /// Project root – parent directory of the main file.
     root: PathBuf,
+    /// Absolute path to the main source file.
+    main_path: PathBuf,
     /// The main source file.
     main_source: Source,
     /// In-memory overlays for edited non-main text sources.
     overlays: HashMap<FileId, Source>,
+    /// Absolute-path overlays keyed by file path for convenience.
+    overlay_paths: HashMap<PathBuf, FileId>,
+    /// Accessed files during compilation, used to build a route table.
+    touched_paths: Mutex<HashSet<PathBuf>>,
     /// Fonts (reference to the global cache).
     fonts: &'static Fonts,
     book: LazyHash<FontBook>,
@@ -55,15 +62,14 @@ impl TypstWorld {
     }
 
     fn new_with_root_impl(file_path: &str, content: &str, root: PathBuf) -> Result<Self, String> {
-        let abs = PathBuf::from(file_path);
+        let abs = absolutize_with_root(Path::new(file_path), &root);
 
-        let rel = VirtualPath::within_root(&abs, &root).unwrap_or_else(|| {
-            let name = abs
-                .file_name()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("main.typ"));
-            VirtualPath::new(name)
-        });
+        let rel = VirtualPath::within_root(&abs, &root).ok_or_else(|| {
+            format!(
+                "Main file is outside current project root: {}",
+                abs.display()
+            )
+        })?;
         let id = FileId::new(None, rel);
         let main_source = Source::new(id, content.to_string());
 
@@ -73,8 +79,11 @@ impl TypstWorld {
 
         Ok(Self {
             root,
+            main_path: abs.clone(),
             main_source,
             overlays: HashMap::new(),
+            overlay_paths: HashMap::new(),
+            touched_paths: Mutex::new(HashSet::from([abs])),
             fonts,
             book,
             library,
@@ -88,15 +97,19 @@ impl TypstWorld {
 
     /// Replace the text of any source file in-place.
     pub fn update_source_by_path(&mut self, file_path: &str, content: &str) -> Result<(), String> {
+        let abs = absolutize_with_root(Path::new(file_path), &self.root);
         let id = self
-            .file_id_for_path(Path::new(file_path))
+            .file_id_for_path(&abs)
             .ok_or_else(|| format!("File is outside current project root: {}", file_path))?;
 
         if id == self.main_source.id() {
             self.main_source.replace(content);
         } else {
-            self.overlays.insert(id, Source::new(id, content.to_string()));
+            self.overlays
+                .insert(id, Source::new(id, content.to_string()));
+            self.overlay_paths.insert(abs.clone(), id);
         }
+        self.touched_paths.lock().insert(abs);
 
         Ok(())
     }
@@ -112,26 +125,38 @@ impl TypstWorld {
     }
 
     pub fn source_by_path(&self, file_path: &str) -> Option<Source> {
-        let id = self.file_id_for_path(Path::new(file_path))?;
+        let abs = absolutize_with_root(Path::new(file_path), &self.root);
+        let id = self.file_id_for_path(&abs)?;
         self.source(id).ok()
     }
 
     pub fn resolve_absolute_path(&self, id: FileId) -> Option<PathBuf> {
+        if id == self.main_source.id() {
+            return Some(self.main_path.clone());
+        }
+        if let Some(path) = self
+            .overlay_paths
+            .iter()
+            .find_map(|(path, overlay_id)| (*overlay_id == id).then(|| path.clone()))
+        {
+            return Some(path);
+        }
         self.resolve_path(id).ok()
     }
 
-    fn file_id_for_path(&self, path: &Path) -> Option<FileId> {
-        let abs = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.root.join(path)
-        };
+    pub fn depended_paths(&self) -> Vec<PathBuf> {
+        let mut deps = self
+            .touched_paths
+            .lock()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        deps.sort();
+        deps
+    }
 
-        let rel = VirtualPath::within_root(&abs, &self.root).or_else(|| {
-            abs.file_name()
-                .map(PathBuf::from)
-                .map(VirtualPath::new)
-        })?;
+    fn file_id_for_path(&self, abs: &Path) -> Option<FileId> {
+        let rel = VirtualPath::within_root(abs, &self.root)?;
 
         Some(FileId::new(None, rel))
     }
@@ -153,6 +178,7 @@ impl TypstWorld {
     /// Read a source file from disk and parse it.
     fn read_source(&self, id: FileId) -> Result<Source, FileError> {
         let path = self.resolve_path(id)?;
+        self.touched_paths.lock().insert(path.clone());
         let text = std::fs::read_to_string(&path).map_err(|_| FileError::NotFound(path.clone()))?;
         Ok(Source::new(id, text))
     }
@@ -160,6 +186,7 @@ impl TypstWorld {
     /// Read a binary file from disk.
     fn read_file(&self, id: FileId) -> Result<Bytes, FileError> {
         let path = self.resolve_path(id)?;
+        self.touched_paths.lock().insert(path.clone());
         let data = std::fs::read(&path).map_err(|_| FileError::NotFound(path.clone()))?;
         Ok(Bytes::new(data))
     }
@@ -240,5 +267,13 @@ impl typst::World for TypstWorld {
 impl typst_ide::IdeWorld for TypstWorld {
     fn upcast(&self) -> &dyn typst::World {
         self
+    }
+}
+
+fn absolutize_with_root(path: &Path, root: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
     }
 }

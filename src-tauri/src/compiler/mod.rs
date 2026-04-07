@@ -1,8 +1,9 @@
 pub(crate) mod world;
 
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -16,129 +17,110 @@ pub struct CompilerState {
 }
 
 pub(crate) struct InnerState {
+    pub preview_entry: Option<PathBuf>,
+    pub pinned_preview_entry: Option<PathBuf>,
+    pub overlays: HashMap<PathBuf, String>,
+    pub route_table: HashMap<PathBuf, PathBuf>,
     pub world: Option<TypstWorld>,
     pub document: Option<Arc<PagedDocument>>,
     pub rendered_pages: Vec<String>,
     pub page_hashes: Vec<u64>,
-    /// Whether the *last* compilation succeeded.
     pub last_compile_ok: bool,
-    /// Cached project root to avoid repeated filesystem walks.
-    pub cached_root: Option<PathBuf>,
 }
 
 impl CompilerState {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(RwLock::new(InnerState {
+                preview_entry: None,
+                pinned_preview_entry: None,
+                overlays: HashMap::new(),
+                route_table: HashMap::new(),
                 world: None,
                 document: None,
                 rendered_pages: Vec::new(),
                 page_hashes: Vec::new(),
                 last_compile_ok: false,
-                cached_root: None,
             })),
         }
     }
 
-    /// Open a .typ file (path on disk) and initialize the world.
+    /// Force the preview to use this file as entry.
     pub fn open(&self, file_path: &str, content: &str) -> Result<(), String> {
-        let abs = PathBuf::from(file_path);
+        let entry = absolutize_editor_path(file_path)?;
         let mut state = self.inner.write();
+        state.overlays.insert(entry.clone(), content.to_string());
+        state.preview_entry = Some(entry);
+        Ok(())
+    }
 
-        // Fast path: reuse cached root only when BOTH paths are absolute and the
-        // file genuinely lives inside the cached root.  An empty or relative cached
-        // root (left over from opening the virtual "untitled.typ" at startup) must
-        // never be used for real absolute paths because Path::starts_with("") is
-        // vacuously true for every path, which would set the wrong root and break
-        // relative #import / #include resolution.
-        let root = state.cached_root.clone().and_then(|cached| {
-            if cached.is_absolute() && abs.is_absolute() && abs.starts_with(&cached) {
-                Some(cached)
-            } else {
-                None
-            }
-        });
+    /// Pins or unpins the preview entry explicitly.
+    pub fn pin_preview_entry(&self, file_path: Option<&str>) -> Result<(), String> {
+        let mut state = self.inner.write();
+        state.pinned_preview_entry = match file_path {
+            Some(path) => Some(absolutize_editor_path(path)?),
+            None => None,
+        };
+        Ok(())
+    }
 
-        let root = root.or_else(|| {
-            // Walk upward to find typst.toml (project root marker).
-            discover_project_root(&abs).or_else(|| {
-                if abs.is_absolute() {
-                    // Use the file's parent directory as root.
-                    abs.parent().map(|p| p.to_path_buf())
-                } else {
-                    // Virtual / untitled file – use the process working directory so
-                    // that the world is still functional without breaking anything.
-                    std::env::current_dir().ok()
-                }
-            })
-        })
-        .unwrap_or_else(|| PathBuf::from("."));
-
-        // Only persist absolute roots; a relative fallback must not poison the cache.
-        if root.is_absolute() {
-            state.cached_root = Some(root.clone());
-        }
-
-        let world = TypstWorld::new_with_root(file_path, content, &root)
-            .map_err(|e| format!("Failed to create TypstWorld: {}", e))?;
-
-        state.world = Some(world);
+    pub fn reset_session(&self) {
+        let mut state = self.inner.write();
+        state.preview_entry = None;
+        state.pinned_preview_entry = None;
+        state.overlays.clear();
+        state.route_table.clear();
+        state.world = None;
         state.document = None;
         state.rendered_pages.clear();
         state.page_hashes.clear();
         state.last_compile_ok = false;
-        Ok(())
     }
 
-    /// Update the source content and compile.
-    pub fn update_and_compile(&self, content: &str) -> CompileResult {
-        let main_path = {
-            let state = self.inner.read();
-            state
-                .world
-                .as_ref()
-                .map(|world| world.main().vpath().as_rootless_path().display().to_string())
-        };
-
-        match main_path {
-            Some(path) => self.update_file_and_compile(&path, content),
-            None => CompileResult {
-                success: false,
-                page_count: 0,
-                page_hashes: vec![],
-                errors: vec!["No file is open".into()],
-                warnings: vec![],
-                duration_ms: 0,
-            },
-        }
-    }
-
-    /// Update any file content and recompile the current main document.
+    /// Update any file content and compile the resolved entry for it.
     pub fn update_file_and_compile(&self, file_path: &str, content: &str) -> CompileResult {
-        let mut state = self.inner.write();
-        let Some(world) = &mut state.world else {
-            return CompileResult {
-                success: false,
-                page_count: 0,
-                page_hashes: vec![],
-                errors: vec!["No file is open".into()],
-                warnings: vec![],
-                duration_ms: 0,
-            };
+        let abs = match absolutize_editor_path(file_path) {
+            Ok(path) => path,
+            Err(err) => {
+                return CompileResult::error(vec![err]);
+            }
         };
 
-        if let Err(err) = world.update_source_by_path(file_path, content) {
-            return CompileResult {
-                success: false,
-                page_count: 0,
-                page_hashes: vec![],
-                errors: vec![err],
-                warnings: vec![],
-                duration_ms: 0,
-            };
+        let mut state = self.inner.write();
+        state.overlays.insert(abs.clone(), content.to_string());
+
+        let entry = resolve_entry_for_file(&state, &abs);
+        let previous_entry = state.preview_entry.clone();
+        let entry_content = match load_overlay_or_disk(&state, &entry) {
+            Ok(content) => content,
+            Err(err) => return CompileResult::error(vec![err]),
+        };
+
+        let root = resolve_root_for_path(&entry);
+        let mut world = match TypstWorld::new_with_root(
+            entry.to_string_lossy().as_ref(),
+            &entry_content,
+            &root,
+        ) {
+            Ok(world) => world,
+            Err(err) => {
+                return CompileResult::error(vec![format!("Failed to create TypstWorld: {err}")])
+            }
+        };
+
+        for (path, overlay) in state.overlays.iter() {
+            if *path == entry || !path_starts_with_root(path, &root) {
+                continue;
+            }
+
+            if let Err(err) = world.update_source_by_path(path.to_string_lossy().as_ref(), overlay)
+            {
+                return CompileResult::error(vec![err]);
+            }
         }
+
         let start = std::time::Instant::now();
-        let result = typst::compile::<PagedDocument>(world);
+        let result = typst::compile::<PagedDocument>(&world);
         let duration = start.elapsed();
 
         let mut compile_result = CompileResult {
@@ -148,12 +130,13 @@ impl CompilerState {
             errors: vec![],
             warnings: vec![],
             duration_ms: duration.as_millis() as u64,
+            entry_path: Some(entry.display().to_string()),
         };
 
         for warning in &result.warnings {
             compile_result
                 .warnings
-                .push(format_diagnostic(warning, world));
+                .push(format_diagnostic(warning, &world));
         }
 
         match result.output {
@@ -163,21 +146,37 @@ impl CompilerState {
                     .iter()
                     .map(|svg| hash_page(svg))
                     .collect::<Vec<_>>();
+                let depended_paths = world.depended_paths();
 
                 compile_result.success = true;
                 compile_result.page_count = doc.pages.len();
                 compile_result.page_hashes = page_hashes.clone();
+
+                state.preview_entry = Some(entry.clone());
+                state.world = Some(world);
                 state.document = Some(Arc::new(doc));
                 state.rendered_pages = rendered_pages;
                 state.page_hashes = page_hashes;
                 state.last_compile_ok = true;
+
+                for dep in depended_paths {
+                    state.route_table.insert(dep, entry.clone());
+                }
+                state.route_table.insert(abs, entry);
             }
             Err(errors) => {
                 for error in errors {
-                    compile_result.errors.push(format_diagnostic(&error, world));
+                    compile_result
+                        .errors
+                        .push(format_diagnostic(&error, &world));
                 }
-                // Keep the old document so preview isn't blank,
-                // but mark that compilation failed.
+                state.preview_entry = Some(entry);
+                state.world = Some(world);
+                if previous_entry.as_ref() != state.preview_entry.as_ref() {
+                    state.document = None;
+                    state.rendered_pages.clear();
+                    state.page_hashes.clear();
+                }
                 state.last_compile_ok = false;
             }
         }
@@ -195,8 +194,6 @@ impl CompilerState {
     }
 
     /// Export the current document as PDF bytes.
-    /// Returns `Err` if there is no document at all, or if the last compile
-    /// failed (stale document).
     pub fn export_pdf(&self) -> Result<Vec<u8>, String> {
         let state = self.inner.read();
         if state.document.is_none() {
@@ -221,10 +218,16 @@ impl CompilerState {
         })
     }
 
-    /// Get the project root directory path.
+    /// Get the project root directory path for the active preview entry.
     pub fn project_root(&self) -> Option<PathBuf> {
         let state = self.inner.read();
-        state.world.as_ref().map(|w| w.root().to_path_buf())
+        let entry = state.preview_entry.as_ref()?;
+        Some(resolve_root_for_path(entry))
+    }
+
+    /// Get the current preview entry path.
+    pub fn preview_entry(&self) -> Option<PathBuf> {
+        self.inner.read().preview_entry.clone()
     }
 
     /// Get the page count of the current document.
@@ -253,6 +256,69 @@ pub struct CompileResult {
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
     pub duration_ms: u64,
+    pub entry_path: Option<String>,
+}
+
+impl CompileResult {
+    fn error(errors: Vec<String>) -> Self {
+        Self {
+            success: false,
+            page_count: 0,
+            page_hashes: vec![],
+            errors,
+            warnings: vec![],
+            duration_ms: 0,
+            entry_path: None,
+        }
+    }
+}
+
+fn resolve_entry_for_file(state: &InnerState, file_path: &Path) -> PathBuf {
+    if let Some(entry) = state.pinned_preview_entry.as_ref() {
+        return entry.clone();
+    }
+
+    if let Some(entry) = state.route_table.get(file_path) {
+        return entry.clone();
+    }
+
+    if let Some(entry) = state.preview_entry.as_ref() {
+        if resolve_root_for_path(entry) == resolve_root_for_path(file_path) {
+            return entry.clone();
+        }
+    }
+
+    file_path.to_path_buf()
+}
+
+fn load_overlay_or_disk(state: &InnerState, path: &Path) -> Result<String, String> {
+    if let Some(content) = state.overlays.get(path) {
+        return Ok(content.clone());
+    }
+
+    std::fs::read_to_string(path).map_err(|e| format!("Failed to read {}: {}", path.display(), e))
+}
+
+fn resolve_root_for_path(path: &Path) -> PathBuf {
+    discover_project_root(path)
+        .or_else(|| path.parent().map(|p| p.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn absolutize_editor_path(path: &str) -> Result<PathBuf, String> {
+    let raw = PathBuf::from(path);
+    if raw.is_absolute() {
+        Ok(raw)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(raw))
+            .map_err(|e| format!("Failed to resolve {}: {}", path, e))
+    }
+}
+
+fn path_starts_with_root(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
 }
 
 pub(crate) fn hash_page(svg: &str) -> u64 {

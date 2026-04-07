@@ -1,10 +1,13 @@
 import {
   initEditor, getEditor, setZoom, getZoom,
   setMonacoTheme, setEditorFont,
-  pickFilePath, openFileAtPath, hasUnsavedDocuments,
+  pickFilePath, openFileAtPath, hasUnsavedDocuments, jumpToFileOffset,
 } from "./editor/MonacoEditor";
 import { initPreview } from "./preview/PreviewPanel";
+import { scrollPreviewToPosition } from "./preview/PreviewPanel";
 import { initFileTree, loadTree } from "./file-tree/FileTree";
+import { initOutlinePanel, type OutlineItem } from "./outline/OutlinePanel";
+import { initWorkspaceShell } from "./workspace/WorkspaceShell";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
@@ -71,6 +74,7 @@ export function createApp(): {
   editorContainer: HTMLDivElement;
   previewContainer: HTMLDivElement;
   fileTreeContainer: HTMLDivElement;
+  outlineContainer: HTMLDivElement;
 } {
   const app = document.getElementById("app")!;
   document.documentElement.dataset.theme = savedTheme();
@@ -188,9 +192,22 @@ export function createApp(): {
   const splitContainer = document.createElement("div");
   splitContainer.className = "split-container";
 
+  const sidebarPane = document.createElement("div");
+  sidebarPane.className = "sidebar-pane";
+  sidebarPane.id = "file-tree-pane";
+
   const fileTreePane = document.createElement("div");
   fileTreePane.className = "file-tree-pane";
-  fileTreePane.id = "file-tree-pane";
+  fileTreePane.id = "project-tree-pane";
+
+  const sidebarDivider = document.createElement("div");
+  sidebarDivider.className = "sidebar-divider";
+
+  const outlinePane = document.createElement("div");
+  outlinePane.className = "outline-pane";
+  outlinePane.id = "outline-pane";
+
+  sidebarPane.append(fileTreePane, sidebarDivider, outlinePane);
 
   const treeGutter = document.createElement("div");
   treeGutter.className = "gutter tree-gutter";
@@ -206,7 +223,7 @@ export function createApp(): {
   previewPane.className = "preview-pane";
   previewPane.id = "preview-pane";
 
-  splitContainer.append(fileTreePane, treeGutter, editorPane, gutter, previewPane);
+  splitContainer.append(sidebarPane, treeGutter, editorPane, gutter, previewPane);
   app.appendChild(splitContainer);
 
   const statusBar = document.createElement("div");
@@ -224,7 +241,7 @@ export function createApp(): {
   `;
   app.appendChild(statusBar);
 
-  setupGutterDrag(treeGutter, fileTreePane, true);
+  setupGutterDrag(treeGutter, sidebarPane, true);
   setupGutterDrag(gutter, editorPane, false);
 
   // Restore font UI (needs DOM)
@@ -234,12 +251,23 @@ export function createApp(): {
     editorContainer: editorPane,
     previewContainer: previewPane,
     fileTreeContainer: fileTreePane,
+    outlineContainer: outlinePane,
   };
 }
 
 export async function initApp(): Promise<void> {
-  const { editorContainer, previewContainer, fileTreeContainer } = createApp();
+  const { editorContainer, previewContainer, fileTreeContainer, outlineContainer } = createApp();
   initPreview(previewContainer);
+  initOutlinePanel(outlineContainer, handleOutlineSelect);
+  initWorkspaceShell({
+    splitContainer: document.querySelector(".split-container") as HTMLDivElement,
+    sidebarPane: document.getElementById("file-tree-pane") as HTMLDivElement,
+    treeGutter: document.querySelector(".tree-gutter") as HTMLDivElement,
+    editorPane: editorContainer,
+    previewGutter: document.querySelectorAll(".gutter")[1] as HTMLDivElement,
+    previewPane: previewContainer,
+    onOpen: () => promptOpenFile(fileTreeContainer),
+  });
   await initEditor(editorContainer);
   bindToolbarButtons(fileTreeContainer);
   setupPreviewZoom();
@@ -249,6 +277,15 @@ export async function initApp(): Promise<void> {
 
   // Apply saved font
   applyFont(savedFontKey(), savedFontSize(), savedCustomFont());
+}
+
+async function handleOutlineSelect(item: OutlineItem): Promise<void> {
+  if (item.position) {
+    scrollPreviewToPosition(item.position);
+  }
+  if (item.file && item.offset != null) {
+    await jumpToFileOffset(item.file, item.offset, false);
+  }
 }
 
 // ─── Frameless Window Controls ────────────────────────────────────
@@ -404,15 +441,7 @@ function bindToolbarButtons(fileTreeContainer: HTMLDivElement): void {
   });
 
   document.getElementById("btn-open")?.addEventListener("click", async () => {
-    const path = await pickFilePath();
-    if (!path) return;
-
-    const treeTask = invoke<string | null>("resolve_project_root", { filePath: path })
-      .then((root) => root ? loadTree(fileTreeContainer, root, 0) : undefined)
-      .catch(() => undefined);
-
-    await openFileAtPath(path);
-    await treeTask;
+    await promptOpenFile(fileTreeContainer);
   });
 
   document.getElementById("btn-save")?.addEventListener("click", () => {
@@ -437,6 +466,18 @@ function bindToolbarButtons(fileTreeContainer: HTMLDivElement): void {
     setZoom(1.0);
     updateZoomLabel();
   });
+}
+
+async function promptOpenFile(fileTreeContainer: HTMLDivElement): Promise<void> {
+  const path = await pickFilePath();
+  if (!path) return;
+
+  const treeTask = invoke<string | null>("resolve_project_root", { filePath: path })
+    .then((root) => root ? loadTree(fileTreeContainer, root, 0) : undefined)
+    .catch(() => undefined);
+
+  await openFileAtPath(path);
+  await treeTask;
 }
 
 function setupPreviewZoom(): void {
@@ -481,10 +522,14 @@ function setupGutterDrag(
     const parentRect = parent.getBoundingClientRect();
     if (isFixed) {
       const w = e.clientX - parentRect.left;
-      pane.style.width = `${Math.max(120, Math.min(420, w))}px`;
+      pane.style.flexBasis = `${Math.max(120, Math.min(420, w))}px`;
+      pane.style.flexShrink = "0";
     } else {
-      const pct = ((e.clientX - parentRect.left) / parentRect.width) * 100;
-      pane.style.width = `${Math.max(20, Math.min(80, pct))}%`;
+      const w = e.clientX - parentRect.left;
+      pane.style.flexBasis = `${w}px`;
+      pane.style.flexShrink = "0";
+      pane.style.minWidth = `${Math.max(parentRect.width * 0.2, 200)}px`;
+      pane.style.maxWidth = `${Math.min(parentRect.width * 0.8, 800)}px`;
     }
   });
 

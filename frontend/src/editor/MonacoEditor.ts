@@ -1,5 +1,19 @@
 import * as monaco from "monaco-editor";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  clientPointToPagePoint,
+  ensurePreviewPageNode,
+  getPreviewContent,
+  getPreviewPane,
+  getPreviewPageSvg,
+  pagePointToPanePoint,
+  replacePreviewPageSvg,
+  resetPreviewContent,
+  scrollPreviewToPosition,
+  trimPreviewPages,
+} from "../preview/PreviewPanel";
+import { clearOutlinePanel, refreshOutlinePanel } from "../outline/OutlinePanel";
+import { showEmptyWorkspace, showWorkspaceLayout } from "../workspace/WorkspaceShell";
 
 let editor: monaco.editor.IStandaloneCodeEditor | null = null;
 let compileTimeout:    ReturnType<typeof setTimeout> | null = null;
@@ -17,6 +31,7 @@ let latestCompileRequestId  = 0;
 let renderedPageHashes: number[] = [];
 let tabsHost: HTMLDivElement | null = null;
 let editorHost: HTMLDivElement | null = null;
+let tabContextMenu: HTMLDivElement | null = null;
 
 interface OpenDocument {
   path: string;
@@ -27,15 +42,6 @@ interface OpenDocument {
 }
 
 const openDocuments = new Map<string, OpenDocument>();
-
-const DEFAULT_CONTENT = `#set page(width: 10cm, height: auto)
-
-= Hello, Typst!
-
-This is a *live preview* editor built with _Tauri_ and _Typst_.
-
-#lorem(50)
-`;
 
 // ─── Monaco Theme Definitions ─────────────────────────────────────
 function defineMonacoThemes(): void {
@@ -127,10 +133,7 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
   editorHost.className = "editor-surface";
   container.appendChild(editorHost);
 
-  const untitledDoc = createDocument("untitled.typ", DEFAULT_CONTENT);
-
   editor = monaco.editor.create(editorHost, {
-    model: untitledDoc.model,
     language: "typst",
     theme: savedTheme === "dark" ? "typst-dark" : "typst-light",
     automaticLayout: true,
@@ -152,24 +155,11 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
     bracketPairColorization: { enabled: true },
   });
 
-  setCurrentFilePath(untitledDoc.path);
+  setCurrentFilePath(null);
   renderTabs();
-
-  // Initialize world with default content
-  const result = await invoke<CompileResult>("open_file", {
-    filePath: "untitled.typ",
-    content: DEFAULT_CONTENT,
-  });
-  if (result.success) {
-    previewEntryPath = "untitled.typ";
-    lastSuccessfulPageCount = result.page_count;
-    updatePageStatus(result.page_count);
-    await renderAllPages(result.page_count, result.page_hashes);
-    updateStatus("success", `Compiled · ${result.page_count} page(s)`);
-  } else {
-    updatePageStatus(0);
-    updateStatus("error", result.errors.join("; "));
-  }
+  updatePageStatus(0);
+  clearOutlinePanel();
+  updateStatus("success", "Ready");
 
   // ── Live compile (debounced 300 ms) ───────────────────────────
   editor.onDidChangeModelContent(() => {
@@ -244,6 +234,18 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
     keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyW],
     run: () => closeCurrentTab(),
   });
+  editor.addAction({
+    id: "set-preview-entry",
+    label: "Set Preview Entry",
+    keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter],
+    run: () => setCurrentDocumentAsPreviewEntry(),
+  });
+  editor.addAction({
+    id: "clear-preview-entry-pin",
+    label: "Clear Preview Entry Pin",
+    keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.Enter],
+    run: () => clearPreviewEntryPin(),
+  });
 }
 
 // ─── Accessors ────────────────────────────────────────────────────
@@ -270,7 +272,7 @@ let currentZoom = 1.0;
 
 export function setZoom(zoom: number): void {
   currentZoom = zoom;
-  const content = document.querySelector<HTMLElement>(".preview-content");
+  const content = getPreviewContent();
   if (content) {
     content.style.transform = `scale(${zoom})`;
     content.style.transformOrigin = "top center";
@@ -287,6 +289,15 @@ interface CompileResult {
   page_hashes: number[];
   errors: string[];
   duration_ms?: number;
+  entry_path?: string | null;
+}
+
+interface JumpResult {
+  type: string;
+  file?: string | null;
+  offset?: number | null;
+  url?: string | null;
+  position?: PagePos | null;
 }
 
 export async function compileAndPreview(): Promise<void> {
@@ -304,14 +315,17 @@ export async function compileAndPreview(): Promise<void> {
     if (requestId < latestCompileRequestId) return; // stale
 
     if (result.success) {
+      previewEntryPath = result.entry_path ?? previewEntryPath;
       lastSuccessfulPageCount = result.page_count;
       updatePageStatus(result.page_count);
       await renderAllPages(result.page_count, result.page_hashes);
+      await refreshOutlinePanel();
       updateStatus("success",
         `Compiled in ${result.duration_ms ?? "?"}ms · ${result.page_count} page(s)`);
       clearDiagnostics();
     } else {
       updatePageStatus(0);
+      clearOutlinePanel();
       updateStatus("error", `${result.errors.length} error(s)`);
       showDiagnostics(result.errors);
     }
@@ -374,10 +388,7 @@ async function saveCurrentFile(): Promise<void> {
       activeDoc.dirty = false;
       renderTabs();
     }
-    const result = path === previewEntryPath || !previewEntryPath
-      ? await invoke<CompileResult>("open_file", { filePath: path, content })
-      : await invoke<CompileResult>("compile_current", { filePath: path, content });
-    if (!previewEntryPath) previewEntryPath = path;
+    const result = await invoke<CompileResult>("compile_current", { filePath: path, content });
     if (!result.success) {
       updatePageStatus(0);
       showDiagnostics(result.errors);
@@ -385,9 +396,11 @@ async function saveCurrentFile(): Promise<void> {
       return;
     }
     resetPreviewState();
+    previewEntryPath = result.entry_path ?? previewEntryPath;
     lastSuccessfulPageCount = result.page_count;
     updatePageStatus(result.page_count);
     await renderAllPages(result.page_count, result.page_hashes);
+    await refreshOutlinePanel();
     updateStatus("success", "Saved");
   } catch (e) {
     updateStatus("error", `Save failed: ${e}`);
@@ -407,6 +420,32 @@ async function exportPdf(): Promise<void> {
 export async function openFileFromTree(path: string): Promise<void> {
   if (!editor) return;
   await openFileAtPath(path);
+}
+
+export async function jumpToFileOffset(
+  path: string,
+  offset: number,
+  refreshPreview = false,
+): Promise<void> {
+  const targetDoc = openDocuments.get(path);
+  if (targetDoc) {
+    await switchToDocument(targetDoc, refreshPreview);
+  } else {
+    await openFileAtPath(path);
+  }
+
+  if (!editor) return;
+  const model = editor.getModel();
+  if (!model) return;
+
+  const pos = model.getPositionAt(offset);
+  suppressCursorSync++;
+  editor.setPosition(pos);
+  editor.revealPositionInCenter(pos);
+  editor.focus();
+  setTimeout(() => {
+    suppressCursorSync = Math.max(0, suppressCursorSync - 1);
+  }, 50);
 }
 
 // ─── Bidirectional Sync ───────────────────────────────────────────
@@ -465,67 +504,21 @@ async function handlePreviewClick(
   svgEl: SVGSVGElement,
   pageIndex: number
 ): Promise<void> {
-  const rect  = svgEl.getBoundingClientRect();
-  const scaleX = parseFloat(svgEl.getAttribute("width")  || "1") / rect.width;
-  const scaleY = parseFloat(svgEl.getAttribute("height") || "1") / rect.height;
-  const ptX   = (e.clientX - rect.left) * scaleX;
-  const ptY   = (e.clientY - rect.top)  * scaleY;
+  const pagePoint = clientPointToPagePoint(svgEl, e.clientX, e.clientY);
 
   try {
-    const result = await invoke<{
-      type: string;
-      file?: string | null;
-      offset?: number | null;
-      url?: string | null;
-      page?: number | null;
-      x?: number | null;
-      y?: number | null;
-    }>("jump_from_click", { page: pageIndex + 1, x: ptX, y: ptY });
+    const result = await invoke<JumpResult>("jump_from_click", {
+      page: pageIndex + 1,
+      x: pagePoint.x,
+      y: pagePoint.y,
+    });
 
     if (result.type === "file" && result.offset != null && result.file && editor) {
-      const targetPath = result.file;
-      const targetDoc = openDocuments.get(targetPath);
-      if (targetDoc) {
-        await switchToDocument(targetDoc, false);
-      } else {
-        await openFileAtPath(targetPath);
-      }
-
-      const model = editor.getModel();
-      if (model) {
-        const pos = model.getPositionAt(result.offset);
-        // Suppress cursor-sync so the editor jump doesn't echo back to the preview
-        suppressCursorSync++;
-        editor.setPosition(pos);
-        editor.revealPositionInCenter(pos);
-        editor.focus();
-        setTimeout(() => { suppressCursorSync = Math.max(0, suppressCursorSync - 1); }, 50);
-      }
+      await jumpToFileOffset(result.file, result.offset, false);
     } else if (result.type === "url" && result.url) {
       window.open(result.url, "_blank", "noopener,noreferrer");
-    } else if (result.type === "position" && result.page != null && result.x != null && result.y != null && editor) {
-      // Position type: query the corresponding text offset and jump to it
-      const positions = currentFilePath
-        ? await invoke<PagePos[]>("jump_from_cursor", {
-            filePath: currentFilePath,
-            cursor: editor.getModel()?.getOffsetAt({ lineNumber: 1, column: 1 }) ?? 0,
-          })
-        : [];
-      if (positions.length > 0) {
-        // Find position on the target page, fallback to first position
-        const targetPos = positions.find(p => p.page === result.page) ?? positions[0];
-        const model = editor.getModel();
-        if (model) {
-          // Estimate offset from page position (fallback: use page * 1000 as approximation)
-          const approxOffset = Math.max(0, (result.page! - 1) * 1000 + Math.floor(result.x!) + Math.floor(result.y!));
-          const pos = model.getPositionAt(Math.min(approxOffset, model.getValueLength()));
-          suppressCursorSync++;
-          editor.setPosition(pos);
-          editor.revealPositionInCenter(pos);
-          editor.focus();
-          setTimeout(() => { suppressCursorSync = Math.max(0, suppressCursorSync - 1); }, 50);
-        }
-      }
+    } else if (result.type === "position" && result.position) {
+      scrollPreviewToPosition(result.position);
     }
   } catch { /* ignore */ }
 }
@@ -543,31 +536,24 @@ function removeSyncOverlays(cls: string): void {
 function highlightCursorInPreview(pos: PagePos): void {
   removeSyncOverlays("cursor-hl");
 
-  const pane = document.getElementById("preview-pane");
-  const svgs = pane?.querySelectorAll<SVGSVGElement>("svg");
-  if (!svgs || svgs.length < pos.page) {
-    console.warn(`[cursor sync] page ${pos.page} out of range (${svgs?.length ?? 0} pages rendered)`);
+  const pane = getPreviewPane();
+  const svgEl = getPreviewPageSvg(pos.page);
+  const panePoint = pagePointToPanePoint(pos);
+  if (!pane || !svgEl || !panePoint) {
+    const totalPages = getPreviewContent()?.querySelectorAll<SVGSVGElement>("svg").length ?? 0;
+    console.warn(`[cursor sync] page ${pos.page} out of range (${totalPages} pages rendered)`);
     return;
   }
 
-  const svgEl    = svgs[pos.page - 1];
-  const rect     = svgEl.getBoundingClientRect();
-  const paneRect = pane!.getBoundingClientRect();
-  const scaleY   = rect.height / parseFloat(svgEl.getAttribute("height") || "1");
-  const screenY  = pos.y * scaleY;
-
   const overlay        = document.createElement("div");
   overlay.className    = "highlight-overlay cursor-hl";
-  overlay.style.left   = `${rect.left - paneRect.left + pane!.scrollLeft}px`;
-  overlay.style.top    = `${rect.top  - paneRect.top  + pane!.scrollTop + screenY - 12}px`;
-  overlay.style.width  = `${rect.width}px`;
+  overlay.style.left   = `${panePoint.left}px`;
+  overlay.style.top    = `${panePoint.top - 12}px`;
+  overlay.style.width  = `${panePoint.pageWidth}px`;
   overlay.style.height = "24px";
 
-  pane!.querySelector(".preview-content")!.appendChild(overlay);
-
-  // Smooth-scroll so the cursor line is roughly centred in the pane
-  const targetTop = rect.top - paneRect.top + pane!.scrollTop + screenY - paneRect.height / 2;
-  pane!.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
+  getPreviewContent()?.appendChild(overlay);
+  scrollPreviewToPosition(pos);
 
   setTimeout(() => overlay.classList.add("fade"), 1500);
   setTimeout(() => overlay.remove(), 2000);
@@ -582,13 +568,11 @@ function highlightCursorInPreview(pos: PagePos): void {
 function highlightRangeInPreview(start: PagePos, end: PagePos, clearFirst = true): void {
   if (clearFirst) removeSyncOverlays("selection-hl");
 
-  const pane = document.getElementById("preview-pane");
-  const svgs = pane?.querySelectorAll<SVGSVGElement>("svg");
+  const pane = getPreviewPane();
+  const contentEl = getPreviewContent();
+  const svgs = contentEl?.querySelectorAll<SVGSVGElement>("svg");
   if (!svgs || svgs.length === 0) return;
-
-  const paneRect  = pane!.getBoundingClientRect();
-  const contentEl = pane!.querySelector<HTMLElement>(".preview-content");
-  if (!contentEl) return;
+  if (!pane || !contentEl) return;
 
   const firstPage = Math.min(start.page, end.page);
   const lastPage  = Math.max(start.page, end.page);
@@ -598,7 +582,9 @@ function highlightRangeInPreview(start: PagePos, end: PagePos, clearFirst = true
     if (!svgEl) continue;
 
     const rect  = svgEl.getBoundingClientRect();
-    const svgH  = parseFloat(svgEl.getAttribute("height") || "1");
+    const panePoint = pagePointToPanePoint({ page: p, x: 0, y: 0 });
+    if (!panePoint) continue;
+    const svgH  = svgEl.viewBox.baseVal.height || parseFloat(svgEl.getAttribute("height") || "1");
     const scaleY = rect.height / svgH;
 
     let topY: number;
@@ -622,22 +608,15 @@ function highlightRangeInPreview(start: PagePos, end: PagePos, clearFirst = true
 
     const overlay        = document.createElement("div");
     overlay.className    = "highlight-overlay selection-hl";
-    overlay.style.left   = `${rect.left - paneRect.left + pane!.scrollLeft + 2}px`;
-    overlay.style.top    = `${rect.top  - paneRect.top  + pane!.scrollTop  + topY}px`;
+    overlay.style.left   = `${panePoint.left + 2}px`;
+    overlay.style.top    = `${panePoint.top + topY}px`;
     overlay.style.width  = `${rect.width - 4}px`;
     overlay.style.height = `${height}px`;
 
     contentEl.appendChild(overlay);
   }
 
-  // Scroll so the start of the selection is visible
-  if (firstPage <= svgs.length) {
-    const svgEl  = svgs[firstPage - 1];
-    const rect   = svgEl.getBoundingClientRect();
-    const scaleY = rect.height / parseFloat(svgEl.getAttribute("height") || "1");
-    const targetTop = rect.top - paneRect.top + pane!.scrollTop + start.y * scaleY - 80;
-    pane!.scrollTo({ top: Math.max(0, targetTop), behavior: "smooth" });
-  }
+  scrollPreviewToPosition(start);
 }
 
 // ─── Rendering ────────────────────────────────────────────────────
@@ -645,19 +624,18 @@ export async function renderAllPages(
   pageCount: number,
   pageHashes: number[]
 ): Promise<void> {
-  const contentDiv = ensurePreviewContent();
-  trimRemovedPages(contentDiv, pageCount);
+  trimPreviewPages(pageCount);
 
   for (let i = 0; i < pageCount; i++) {
     const pageHash = pageHashes[i];
-    const pageNode = ensurePageNode(contentDiv, i);
+    const pageNode = ensurePreviewPageNode(i);
     if (renderedPageHashes[i] === pageHash) continue; // unchanged
 
     try {
       const svg = await invoke<string>("render_page", { page: i });
       // Discard if hash changed while awaiting (newer compile running)
       if (pageHash !== pageHashes[i]) continue;
-      replacePageSvg(pageNode, svg, i);
+      if (!replacePreviewPageSvg(i, svg, handlePreviewClick)) continue;
       renderedPageHashes[i] = pageHash;
       pageNode.classList.add("page-updated");
       setTimeout(() => pageNode.classList.remove("page-updated"), 120);
@@ -666,49 +644,10 @@ export async function renderAllPages(
 
   renderedPageHashes.length = pageCount;
 }
-
-function ensurePreviewContent(): HTMLDivElement {
-  const pane = document.getElementById("preview-pane") as HTMLDivElement | null;
-  if (!pane) throw new Error("Preview pane not found");
-  let div = pane.querySelector<HTMLDivElement>(".preview-content");
-  if (!div) {
-    div = document.createElement("div");
-    div.className = "preview-content";
-    pane.appendChild(div);
-  }
-  return div;
-}
-
-function ensurePageNode(contentDiv: HTMLDivElement, index: number): HTMLDivElement {
-  let node = contentDiv.querySelector<HTMLDivElement>(`[data-page-index="${index}"]`);
-  if (!node) {
-    node = document.createElement("div");
-    node.className = "preview-page";
-    node.dataset.pageIndex = String(index);
-    contentDiv.appendChild(node);
-  }
-  return node;
-}
-
-function replacePageSvg(node: HTMLDivElement, svg: string, pageIndex: number): void {
-  const wrapper     = document.createElement("div");
-  wrapper.innerHTML = svg;
-  const svgEl       = wrapper.firstElementChild as SVGSVGElement | null;
-  if (!svgEl) return;
-  svgEl.addEventListener("click", (e) => handlePreviewClick(e, svgEl, pageIndex));
-  node.replaceChildren(svgEl);
-}
-
-function trimRemovedPages(contentDiv: HTMLDivElement, pageCount: number): void {
-  contentDiv.querySelectorAll<HTMLDivElement>(".preview-page").forEach((n) => {
-    if (Number(n.dataset.pageIndex ?? -1) >= pageCount) n.remove();
-  });
-}
-
 function resetPreviewState(): void {
   latestCompileRequestId++;
   renderedPageHashes = [];
-  document.querySelector(".preview-content")?.replaceChildren();
+  resetPreviewContent();
 }
 
 function createDocument(path: string, content: string): OpenDocument {
@@ -744,6 +683,7 @@ function updateActiveDocumentState(): void {
 
 async function switchToDocument(doc: OpenDocument, refreshPreview = true): Promise<void> {
   if (!editor) return;
+  showWorkspaceLayout();
 
   const currentDoc = getActiveDocument();
   if (currentDoc && currentDoc.path !== doc.path) {
@@ -787,8 +727,18 @@ async function closeDocument(path: string): Promise<void> {
   doc.model.dispose();
 
   if (openDocuments.size === 0) {
-    const untitledDoc = createDocument("untitled.typ", DEFAULT_CONTENT);
-    await switchToDocument(untitledDoc);
+    editor?.setModel(null);
+    setCurrentFilePath(null);
+    previewEntryPath = "";
+    lastSuccessfulPageCount = 0;
+    resetPreviewState();
+    renderTabs();
+    clearDiagnostics();
+    clearOutlinePanel();
+    updatePageStatus(0);
+    updateStatus("success", "Ready");
+    await invoke("reset_session");
+    showEmptyWorkspace();
     return;
   }
 
@@ -804,29 +754,69 @@ async function closeDocument(path: string): Promise<void> {
 async function compileOpenDocument(doc: OpenDocument): Promise<void> {
   try {
     const content = doc.model.getValue();
-    const currentRoot = await invoke<string | null>("get_project_root").catch(() => null);
-    const targetRoot = await invoke<string | null>("resolve_project_root", { filePath: doc.path }).catch(() => null);
-    const shouldOpenAsEntry = !previewEntryPath || !currentRoot || !targetRoot || currentRoot !== targetRoot;
-    const result = shouldOpenAsEntry
+    const result = !previewEntryPath
       ? await invoke<CompileResult>("open_file", { filePath: doc.path, content })
       : await invoke<CompileResult>("compile_current", { filePath: doc.path, content });
 
-    if (shouldOpenAsEntry) previewEntryPath = doc.path;
-
     if (result.success) {
+      showWorkspaceLayout();
+      previewEntryPath = result.entry_path ?? previewEntryPath;
       lastSuccessfulPageCount = result.page_count;
       updatePageStatus(result.page_count);
       await renderAllPages(result.page_count, result.page_hashes);
+      await refreshOutlinePanel();
       updateStatus("success", `Compiled · ${result.page_count} page(s)`);
       clearDiagnostics();
     } else {
       updatePageStatus(0);
+      clearOutlinePanel();
       updateStatus("error", result.errors.join("; "));
       showDiagnostics(result.errors);
     }
   } catch (e) {
     updatePageStatus(0);
     updateStatus("error", `Failed to compile: ${e}`);
+  }
+}
+
+async function setCurrentDocumentAsPreviewEntry(): Promise<void> {
+  if (!editor || !currentFilePath) return;
+
+  try {
+    const result = await invoke<CompileResult>("set_preview_entry", {
+      filePath: currentFilePath,
+      content: editor.getValue(),
+    });
+
+    if (!result.success) {
+      updatePageStatus(0);
+      updateStatus("error", result.errors.join("; "));
+      showDiagnostics(result.errors);
+      return;
+    }
+
+    resetPreviewState();
+    showWorkspaceLayout();
+    previewEntryPath = result.entry_path ?? currentFilePath;
+    lastSuccessfulPageCount = result.page_count;
+    updatePageStatus(result.page_count);
+    await renderAllPages(result.page_count, result.page_hashes);
+    await refreshOutlinePanel();
+    updateStatus("success", "Preview entry updated");
+    clearDiagnostics();
+  } catch (e) {
+    updateStatus("error", `Failed to set preview entry: ${e}`);
+  }
+}
+
+async function clearPreviewEntryPin(): Promise<void> {
+  if (!editor || !currentFilePath) return;
+
+  try {
+    await invoke("clear_preview_entry_pin");
+    await compileAndPreview();
+  } catch (e) {
+    updateStatus("error", `Failed to clear preview entry pin: ${e}`);
   }
 }
 
@@ -866,8 +856,64 @@ function renderTabs(): void {
       await switchToDocument(doc);
     });
 
+    tab.addEventListener("contextmenu", (event) => {
+      event.preventDefault();
+      showTabContextMenu(event.clientX, event.clientY, doc.path);
+    });
+
     tabsHost.appendChild(tab);
   }
+}
+
+function showTabContextMenu(x: number, y: number, path: string): void {
+  hideTabContextMenu();
+
+  const menu = document.createElement("div");
+  menu.className = "tab-context-menu";
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+
+  const setMain = document.createElement("button");
+  setMain.type = "button";
+  setMain.className = "tab-context-menu-item";
+  setMain.textContent = path === previewEntryPath ? "当前已是主文件" : "设为主文件";
+  setMain.disabled = path === previewEntryPath;
+  setMain.addEventListener("click", async () => {
+    hideTabContextMenu();
+    const targetDoc = openDocuments.get(path);
+    if (!targetDoc || !editor) return;
+    if (currentFilePath !== path) {
+      await switchToDocument(targetDoc, false);
+    }
+    await setCurrentDocumentAsPreviewEntry();
+  });
+
+  const clearMain = document.createElement("button");
+  clearMain.type = "button";
+  clearMain.className = "tab-context-menu-item";
+  clearMain.textContent = "取消主文件固定";
+  clearMain.addEventListener("click", async () => {
+    hideTabContextMenu();
+    await clearPreviewEntryPin();
+  });
+
+  menu.append(setMain, clearMain);
+  document.body.appendChild(menu);
+  tabContextMenu = menu;
+
+  setTimeout(() => {
+    document.addEventListener("mousedown", handleTabContextMenuDismiss, { once: true });
+    document.addEventListener("blur", handleTabContextMenuDismiss, { once: true });
+  }, 0);
+}
+
+function handleTabContextMenuDismiss(): void {
+  hideTabContextMenu();
+}
+
+function hideTabContextMenu(): void {
+  tabContextMenu?.remove();
+  tabContextMenu = null;
 }
 
 // ─── Typst Language ───────────────────────────────────────────────
