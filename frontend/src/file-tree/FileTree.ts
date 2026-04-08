@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { closeDocument, closeDocumentsUnderPath, openFileFromTree } from "../editor/editorApi";
+import { closeDocument, closeDocumentsUnderPath, openFileFromTree, setPreviewEntryAtPath } from "../editor/editorApi";
 
 // ─── Types ────────────────────────────────────────────────────────
 
@@ -479,10 +479,7 @@ function dismissContextMenu(): void {
 }
 
 async function setAsPreviewEntry(path: string): Promise<void> {
-  try {
-    const content = await invoke<string>("read_text_file", { path });
-    await invoke("set_preview_entry", { filePath: path, content });
-  } catch { /* ignore */ }
+  await setPreviewEntryAtPath(path);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────

@@ -26,11 +26,12 @@ pub fn get_or_init_fonts() -> &'static Fonts {
 
 /// Implements `typst::World` for the editor.
 ///
-/// Resolves files relative to a project root directory (the parent of the
-/// main file). Supports `#import`, `#include`, images and any other external
-/// resources by reading from disk on demand.
+/// Resolves files relative to an access root directory. When a `typst.toml`
+/// is present, that project root is used. Otherwise the access root falls back
+/// to the filesystem root for the opened file so standalone documents can still
+/// import shared files from parent directories.
 pub struct TypstWorld {
-    /// Project root – parent directory of the main file.
+    /// Typst access root used for file sandboxing.
     root: PathBuf,
     /// Absolute path to the main source file.
     main_path: PathBuf,
@@ -55,8 +56,7 @@ impl TypstWorld {
     /// `content`   – the text content of that file.
     pub fn new(file_path: &str, content: &str) -> Result<Self, String> {
         let abs = PathBuf::from(file_path);
-        let root = discover_project_root(&abs)
-            .or_else(|| abs.parent().map(|p| p.to_path_buf()))
+        let root = discover_access_root(&abs)
             .unwrap_or_else(|| PathBuf::from("."));
 
         Self::new_with_root_impl(file_path, content, root)
@@ -216,6 +216,24 @@ pub(crate) fn discover_project_root(path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+pub(crate) fn discover_access_root(path: &Path) -> Option<PathBuf> {
+    discover_project_root(path).or_else(|| discover_filesystem_root(path))
+}
+
+fn discover_filesystem_root(path: &Path) -> Option<PathBuf> {
+    let start = if path.is_dir() {
+        path
+    } else {
+        path.parent().unwrap_or(path)
+    };
+
+    start
+        .ancestors()
+        .last()
+        .map(Path::to_path_buf)
+        .filter(|root| !root.as_os_str().is_empty())
 }
 
 fn resolve_package_root(spec: &typst::syntax::package::PackageSpec) -> Option<PathBuf> {

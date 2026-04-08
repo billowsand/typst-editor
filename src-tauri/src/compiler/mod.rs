@@ -11,7 +11,7 @@ use std::sync::MutexGuard;
 use parking_lot::RwLock;
 use typst::layout::PagedDocument;
 use typst::World;
-use world::{discover_project_root, TypstWorld};
+use world::{discover_access_root, discover_project_root, TypstWorld};
 
 /// Mutex to prevent concurrent compilations from racing
 static COMPILE_MUTEX: Mutex<()> = Mutex::new(());
@@ -124,7 +124,7 @@ impl CompilerState {
             Err(err) => return CompileResult::error(vec![err]),
         };
 
-        let root = resolve_root_for_path(&entry);
+        let root = resolve_access_root_for_path(&entry);
 
         // Check if any file content actually changed (compare BEFORE updating hashes)
         let content_hash = hash_content(content);
@@ -199,6 +199,10 @@ impl CompilerState {
                 warnings: vec![],
                 duration_ms: 0,
                 entry_path: Some(entry_path_str),
+                pinned_entry_path: state
+                    .pinned_preview_entry
+                    .as_ref()
+                    .map(|path| path.display().to_string()),
             };
         }
 
@@ -258,6 +262,10 @@ impl CompilerState {
             warnings: vec![],
             duration_ms: duration.as_millis() as u64,
             entry_path: Some(entry.display().to_string()),
+            pinned_entry_path: state
+                .pinned_preview_entry
+                .as_ref()
+                .map(|path| path.display().to_string()),
         };
 
         for warning in &result.warnings {
@@ -414,6 +422,7 @@ pub struct CompileResult {
     pub warnings: Vec<String>,
     pub duration_ms: u64,
     pub entry_path: Option<String>,
+    pub pinned_entry_path: Option<String>,
 }
 
 impl CompileResult {
@@ -427,6 +436,7 @@ impl CompileResult {
             warnings: vec![],
             duration_ms: 0,
             entry_path: None,
+            pinned_entry_path: None,
         }
     }
 }
@@ -456,12 +466,6 @@ fn resolve_entry_for_file(state: &InnerState, file_path: &Path) -> PathBuf {
         return entry.clone();
     }
 
-    if let Some(entry) = state.preview_entry.as_ref() {
-        if resolve_root_for_path(entry) == resolve_root_for_path(file_path) {
-            return entry.clone();
-        }
-    }
-
     file_path.to_path_buf()
 }
 
@@ -476,6 +480,12 @@ fn load_overlay_or_disk(state: &InnerState, path: &Path) -> Result<String, Strin
 fn resolve_root_for_path(path: &Path) -> PathBuf {
     discover_project_root(path)
         .or_else(|| path.parent().map(|p| p.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn resolve_access_root_for_path(path: &Path) -> PathBuf {
+    discover_access_root(path)
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
 }

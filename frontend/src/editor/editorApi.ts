@@ -100,6 +100,11 @@ export async function openFileFromTree(path: string): Promise<void> {
   await mod.openFileFromTree(path);
 }
 
+export async function setPreviewEntryAtPath(path: string): Promise<void> {
+  const mod = await ensureEditorReady();
+  await mod.setPreviewEntryAtPath(path);
+}
+
 export async function jumpToFileOffset(
   path: string,
   offset: number,

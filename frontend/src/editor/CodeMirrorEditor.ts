@@ -57,7 +57,8 @@ let lastEditTime = 0;
 let lastOutlineSyncLine = -1;
 
 let currentFilePath = "";
-let previewEntryPath = "";
+let activePreviewEntryPath = "";
+let pinnedPreviewEntryPath = "";
 let lastSuccessfulPageCount = 0;
 let latestCompileRequestId = 0;
 let renderedPageHashes: number[] = [];
@@ -71,7 +72,7 @@ let latestCursorRequestId = 0;
 let lastCursorPreviewPage: number | null = null;
 
 type Theme = "light" | "dark";
-type CompileCommand = "compile_current" | "open_file" | "set_preview_entry";
+type CompileCommand = "compile_current" | "set_preview_entry";
 
 interface CompileResult {
   success: boolean;
@@ -81,6 +82,7 @@ interface CompileResult {
   errors: string[];
   duration_ms?: number;
   entry_path?: string | null;
+  pinned_entry_path?: string | null;
 }
 
 interface JumpResult {
@@ -687,10 +689,9 @@ async function runCompileJob(job: CompileJob): Promise<void> {
 
 async function applyCompileResult(job: CompileJob, result: CompileResult): Promise<void> {
   finalizeCompileStatusTimeout();
+  const pinnedEntryChanged = applyCompileEntryState(result);
 
   if (result.success) {
-    const oldPreviewEntryPath = previewEntryPath;
-    previewEntryPath = result.entry_path ?? previewEntryPath;
     lastSuccessfulPageCount = result.page_count;
     updatePageStatus(result.page_count);
     await renderAllPages(result.page_count, result.page_hashes);
@@ -701,8 +702,8 @@ async function applyCompileResult(job: CompileJob, result: CompileResult): Promi
     syncOutlineActiveFromEditor();
     updateStatus("success", job.successMessage(result));
     clearDiagnostics();
-    if (job.notifyPreviewEntryChange && oldPreviewEntryPath !== previewEntryPath) {
-      onPreviewEntryChangeCb?.(previewEntryPath);
+    if (job.notifyPreviewEntryChange && pinnedEntryChanged) {
+      onPreviewEntryChangeCb?.(pinnedPreviewEntryPath || null);
     }
     return;
   }
@@ -719,6 +720,25 @@ async function applyCompileResult(job: CompileJob, result: CompileResult): Promi
   }
   updateStatus("error", `${result.errors.length} error(s)`);
   showDiagnostics(result.errors);
+  if (job.notifyPreviewEntryChange && pinnedEntryChanged) {
+    onPreviewEntryChangeCb?.(pinnedPreviewEntryPath || null);
+  }
+}
+
+function applyCompileEntryState(result: CompileResult): boolean {
+  const nextActivePreviewEntryPath = result.entry_path ?? activePreviewEntryPath;
+  const nextPinnedPreviewEntryPath = result.pinned_entry_path ?? pinnedPreviewEntryPath;
+  const pinnedEntryChanged = nextPinnedPreviewEntryPath !== pinnedPreviewEntryPath;
+  const activeEntryChanged = nextActivePreviewEntryPath !== activePreviewEntryPath;
+
+  activePreviewEntryPath = nextActivePreviewEntryPath;
+  pinnedPreviewEntryPath = nextPinnedPreviewEntryPath;
+
+  if (pinnedEntryChanged || activeEntryChanged) {
+    renderTabs();
+  }
+
+  return pinnedEntryChanged;
 }
 
 function finalizeCompileStatusTimeout(): void {
@@ -833,6 +853,22 @@ async function exportPdf(): Promise<void> {
 export async function openFileFromTree(path: string): Promise<void> {
   if (!editorView) return;
   await openFileAtPath(path);
+}
+
+export async function setPreviewEntryAtPath(path: string): Promise<void> {
+  if (!editorView) return;
+
+  let targetDoc = openDocuments.get(path);
+  if (!targetDoc) {
+    const content = await invoke<string>("read_text_file", { path });
+    targetDoc = createDocument(path, content);
+  }
+
+  if (currentFilePath !== path) {
+    await switchToDocument(targetDoc, false);
+  }
+
+  await setCurrentDocumentAsPreviewEntry();
 }
 
 export async function jumpToFileOffset(
@@ -1537,7 +1573,9 @@ async function closeDocument(path: string): Promise<boolean> {
   if (openDocuments.size === 0) {
     editorView?.setState(createEditorState(""));
     setCurrentFilePath(null);
-    previewEntryPath = "";
+    const pinnedEntryChanged = !!pinnedPreviewEntryPath;
+    activePreviewEntryPath = "";
+    pinnedPreviewEntryPath = "";
     lastSuccessfulPageCount = 0;
     resetPreviewState();
     renderTabs();
@@ -1547,6 +1585,9 @@ async function closeDocument(path: string): Promise<boolean> {
     updatePageStatus(0);
     updateStatus("success", "Ready");
     await invoke("reset_session");
+    if (pinnedEntryChanged) {
+      onPreviewEntryChangeCb?.(null);
+    }
     showEmptyWorkspace();
     return true;
   }
@@ -1584,7 +1625,7 @@ function compileOpenDocument(doc: OpenDocument): void {
   const content = doc.state.doc.toString();
   showWorkspaceLayout();
   enqueueCompile({
-    command: previewEntryPath ? "compile_current" : "open_file",
+    command: "compile_current",
     filePath: doc.path,
     content,
     savedContent: doc.savedContent,
@@ -1627,9 +1668,9 @@ function renderTabs(): void {
   tabsHost.replaceChildren();
 
   for (const doc of openDocuments.values()) {
-    const isPreviewEntry = doc.path === previewEntryPath;
+    const isPinnedPreviewEntry = doc.path === pinnedPreviewEntryPath;
     const tab = document.createElement("button");
-    tab.className = `editor-tab${doc.path === currentFilePath ? " active" : ""}${isPreviewEntry ? " preview-entry" : ""}`;
+    tab.className = `editor-tab${doc.path === currentFilePath ? " active" : ""}${isPinnedPreviewEntry ? " preview-entry" : ""}`;
     tab.title = doc.path;
 
     const label = document.createElement("span");
@@ -1637,7 +1678,7 @@ function renderTabs(): void {
     label.textContent = doc.path.split(/[\\/]/).pop() || doc.path;
     tab.appendChild(label);
 
-    if (isPreviewEntry) {
+    if (isPinnedPreviewEntry) {
       const star = document.createElement("span");
       star.className = "editor-tab-star";
       star.innerHTML = `<svg width="11" height="11" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 1l1.5 3h3.3l-2.6 2 1 3.3L6 8l-3.2 1.3 1-3.3-2.6-2h3.3L6 1Z" fill="currentColor"/></svg>`;
@@ -1687,22 +1728,18 @@ function showTabContextMenu(x: number, y: number, path: string): void {
   const setMain = document.createElement("button");
   setMain.type = "button";
   setMain.className = "tab-context-menu-item";
-  setMain.textContent = path === previewEntryPath ? "当前已是主文件" : "设为主文件";
-  setMain.disabled = path === previewEntryPath;
+  setMain.textContent = path === pinnedPreviewEntryPath ? "当前已是主文件" : "设为主文件";
+  setMain.disabled = path === pinnedPreviewEntryPath;
   setMain.addEventListener("click", async () => {
     hideTabContextMenu();
-    const targetDoc = openDocuments.get(path);
-    if (!targetDoc || !editorView) return;
-    if (currentFilePath !== path) {
-      await switchToDocument(targetDoc, false);
-    }
-    await setCurrentDocumentAsPreviewEntry();
+    await setPreviewEntryAtPath(path);
   });
 
   const clearMain = document.createElement("button");
   clearMain.type = "button";
   clearMain.className = "tab-context-menu-item";
   clearMain.textContent = "取消主文件固定";
+  clearMain.disabled = !pinnedPreviewEntryPath;
   clearMain.addEventListener("click", async () => {
     hideTabContextMenu();
     await clearPreviewEntryPin();
@@ -1714,11 +1751,19 @@ function showTabContextMenu(x: number, y: number, path: string): void {
 
   setTimeout(() => {
     document.addEventListener("mousedown", handleTabContextMenuDismiss, { once: true });
-    document.addEventListener("blur", handleTabContextMenuDismiss, { once: true });
+    window.addEventListener("blur", handleTabContextMenuWindowBlur, { once: true });
   }, 0);
 }
 
-function handleTabContextMenuDismiss(): void {
+function handleTabContextMenuDismiss(event: MouseEvent): void {
+  if (tabContextMenu?.contains(event.target as Node)) {
+    document.addEventListener("mousedown", handleTabContextMenuDismiss, { once: true });
+    return;
+  }
+  hideTabContextMenu();
+}
+
+function handleTabContextMenuWindowBlur(): void {
   hideTabContextMenu();
 }
 

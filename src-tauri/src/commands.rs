@@ -192,6 +192,10 @@ fn get_current_compilation_result(
                 .preview_entry
                 .clone()
                 .map(|p| p.display().to_string()),
+            pinned_entry_path: compiler_state
+                .pinned_preview_entry
+                .clone()
+                .map(|p| p.display().to_string()),
         }
     } else {
         crate::compiler::CompileResult {
@@ -203,6 +207,10 @@ fn get_current_compilation_result(
             warnings: vec![],
             duration_ms: 0,
             entry_path: None,
+            pinned_entry_path: compiler_state
+                .pinned_preview_entry
+                .clone()
+                .map(|p| p.display().to_string()),
         }
     }
 }
