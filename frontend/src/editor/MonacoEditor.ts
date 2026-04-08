@@ -53,6 +53,7 @@ let previewHoverTargetKey = "";
 let sourceHoverDecorationIds: string[] = [];
 let sourceHoverTarget: { file: string; offset: number } | null = null;
 let latestCursorRequestId = 0;
+let lastCursorPreviewPage: number | null = null;
 let offsetCache:
   | {
     model: monaco.editor.ITextModel;
@@ -69,6 +70,7 @@ interface OpenDocument {
   path: string;
   model: monaco.editor.ITextModel;
   viewState: monaco.editor.ICodeEditorViewState | null;
+  savedContent: string;
   /** Monaco alternative version ID at the time of last save — O(1) dirty check */
   savedVersionId: number;
   dirty: boolean;
@@ -365,6 +367,7 @@ interface JumpResult {
 export async function compileAndPreview(): Promise<void> {
   if (!editor) return;
   if (!currentFilePath) return;
+  const activeDoc = getActiveDocument();
   const content   = editor.getValue();
   const requestId = ++latestCompileRequestId;
   if (compileStatusTimeout) clearTimeout(compileStatusTimeout);
@@ -390,6 +393,7 @@ export async function compileAndPreview(): Promise<void> {
       lastSuccessfulPageCount = result.page_count;
       updatePageStatus(result.page_count);
       await renderAllPages(result.page_count, result.page_hashes);
+      await renderUnsavedInsertHighlights(currentFilePath, activeDoc?.savedContent ?? content, content);
       setOutlineItems(result.outline ?? []);
       syncOutlineActiveFromEditor();
       updateStatus("success",
@@ -398,6 +402,7 @@ export async function compileAndPreview(): Promise<void> {
     } else if (isTransientCompileResult(result)) {
       updateStatus("compiling", "Syncing preview…");
     } else {
+      removeSyncOverlays("unsaved-add-hl");
       updatePageStatus(0);
       clearOutlinePanel();
       updateStatus("error", `${result.errors.length} error(s)`);
@@ -408,6 +413,7 @@ export async function compileAndPreview(): Promise<void> {
       clearTimeout(compileStatusTimeout);
       compileStatusTimeout = null;
     }
+    removeSyncOverlays("unsaved-add-hl");
     updateStatus("error", `Error: ${e}`);
   }
 }
@@ -470,6 +476,7 @@ async function saveCurrentFile(): Promise<void> {
   try {
     await invoke("save_file", { content, filePath: path });
     if (activeDoc) {
+      activeDoc.savedContent = content;
       activeDoc.savedVersionId = activeDoc.model.getAlternativeVersionId();
       activeDoc.dirty = false;
       renderTabs();
@@ -485,6 +492,7 @@ async function saveCurrentFile(): Promise<void> {
     lastSuccessfulPageCount = result.page_count;
     updatePageStatus(result.page_count);
     await renderAllPages(result.page_count, result.page_hashes);
+    await renderUnsavedInsertHighlights(path, content, content);
     setOutlineItems(result.outline ?? []);
     syncOutlineActiveFromEditor();
     updateStatus("success", "Saved");
@@ -561,6 +569,142 @@ export async function revealSourceOffsetInPreview(
     }
   } catch {
     // ignore sync failures
+  }
+}
+
+interface LineRange {
+  startLine: number;
+  endLine: number;
+}
+
+function splitLinesPreserveFinalEmpty(text: string): string[] {
+  return text.split(/\r\n|\n|\r/);
+}
+
+function computeUnsavedInsertedLineRanges(savedContent: string, compiledContent: string): LineRange[] {
+  if (savedContent === compiledContent) return [];
+
+  const savedLines = splitLinesPreserveFinalEmpty(savedContent);
+  const currentLines = splitLinesPreserveFinalEmpty(compiledContent);
+
+  let prefix = 0;
+  while (
+    prefix < savedLines.length &&
+    prefix < currentLines.length &&
+    savedLines[prefix] === currentLines[prefix]
+  ) {
+    prefix++;
+  }
+
+  let savedSuffix = savedLines.length - 1;
+  let currentSuffix = currentLines.length - 1;
+  while (
+    savedSuffix >= prefix &&
+    currentSuffix >= prefix &&
+    savedLines[savedSuffix] === currentLines[currentSuffix]
+  ) {
+    savedSuffix--;
+    currentSuffix--;
+  }
+
+  const savedMiddle = savedLines.slice(prefix, savedSuffix + 1);
+  const currentMiddle = currentLines.slice(prefix, currentSuffix + 1);
+  if (currentMiddle.length === 0) return [];
+
+  const rows = savedMiddle.length;
+  const cols = currentMiddle.length;
+  const dp: number[][] = Array.from({ length: rows + 1 }, () => new Array<number>(cols + 1).fill(0));
+
+  for (let i = rows - 1; i >= 0; i--) {
+    for (let j = cols - 1; j >= 0; j--) {
+      dp[i][j] = savedMiddle[i] === currentMiddle[j]
+        ? dp[i + 1][j + 1] + 1
+        : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+
+  const insertedLineIndices: number[] = [];
+  let i = 0;
+  let j = 0;
+  while (i < rows && j < cols) {
+    if (savedMiddle[i] === currentMiddle[j]) {
+      i++;
+      j++;
+      continue;
+    }
+    if (dp[i][j + 1] >= dp[i + 1][j]) {
+      insertedLineIndices.push(prefix + j);
+      j++;
+    } else {
+      i++;
+    }
+  }
+  while (j < cols) {
+    insertedLineIndices.push(prefix + j);
+    j++;
+  }
+
+  if (insertedLineIndices.length === 0) return [];
+
+  const ranges: LineRange[] = [];
+  let start = insertedLineIndices[0];
+  let end = start;
+  for (let index = 1; index < insertedLineIndices.length; index++) {
+    const lineIndex = insertedLineIndices[index];
+    if (lineIndex === end + 1) {
+      end = lineIndex;
+      continue;
+    }
+    ranges.push({ startLine: start + 1, endLine: end + 1 });
+    start = lineIndex;
+    end = lineIndex;
+  }
+  ranges.push({ startLine: start + 1, endLine: end + 1 });
+  return ranges;
+}
+
+async function renderUnsavedInsertHighlights(
+  filePath: string,
+  savedContent: string,
+  compiledContent: string,
+): Promise<void> {
+  removeSyncOverlays("unsaved-add-hl");
+  if (!currentFilePath || currentFilePath !== filePath || lastSuccessfulPageCount === 0) return;
+
+  const lineRanges = computeUnsavedInsertedLineRanges(savedContent, compiledContent);
+  if (lineRanges.length === 0) return;
+
+  const compiledLines = splitLinesPreserveFinalEmpty(compiledContent);
+  for (let rangeIndex = 0; rangeIndex < lineRanges.length; rangeIndex++) {
+    const range = lineRanges[rangeIndex];
+    const startLine = Math.max(1, Math.min(range.startLine, compiledLines.length));
+    const endLine = Math.max(startLine, Math.min(range.endLine, compiledLines.length));
+    const endLineText = compiledLines[endLine - 1] ?? "";
+    try {
+      const [startPositions, endPositions] = await Promise.all([
+        invoke<PagePos[]>("jump_from_cursor", {
+          filePath,
+          line: startLine - 1,
+          character: 0,
+        }),
+        invoke<PagePos[]>("jump_from_cursor", {
+          filePath,
+          line: endLine - 1,
+          character: endLineText.length,
+        }),
+      ]);
+
+      if (startPositions.length === 0 || endPositions.length === 0) continue;
+
+      const maxLen = Math.max(startPositions.length, endPositions.length);
+      for (let idx = 0; idx < maxLen; idx++) {
+        const start = startPositions[idx] ?? startPositions[0];
+        const end = endPositions[idx] ?? endPositions[0];
+        highlightRangeInPreview(start, end, idx === 0 && rangeIndex === 0, "unsaved-add-hl", false);
+      }
+    } catch {
+      // ignore individual unsaved highlight mapping failures
+    }
   }
 }
 
@@ -726,7 +870,13 @@ async function syncCursorToPreview(position: monaco.Position): Promise<void> {
     if (requestId !== latestCursorRequestId) return;
     const previewPos = pickBestPreviewPosition(positions);
     if (previewPos) {
-      highlightCursorInPreview(previewPos, { scroll: false, persistent: true });
+      const shouldScroll = lastCursorPreviewPage == null || lastCursorPreviewPage !== previewPos.page;
+      lastCursorPreviewPage = previewPos.page;
+      highlightCursorInPreview(previewPos, {
+        scroll: shouldScroll,
+        behavior: "auto",
+        persistent: true,
+      });
     }
   } catch { /* ignore */ }
 }
@@ -787,6 +937,7 @@ async function handlePreviewClick(
     if (result.type === "file" && result.offset != null && result.file && editor) {
       applySourceHoverDecoration(result.file, result.offset);
       await jumpToFileOffset(result.file, result.offset, false);
+      await revealSourceOffsetInPreview(result.file, result.offset, "auto");
     } else if (result.type === "url" && result.url) {
       window.open(result.url, "_blank", "noopener,noreferrer");
     } else if (result.type === "position" && result.position) {
@@ -877,7 +1028,7 @@ function highlightCursorInPreview(
 
   getPreviewContent()?.appendChild(overlay);
   if (options.scroll) {
-    scrollPreviewToPosition(pos, options.behavior ?? "smooth");
+    scrollPreviewToPosition(pos, options.behavior ?? "auto");
   }
   if (!options.persistent) {
     setTimeout(() => overlay.classList.add("fade"), 1500);
@@ -891,8 +1042,14 @@ function highlightCursorInPreview(
  * @param clearFirst - if true (default), clears existing selection overlays before drawing.
  *                     Set to false when drawing multiple ranges in a loop.
  */
-function highlightRangeInPreview(start: PagePos, end: PagePos, clearFirst = true): void {
-  if (clearFirst) removeSyncOverlays("selection-hl");
+function highlightRangeInPreview(
+  start: PagePos,
+  end: PagePos,
+  clearFirst = true,
+  overlayClass = "selection-hl",
+  scroll = true,
+): void {
+  if (clearFirst) removeSyncOverlays(overlayClass);
 
   const pane = getPreviewPane();
   const contentEl = getPreviewContent();
@@ -933,7 +1090,7 @@ function highlightRangeInPreview(start: PagePos, end: PagePos, clearFirst = true
     const height = Math.max(20, botY - topY);
 
     const overlay        = document.createElement("div");
-    overlay.className    = "highlight-overlay selection-hl";
+    overlay.className    = `highlight-overlay ${overlayClass}`;
     overlay.style.left   = `${panePoint.left + 2}px`;
     overlay.style.top    = `${panePoint.top + topY}px`;
     overlay.style.width  = `${rect.width - 4}px`;
@@ -942,7 +1099,9 @@ function highlightRangeInPreview(start: PagePos, end: PagePos, clearFirst = true
     contentEl.appendChild(overlay);
   }
 
-  scrollPreviewToPosition(start);
+  if (scroll) {
+    scrollPreviewToPosition(start, "auto");
+  }
 }
 
 function pickBestPreviewPosition(positions: PagePos[]): PagePos | null {
@@ -1073,9 +1232,11 @@ async function renderSinglePage(i: number, pageHashes: number[]): Promise<void> 
 function resetPreviewState(): void {
   latestCompileRequestId++;
   renderedPageHashes = [];
+  lastCursorPreviewPage = null;
   clearPreviewSourceHover();
   removeSyncOverlays("cursor-hl");
   removeSyncOverlays("selection-hl");
+  removeSyncOverlays("unsaved-add-hl");
   resetPreviewContent();
 }
 
@@ -1091,6 +1252,7 @@ function createDocument(path: string, content: string): OpenDocument {
     path,
     model,
     viewState: null,
+    savedContent: content,
     savedVersionId: model.getAlternativeVersionId(),
     dirty: false,
   };
@@ -1239,6 +1401,7 @@ async function compileOpenDocument(doc: OpenDocument): Promise<void> {
       lastSuccessfulPageCount = result.page_count;
       updatePageStatus(result.page_count);
       await renderAllPages(result.page_count, result.page_hashes);
+      await renderUnsavedInsertHighlights(doc.path, doc.savedContent, content);
       setOutlineItems(result.outline ?? []);
       updateStatus("success", `Compiled · ${result.page_count} page(s)`);
       clearDiagnostics();
@@ -1259,11 +1422,13 @@ async function compileOpenDocument(doc: OpenDocument): Promise<void> {
 
 async function setCurrentDocumentAsPreviewEntry(): Promise<void> {
   if (!editor || !currentFilePath) return;
+  const activeDoc = getActiveDocument();
+  const content = editor.getValue();
 
   try {
     const result = await invoke<CompileResult>("set_preview_entry", {
       filePath: currentFilePath,
-      content: editor.getValue(),
+      content,
     });
 
     if (!result.success) {
@@ -1279,6 +1444,7 @@ async function setCurrentDocumentAsPreviewEntry(): Promise<void> {
     lastSuccessfulPageCount = result.page_count;
     updatePageStatus(result.page_count);
     await renderAllPages(result.page_count, result.page_hashes);
+    await renderUnsavedInsertHighlights(currentFilePath, activeDoc?.savedContent ?? content, content);
     setOutlineItems(result.outline ?? []);
     updateStatus("success", "Preview entry updated");
     clearDiagnostics();

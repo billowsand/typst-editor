@@ -47,6 +47,8 @@
   --hl-cursor-line:  rgba(0, 113, 227, 0.70);
   --hl-sel-bg:       rgba(0, 113, 227, 0.10);
   --hl-sel-border:   rgba(0, 113, 227, 0.55);
+  --hl-unsaved-bg:   rgba(255, 214, 10, 0.24);
+  --hl-unsaved-border: rgba(201, 138, 0, 0.72);
 }
 
 [data-theme="dark"] {
@@ -82,6 +84,8 @@
   --hl-cursor-line:  rgba(10, 132, 255, 0.75);
   --hl-sel-bg:       rgba(10, 132, 255, 0.12);
   --hl-sel-border:   rgba(10, 132, 255, 0.60);
+  --hl-unsaved-bg:   rgba(255, 214, 10, 0.22);
+  --hl-unsaved-border: rgba(255, 214, 10, 0.70);
 }
 
 /* ─── Base ───────────────────────────────────────────────────── */
@@ -856,6 +860,14 @@ html, body {
 .highlight-overlay.selection-hl {
   background: var(--hl-sel-bg);
   border: 1.5px solid var(--hl-sel-border);
+}
+
+.highlight-overlay.unsaved-add-hl {
+  background: linear-gradient(90deg,
+    color-mix(in srgb, var(--hl-unsaved-bg) 100%, transparent),
+    color-mix(in srgb, var(--hl-unsaved-bg) 72%, transparent)
+  );
+  border: 1.5px solid var(--hl-unsaved-border);
 }
 
 /* Preview hover indicator: very subtle, shows clickable line without changing text color */

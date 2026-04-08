@@ -141,7 +141,7 @@ export function pagePointToPanePoint(pos: PreviewPagePosition): PreviewPanePoint
 
 export function scrollPreviewToPosition(
   pos: PreviewPagePosition,
-  behavior: ScrollBehavior = "smooth",
+  behavior: ScrollBehavior = "auto",
 ): void {
   const pane = getPreviewPane();
   const panePoint = pagePointToPanePoint(pos);
