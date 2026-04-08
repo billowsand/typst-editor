@@ -17,7 +17,6 @@ import {
   highlightActiveLineGutter,
   keymap,
   lineNumbers,
-  rectangularSelection,
   ViewPlugin,
   ViewUpdate,
 } from "@codemirror/view";
@@ -405,7 +404,6 @@ function createBaseExtensions(): Extension[] {
     highlightActiveLineGutter(),
     highlightActiveLine(),
     drawSelection(),
-    rectangularSelection(),
     history(),
     closeBrackets(),
     basicSetup,
@@ -474,8 +472,10 @@ function createBaseExtensions(): Extension[] {
     }),
     EditorView.domEventHandlers({
       mousemove(event, view) {
+        if (event.buttons !== 0) return;
         if (hoverSyncTimeout) clearTimeout(hoverSyncTimeout);
         hoverSyncTimeout = setTimeout(() => {
+          if (view.state.selection.main.empty === false) return;
           const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
           if (pos == null) return;
           void syncHoverToPreview(pos);
@@ -1059,6 +1059,7 @@ async function syncHoverToPreview(offset: number): Promise<void> {
 
   const view = editorView;
   if (!view) return;
+  if (!view.state.selection.main.empty) return;
   const byteOffset = charOffsetToUtf8ByteOffset(view.state.doc.toString(), offset);
   try {
     const positions = await invoke<PagePos[]>("jump_from_offset", {
