@@ -743,6 +743,26 @@ html, body {
   color: var(--c-text);
 }
 
+.editor-tab-star {
+  color: #fbbf24;
+  font-size: 10px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+[data-theme="dark"] .editor-tab-star {
+  color: #f59e0b;
+}
+
+.editor-tab.preview-entry {
+  border-bottom-color: #fbbf24;
+}
+
+[data-theme="dark"] .editor-tab.preview-entry {
+  border-bottom-color: #f59e0b;
+}
+
 .tab-context-menu {
   position: fixed;
   z-index: 1000;
@@ -1034,6 +1054,35 @@ html, body {
 }
 
 .tree-children { /* container — no extra styles needed */ }
+
+/* ─── Preview Entry Badge (Main File) ──────────────────────────────── */
+.preview-entry-badge {
+  width: 13px;
+  height: 13px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: auto;
+  color: #fbbf24;
+  flex-shrink: 0;
+}
+
+[data-theme="dark"] .preview-entry-badge {
+  color: #f59e0b;
+}
+
+.tree-item.preview-entry {
+  background: color-mix(in srgb, var(--c-accent) 8%, transparent);
+}
+
+.tree-item.preview-entry.active {
+  background: color-mix(in srgb, var(--c-accent) 14%, transparent);
+}
+
+.tree-item.preview-entry .tree-label {
+  color: var(--c-accent);
+  font-weight: 600;
+}
 
 .tree-error {
   color: var(--c-error);

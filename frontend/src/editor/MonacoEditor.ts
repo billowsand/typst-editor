@@ -21,10 +21,16 @@ import { showEmptyWorkspace, showWorkspaceLayout } from "../workspace/WorkspaceS
 
 let editor: monaco.editor.IStandaloneCodeEditor | null = null;
 let onFileChangeCb: ((path: string | null) => void) | null = null;
+let onPreviewEntryChangeCb: ((path: string | null) => void) | null = null;
 
 /** Register a callback that fires whenever the active file path changes. */
 export function onEditorFileChange(cb: (path: string | null) => void): void {
   onFileChangeCb = cb;
+}
+
+/** Register a callback that fires whenever the preview entry path changes. */
+export function onPreviewEntryChange(cb: (path: string | null) => void): void {
+  onPreviewEntryChangeCb = cb;
 }
 let compileTimeout:    ReturnType<typeof setTimeout> | null = null;
 let cursorSyncTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -77,6 +83,22 @@ interface OpenDocument {
 }
 
 const openDocuments = new Map<string, OpenDocument>();
+
+type CompileCommand = "compile_current" | "open_file" | "set_preview_entry";
+
+interface CompileJob {
+  intentId: number;
+  command: CompileCommand;
+  filePath: string;
+  content: string;
+  savedContent: string;
+  successMessage: (result: CompileResult) => string;
+  preservePagesOnError?: boolean;
+  notifyPreviewEntryChange?: boolean;
+}
+
+let activeCompileJob: Promise<void> | null = null;
+let pendingCompileJob: CompileJob | null = null;
 
 function scheduleCursorPreviewSync(delay = 120): void {
   if (cursorSyncTimeout) clearTimeout(cursorSyncTimeout);
@@ -364,58 +386,112 @@ interface JumpResult {
   position?: PagePos | null;
 }
 
-export async function compileAndPreview(): Promise<void> {
-  if (!editor) return;
-  if (!currentFilePath) return;
-  const activeDoc = getActiveDocument();
-  const content   = editor.getValue();
-  const requestId = ++latestCompileRequestId;
+function enqueueCompile(job: Omit<CompileJob, "intentId">): void {
+  pendingCompileJob = {
+    ...job,
+    intentId: ++latestCompileRequestId,
+  };
+  void drainCompileQueue();
+}
+
+async function drainCompileQueue(): Promise<void> {
+  if (activeCompileJob || !pendingCompileJob) return;
+
+  const job = pendingCompileJob;
+  pendingCompileJob = null;
+  activeCompileJob = runCompileJob(job).finally(() => {
+    activeCompileJob = null;
+    if (pendingCompileJob) {
+      void drainCompileQueue();
+    }
+  });
+
+  await activeCompileJob;
+}
+
+async function runCompileJob(job: CompileJob): Promise<void> {
   if (compileStatusTimeout) clearTimeout(compileStatusTimeout);
   compileStatusTimeout = setTimeout(() => {
-    if (requestId === latestCompileRequestId) {
+    if (job.intentId === latestCompileRequestId) {
       updateStatus("compiling", "Syncing preview…");
     }
   }, 180);
 
   try {
-    const result = await invoke<CompileResult>("compile_current", {
-      filePath: currentFilePath,
-      content,
+    const result = await invoke<CompileResult>(job.command, {
+      filePath: job.filePath,
+      content: job.content,
     });
-    if (requestId < latestCompileRequestId) return; // stale
-    if (compileStatusTimeout) {
-      clearTimeout(compileStatusTimeout);
-      compileStatusTimeout = null;
-    }
 
-    if (result.success) {
-      previewEntryPath = result.entry_path ?? previewEntryPath;
-      lastSuccessfulPageCount = result.page_count;
-      updatePageStatus(result.page_count);
-      await renderAllPages(result.page_count, result.page_hashes);
-      await renderUnsavedInsertHighlights(currentFilePath, activeDoc?.savedContent ?? content, content);
-      setOutlineItems(result.outline ?? []);
-      syncOutlineActiveFromEditor();
-      updateStatus("success",
-        `Compiled in ${result.duration_ms ?? "?"}ms · ${result.page_count} page(s)`);
-      clearDiagnostics();
-    } else if (isTransientCompileResult(result)) {
-      updateStatus("compiling", "Syncing preview…");
-    } else {
-      removeSyncOverlays("unsaved-add-hl");
+    if (job.intentId !== latestCompileRequestId) return;
+    await applyCompileResult(job, result);
+  } catch (e) {
+    if (job.intentId !== latestCompileRequestId) return;
+    finalizeCompileStatusTimeout();
+    removeSyncOverlays("unsaved-add-hl");
+    if (!job.preservePagesOnError) {
       updatePageStatus(0);
       clearOutlinePanel();
-      updateStatus("error", `${result.errors.length} error(s)`);
-      showDiagnostics(result.errors);
     }
-  } catch (e) {
-    if (compileStatusTimeout) {
-      clearTimeout(compileStatusTimeout);
-      compileStatusTimeout = null;
-    }
-    removeSyncOverlays("unsaved-add-hl");
     updateStatus("error", `Error: ${e}`);
   }
+}
+
+async function applyCompileResult(job: CompileJob, result: CompileResult): Promise<void> {
+  finalizeCompileStatusTimeout();
+
+  if (result.success) {
+    const oldPreviewEntryPath = previewEntryPath;
+    previewEntryPath = result.entry_path ?? previewEntryPath;
+    lastSuccessfulPageCount = result.page_count;
+    updatePageStatus(result.page_count);
+    await renderAllPages(result.page_count, result.page_hashes);
+    if (job.intentId !== latestCompileRequestId) return;
+    await renderUnsavedInsertHighlights(job.filePath, job.savedContent, job.content);
+    if (job.intentId !== latestCompileRequestId) return;
+    setOutlineItems(result.outline ?? []);
+    syncOutlineActiveFromEditor();
+    updateStatus("success", job.successMessage(result));
+    clearDiagnostics();
+    if (job.notifyPreviewEntryChange && oldPreviewEntryPath !== previewEntryPath) {
+      onPreviewEntryChangeCb?.(previewEntryPath);
+    }
+    return;
+  }
+
+  if (isTransientCompileResult(result)) {
+    updateStatus("compiling", "Syncing preview…");
+    return;
+  }
+
+  removeSyncOverlays("unsaved-add-hl");
+  if (!job.preservePagesOnError) {
+    updatePageStatus(0);
+    clearOutlinePanel();
+  }
+  updateStatus("error", `${result.errors.length} error(s)`);
+  showDiagnostics(result.errors);
+}
+
+function finalizeCompileStatusTimeout(): void {
+  if (!compileStatusTimeout) return;
+  clearTimeout(compileStatusTimeout);
+  compileStatusTimeout = null;
+}
+
+export async function compileAndPreview(): Promise<void> {
+  if (!editor) return;
+  if (!currentFilePath) return;
+  const activeDoc = getActiveDocument();
+  enqueueCompile({
+    command: "compile_current",
+    filePath: currentFilePath,
+    content: editor.getValue(),
+    savedContent: activeDoc?.savedContent ?? editor.getValue(),
+    preservePagesOnError: false,
+    notifyPreviewEntryChange: true,
+    successMessage: (result) => `Compiled in ${result.duration_ms ?? "?"}ms · ${result.page_count} page(s)`,
+  });
 }
 
 function scheduleCompile(delay = 650): void {
@@ -481,21 +557,16 @@ async function saveCurrentFile(): Promise<void> {
       activeDoc.dirty = false;
       renderTabs();
     }
-    const result = await invoke<CompileResult>("compile_current", { filePath: path, content });
-    if (!result.success) {
-      updatePageStatus(0);
-      showDiagnostics(result.errors);
-      updateStatus("error", result.errors.join("; "));
-      return;
-    }
-    previewEntryPath = result.entry_path ?? previewEntryPath;
-    lastSuccessfulPageCount = result.page_count;
-    updatePageStatus(result.page_count);
-    await renderAllPages(result.page_count, result.page_hashes);
-    await renderUnsavedInsertHighlights(path, content, content);
-    setOutlineItems(result.outline ?? []);
-    syncOutlineActiveFromEditor();
     updateStatus("success", "Saved");
+    enqueueCompile({
+      command: "compile_current",
+      filePath: path,
+      content,
+      savedContent: content,
+      preservePagesOnError: true,
+      notifyPreviewEntryChange: true,
+      successMessage: () => "Saved",
+    });
   } catch (e) {
     updateStatus("error", `Save failed: ${e}`);
   }
@@ -572,95 +643,70 @@ export async function revealSourceOffsetInPreview(
   }
 }
 
-interface LineRange {
+interface TextRange {
   startLine: number;
+  startColumn: number;
   endLine: number;
+  endColumn: number;
 }
 
 function splitLinesPreserveFinalEmpty(text: string): string[] {
   return text.split(/\r\n|\n|\r/);
 }
 
-function computeUnsavedInsertedLineRanges(savedContent: string, compiledContent: string): LineRange[] {
+function offsetToLineColumn(text: string, offset: number): { line: number; column: number } {
+  const clampedOffset = Math.max(0, Math.min(offset, text.length));
+  const lines = splitLinesPreserveFinalEmpty(text);
+  let remaining = clampedOffset;
+
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index] ?? "";
+    if (remaining <= line.length) {
+      return { line: index + 1, column: remaining + 1 };
+    }
+    remaining -= line.length;
+    if (index < lines.length - 1) {
+      if (remaining === 0) {
+        return { line: index + 1, column: line.length + 1 };
+      }
+      remaining -= 1;
+    }
+  }
+
+  const lastLine = lines[lines.length - 1] ?? "";
+  return { line: Math.max(1, lines.length), column: lastLine.length + 1 };
+}
+
+function computeUnsavedChangedTextRanges(savedContent: string, compiledContent: string): TextRange[] {
   if (savedContent === compiledContent) return [];
 
-  const savedLines = splitLinesPreserveFinalEmpty(savedContent);
-  const currentLines = splitLinesPreserveFinalEmpty(compiledContent);
-
   let prefix = 0;
-  while (
-    prefix < savedLines.length &&
-    prefix < currentLines.length &&
-    savedLines[prefix] === currentLines[prefix]
-  ) {
+  const sharedPrefixLimit = Math.min(savedContent.length, compiledContent.length);
+  while (prefix < sharedPrefixLimit && savedContent[prefix] === compiledContent[prefix]) {
     prefix++;
   }
 
-  let savedSuffix = savedLines.length - 1;
-  let currentSuffix = currentLines.length - 1;
+  let savedSuffix = savedContent.length;
+  let compiledSuffix = compiledContent.length;
   while (
-    savedSuffix >= prefix &&
-    currentSuffix >= prefix &&
-    savedLines[savedSuffix] === currentLines[currentSuffix]
+    savedSuffix > prefix &&
+    compiledSuffix > prefix &&
+    savedContent[savedSuffix - 1] === compiledContent[compiledSuffix - 1]
   ) {
     savedSuffix--;
-    currentSuffix--;
+    compiledSuffix--;
   }
 
-  const savedMiddle = savedLines.slice(prefix, savedSuffix + 1);
-  const currentMiddle = currentLines.slice(prefix, currentSuffix + 1);
-  if (currentMiddle.length === 0) return [];
+  if (compiledSuffix <= prefix) return [];
 
-  const rows = savedMiddle.length;
-  const cols = currentMiddle.length;
-  const dp: number[][] = Array.from({ length: rows + 1 }, () => new Array<number>(cols + 1).fill(0));
-
-  for (let i = rows - 1; i >= 0; i--) {
-    for (let j = cols - 1; j >= 0; j--) {
-      dp[i][j] = savedMiddle[i] === currentMiddle[j]
-        ? dp[i + 1][j + 1] + 1
-        : Math.max(dp[i + 1][j], dp[i][j + 1]);
-    }
-  }
-
-  const insertedLineIndices: number[] = [];
-  let i = 0;
-  let j = 0;
-  while (i < rows && j < cols) {
-    if (savedMiddle[i] === currentMiddle[j]) {
-      i++;
-      j++;
-      continue;
-    }
-    if (dp[i][j + 1] >= dp[i + 1][j]) {
-      insertedLineIndices.push(prefix + j);
-      j++;
-    } else {
-      i++;
-    }
-  }
-  while (j < cols) {
-    insertedLineIndices.push(prefix + j);
-    j++;
-  }
-
-  if (insertedLineIndices.length === 0) return [];
-
-  const ranges: LineRange[] = [];
-  let start = insertedLineIndices[0];
-  let end = start;
-  for (let index = 1; index < insertedLineIndices.length; index++) {
-    const lineIndex = insertedLineIndices[index];
-    if (lineIndex === end + 1) {
-      end = lineIndex;
-      continue;
-    }
-    ranges.push({ startLine: start + 1, endLine: end + 1 });
-    start = lineIndex;
-    end = lineIndex;
-  }
-  ranges.push({ startLine: start + 1, endLine: end + 1 });
-  return ranges;
+  const start = offsetToLineColumn(compiledContent, prefix);
+  const end = offsetToLineColumn(compiledContent, compiledSuffix);
+  return [{
+    startLine: start.line,
+    startColumn: start.column,
+    endLine: end.line,
+    endColumn: end.column,
+  }];
 }
 
 async function renderUnsavedInsertHighlights(
@@ -671,26 +717,22 @@ async function renderUnsavedInsertHighlights(
   removeSyncOverlays("unsaved-add-hl");
   if (!currentFilePath || currentFilePath !== filePath || lastSuccessfulPageCount === 0) return;
 
-  const lineRanges = computeUnsavedInsertedLineRanges(savedContent, compiledContent);
-  if (lineRanges.length === 0) return;
+  const ranges = computeUnsavedChangedTextRanges(savedContent, compiledContent);
+  if (ranges.length === 0) return;
 
-  const compiledLines = splitLinesPreserveFinalEmpty(compiledContent);
-  for (let rangeIndex = 0; rangeIndex < lineRanges.length; rangeIndex++) {
-    const range = lineRanges[rangeIndex];
-    const startLine = Math.max(1, Math.min(range.startLine, compiledLines.length));
-    const endLine = Math.max(startLine, Math.min(range.endLine, compiledLines.length));
-    const endLineText = compiledLines[endLine - 1] ?? "";
+  for (let rangeIndex = 0; rangeIndex < ranges.length; rangeIndex++) {
+    const range = ranges[rangeIndex];
     try {
       const [startPositions, endPositions] = await Promise.all([
         invoke<PagePos[]>("jump_from_cursor", {
           filePath,
-          line: startLine - 1,
-          character: 0,
+          line: range.startLine - 1,
+          character: Math.max(0, range.startColumn - 1),
         }),
         invoke<PagePos[]>("jump_from_cursor", {
           filePath,
-          line: endLine - 1,
-          character: endLineText.length,
+          line: range.endLine - 1,
+          character: Math.max(0, range.endColumn - 1),
         }),
       ]);
 
@@ -700,7 +742,11 @@ async function renderUnsavedInsertHighlights(
       for (let idx = 0; idx < maxLen; idx++) {
         const start = startPositions[idx] ?? startPositions[0];
         const end = endPositions[idx] ?? endPositions[0];
-        highlightRangeInPreview(start, end, idx === 0 && rangeIndex === 0, "unsaved-add-hl", false);
+        highlightRangeInPreview(start, end, {
+          clearFirst: idx === 0 && rangeIndex === 0,
+          overlayClass: "unsaved-add-hl",
+          scroll: false,
+        });
       }
     } catch {
       // ignore individual unsaved highlight mapping failures
@@ -855,8 +901,9 @@ async function syncCursorToPreview(position: monaco.Position): Promise<void> {
   const model = editor?.getModel();
   if (!model) return;
   if (!currentFilePath) return;
-  // Skip sync if no compiled output exists yet, or if the user is actively typing
+  // Skip sync if no compiled output exists yet, pages aren't rendered yet, or if the user is actively typing
   if (lastSuccessfulPageCount === 0) return;
+  if (renderedPageHashes.length === 0) return;
   if (Date.now() - lastEditTime < 400) return;
 
   const requestId = ++latestCursorRequestId;
@@ -869,7 +916,7 @@ async function syncCursorToPreview(position: monaco.Position): Promise<void> {
     // Discard stale responses
     if (requestId !== latestCursorRequestId) return;
     const previewPos = pickBestPreviewPosition(positions);
-    if (previewPos) {
+    if (previewPos && previewPos.page <= renderedPageHashes.length) {
       const shouldScroll = lastCursorPreviewPage == null || lastCursorPreviewPage !== previewPos.page;
       lastCursorPreviewPage = previewPos.page;
       highlightCursorInPreview(previewPos, {
@@ -913,7 +960,7 @@ async function syncSelectionToPreview(sel: monaco.Selection): Promise<void> {
       for (let i = 0; i < maxLen; i++) {
         const start = startPositions[i] ?? startPositions[0];
         const end = endPositions[i] ?? endPositions[0];
-        highlightRangeInPreview(start, end, i === 0);
+        highlightRangeInPreview(start, end, { clearFirst: i === 0 });
       }
     }
   } catch { /* ignore */ }
@@ -949,8 +996,9 @@ async function handlePreviewClick(
 async function syncHoverToPreview(position: monaco.Position): Promise<void> {
   const model = editor?.getModel();
   if (!model || !currentFilePath) return;
-  // Skip hover sync if no compiled output, or if actively typing
+  // Skip hover sync if no compiled output, pages aren't rendered yet, or if actively typing
   if (lastSuccessfulPageCount === 0) return;
+  if (renderedPageHashes.length === 0) return;
   if (Date.now() - lastEditTime < 600) return;
 
   try {
@@ -960,7 +1008,7 @@ async function syncHoverToPreview(position: monaco.Position): Promise<void> {
       character: position.column - 1,
     });
     const previewPos = pickBestPreviewPosition(positions);
-    if (previewPos) {
+    if (previewPos && previewPos.page <= renderedPageHashes.length) {
       applyHoverAtPreviewPosition(previewPos);
     }
   } catch {
@@ -1014,8 +1062,6 @@ function highlightCursorInPreview(
   const svgEl = getPreviewPageSvg(pos.page);
   const panePoint = pagePointToPanePoint(pos);
   if (!pane || !svgEl || !panePoint) {
-    const totalPages = getPreviewContent()?.querySelectorAll<SVGSVGElement>("svg").length ?? 0;
-    console.warn(`[cursor sync] page ${pos.page} out of range (${totalPages} pages rendered)`);
     return;
   }
 
@@ -1036,67 +1082,166 @@ function highlightCursorInPreview(
   }
 }
 
+interface PreviewPageMetrics {
+  pageLeft: number;
+  pageTop: number;
+  pageWidth: number;
+  pageHeight: number;
+  x: number;
+  y: number;
+}
+
+function getPreviewPageMetrics(pos: PagePos): PreviewPageMetrics | null {
+  const svgEl = getPreviewPageSvg(pos.page);
+  const panePoint = pagePointToPanePoint(pos);
+  const pageOrigin = pagePointToPanePoint({ page: pos.page, x: 0, y: 0 });
+  if (!svgEl || !panePoint || !pageOrigin) return null;
+
+  const rect = svgEl.getBoundingClientRect();
+  return {
+    pageLeft: pageOrigin.left,
+    pageTop: pageOrigin.top,
+    pageWidth: rect.width,
+    pageHeight: rect.height,
+    x: panePoint.left,
+    y: panePoint.top,
+  };
+}
+
+function appendRangeOverlay(
+  overlayClass: string,
+  left: number,
+  top: number,
+  width: number,
+  height: number,
+): void {
+  const contentEl = getPreviewContent();
+  if (!contentEl) return;
+
+  const overlay = document.createElement("div");
+  overlay.className = `highlight-overlay ${overlayClass}`;
+  overlay.style.left = `${Math.max(0, left)}px`;
+  overlay.style.top = `${Math.max(0, top)}px`;
+  overlay.style.width = `${Math.max(6, width)}px`;
+  overlay.style.height = `${Math.max(16, height)}px`;
+  contentEl.appendChild(overlay);
+}
+
 /**
  * Draw a selection-range highlight from `start` to `end`, spanning pages if necessary.
  * Scroll the preview so the start of the selection is visible.
- * @param clearFirst - if true (default), clears existing selection overlays before drawing.
- *                     Set to false when drawing multiple ranges in a loop.
  */
 function highlightRangeInPreview(
   start: PagePos,
   end: PagePos,
-  clearFirst = true,
-  overlayClass = "selection-hl",
-  scroll = true,
+  options: {
+    clearFirst?: boolean;
+    overlayClass?: string;
+    scroll?: boolean;
+  } = {},
 ): void {
+  const clearFirst = options.clearFirst ?? true;
+  const overlayClass = options.overlayClass ?? "selection-hl";
+  const scroll = options.scroll ?? true;
   if (clearFirst) removeSyncOverlays(overlayClass);
 
-  const pane = getPreviewPane();
-  const contentEl = getPreviewContent();
-  const svgs = contentEl?.querySelectorAll<SVGSVGElement>("svg");
-  if (!svgs || svgs.length === 0) return;
-  if (!pane || !contentEl) return;
+  const pageCount = getPreviewContent()?.querySelectorAll<SVGSVGElement>("svg").length ?? 0;
+  if (pageCount === 0) return;
 
   const firstPage = Math.min(start.page, end.page);
-  const lastPage  = Math.max(start.page, end.page);
+  const lastPage = Math.max(start.page, end.page);
+  const startMetrics = getPreviewPageMetrics(start);
+  const endMetrics = getPreviewPageMetrics(end);
+  if (!startMetrics || !endMetrics) return;
+  const linePaddingTop = 12;
+  const linePaddingBottom = 8;
+  const lineHeight = 20;
 
-  for (let p = firstPage; p <= Math.min(lastPage, svgs.length); p++) {
-    const svgEl = svgs[p - 1];
-    if (!svgEl) continue;
+  for (let page = firstPage; page <= Math.min(lastPage, pageCount); page++) {
+    const pageMetrics = getPreviewPageMetrics({ page, x: 0, y: 0 });
+    if (!pageMetrics) continue;
 
-    const rect  = svgEl.getBoundingClientRect();
-    const panePoint = pagePointToPanePoint({ page: p, x: 0, y: 0 });
-    if (!panePoint) continue;
-    const svgH  = svgEl.viewBox.baseVal.height || parseFloat(svgEl.getAttribute("height") || "1");
-    const scaleY = rect.height / svgH;
-
-    let topY: number;
-    let botY: number;
-
-    if (p === firstPage && p === lastPage) {
-      topY = start.y * scaleY - 12;
-      botY = end.y   * scaleY + 8;
-    } else if (p === firstPage) {
-      topY = start.y * scaleY - 12;
-      botY = rect.height;
-    } else if (p === lastPage) {
-      topY = 0;
-      botY = end.y * scaleY + 8;
-    } else {
-      topY = 0;
-      botY = rect.height;
+    if (firstPage === lastPage) {
+      const sameLine = Math.abs(endMetrics.y - startMetrics.y) < lineHeight;
+      if (sameLine) {
+        appendRangeOverlay(
+          overlayClass,
+          startMetrics.x,
+          startMetrics.y - linePaddingTop,
+          endMetrics.x - startMetrics.x,
+          lineHeight + linePaddingTop + linePaddingBottom,
+        );
+      } else {
+        appendRangeOverlay(
+          overlayClass,
+          startMetrics.x,
+          startMetrics.y - linePaddingTop,
+          pageMetrics.pageLeft + pageMetrics.pageWidth - startMetrics.x,
+          lineHeight + linePaddingTop + linePaddingBottom,
+        );
+        if (endMetrics.y - startMetrics.y > lineHeight) {
+          appendRangeOverlay(
+            overlayClass,
+            pageMetrics.pageLeft + 2,
+            startMetrics.y + linePaddingBottom,
+            pageMetrics.pageWidth - 4,
+            endMetrics.y - startMetrics.y - lineHeight,
+          );
+        }
+        appendRangeOverlay(
+          overlayClass,
+          pageMetrics.pageLeft + 2,
+          endMetrics.y - linePaddingTop,
+          endMetrics.x - pageMetrics.pageLeft - 2,
+          lineHeight + linePaddingTop + linePaddingBottom,
+        );
+      }
+      break;
     }
 
-    const height = Math.max(20, botY - topY);
+    if (page === firstPage) {
+      appendRangeOverlay(
+        overlayClass,
+        startMetrics.x,
+        startMetrics.y - linePaddingTop,
+        pageMetrics.pageLeft + pageMetrics.pageWidth - startMetrics.x,
+        lineHeight + linePaddingTop + linePaddingBottom,
+      );
+      appendRangeOverlay(
+        overlayClass,
+        pageMetrics.pageLeft + 2,
+        startMetrics.y + linePaddingBottom,
+        pageMetrics.pageWidth - 4,
+        pageMetrics.pageTop + pageMetrics.pageHeight - startMetrics.y - linePaddingBottom,
+      );
+      continue;
+    }
 
-    const overlay        = document.createElement("div");
-    overlay.className    = `highlight-overlay ${overlayClass}`;
-    overlay.style.left   = `${panePoint.left + 2}px`;
-    overlay.style.top    = `${panePoint.top + topY}px`;
-    overlay.style.width  = `${rect.width - 4}px`;
-    overlay.style.height = `${height}px`;
+    if (page === lastPage) {
+      appendRangeOverlay(
+        overlayClass,
+        pageMetrics.pageLeft + 2,
+        pageMetrics.pageTop,
+        pageMetrics.pageWidth - 4,
+        Math.max(0, endMetrics.y - pageMetrics.pageTop - linePaddingTop),
+      );
+      appendRangeOverlay(
+        overlayClass,
+        pageMetrics.pageLeft + 2,
+        endMetrics.y - linePaddingTop,
+        endMetrics.x - pageMetrics.pageLeft - 2,
+        lineHeight + linePaddingTop + linePaddingBottom,
+      );
+      continue;
+    }
 
-    contentEl.appendChild(overlay);
+    appendRangeOverlay(
+      overlayClass,
+      pageMetrics.pageLeft + 2,
+      pageMetrics.pageTop,
+      pageMetrics.pageWidth - 4,
+      pageMetrics.pageHeight,
+    );
   }
 
   if (scroll) {
@@ -1303,7 +1448,7 @@ async function switchToDocument(doc: OpenDocument, refreshPreview = true): Promi
   }
   if (refreshPreview) {
     resetPreviewState();
-    await compileOpenDocument(doc);
+    compileOpenDocument(doc);
   }
 }
 
@@ -1388,36 +1533,18 @@ export async function closeDocumentsUnderPath(dirPath: string): Promise<boolean>
   return true;
 }
 
-async function compileOpenDocument(doc: OpenDocument): Promise<void> {
-  try {
-    const content = doc.model.getValue();
-    const result = !previewEntryPath
-      ? await invoke<CompileResult>("open_file", { filePath: doc.path, content })
-      : await invoke<CompileResult>("compile_current", { filePath: doc.path, content });
-
-    if (result.success) {
-      showWorkspaceLayout();
-      previewEntryPath = result.entry_path ?? previewEntryPath;
-      lastSuccessfulPageCount = result.page_count;
-      updatePageStatus(result.page_count);
-      await renderAllPages(result.page_count, result.page_hashes);
-      await renderUnsavedInsertHighlights(doc.path, doc.savedContent, content);
-      setOutlineItems(result.outline ?? []);
-      updateStatus("success", `Compiled · ${result.page_count} page(s)`);
-      clearDiagnostics();
-      syncOutlineActiveFromEditor();
-    } else if (isTransientCompileResult(result)) {
-      updateStatus("compiling", "Syncing preview…");
-    } else {
-      updatePageStatus(0);
-      clearOutlinePanel();
-      updateStatus("error", result.errors.join("; "));
-      showDiagnostics(result.errors);
-    }
-  } catch (e) {
-    updatePageStatus(0);
-    updateStatus("error", `Failed to compile: ${e}`);
-  }
+function compileOpenDocument(doc: OpenDocument): void {
+  const content = doc.model.getValue();
+  showWorkspaceLayout();
+  enqueueCompile({
+    command: previewEntryPath ? "compile_current" : "open_file",
+    filePath: doc.path,
+    content,
+    savedContent: doc.savedContent,
+    preservePagesOnError: false,
+    notifyPreviewEntryChange: true,
+    successMessage: (result) => `Compiled · ${result.page_count} page(s)`,
+  });
 }
 
 async function setCurrentDocumentAsPreviewEntry(): Promise<void> {
@@ -1425,33 +1552,17 @@ async function setCurrentDocumentAsPreviewEntry(): Promise<void> {
   const activeDoc = getActiveDocument();
   const content = editor.getValue();
 
-  try {
-    const result = await invoke<CompileResult>("set_preview_entry", {
-      filePath: currentFilePath,
-      content,
-    });
-
-    if (!result.success) {
-      updatePageStatus(0);
-      updateStatus("error", result.errors.join("; "));
-      showDiagnostics(result.errors);
-      return;
-    }
-
-    resetPreviewState();
-    showWorkspaceLayout();
-    previewEntryPath = result.entry_path ?? currentFilePath;
-    lastSuccessfulPageCount = result.page_count;
-    updatePageStatus(result.page_count);
-    await renderAllPages(result.page_count, result.page_hashes);
-    await renderUnsavedInsertHighlights(currentFilePath, activeDoc?.savedContent ?? content, content);
-    setOutlineItems(result.outline ?? []);
-    updateStatus("success", "Preview entry updated");
-    clearDiagnostics();
-    syncOutlineActiveFromEditor();
-  } catch (e) {
-    updateStatus("error", `Failed to set preview entry: ${e}`);
-  }
+  resetPreviewState();
+  showWorkspaceLayout();
+  enqueueCompile({
+    command: "set_preview_entry",
+    filePath: currentFilePath,
+    content,
+    savedContent: activeDoc?.savedContent ?? content,
+    preservePagesOnError: false,
+    notifyPreviewEntryChange: true,
+    successMessage: () => "Preview entry updated",
+  });
 }
 
 async function clearPreviewEntryPin(): Promise<void> {
@@ -1470,14 +1581,25 @@ function renderTabs(): void {
   tabsHost.replaceChildren();
 
   for (const doc of openDocuments.values()) {
+    const isPreviewEntry = doc.path === previewEntryPath;
     const tab = document.createElement("button");
-    tab.className = `editor-tab${doc.path === currentFilePath ? " active" : ""}`;
+    tab.className = `editor-tab${doc.path === currentFilePath ? " active" : ""}${isPreviewEntry ? " preview-entry" : ""}`;
     tab.title = doc.path;
 
     const label = document.createElement("span");
     label.className = "editor-tab-label";
     label.textContent = doc.path.split(/[\\/]/).pop() || doc.path;
     tab.appendChild(label);
+
+    if (isPreviewEntry) {
+      const star = document.createElement("span");
+      star.className = "editor-tab-star";
+      star.innerHTML = `<svg width="11" height="11" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M6 1l1.5 3h3.3l-2.6 2 1 3.3L6 8l-3.2 1.3 1-3.3-2.6-2h3.3L6 1Z" fill="currentColor"/>
+      </svg>`;
+      star.title = "主文件";
+      tab.appendChild(star);
+    }
 
     if (doc.dirty) {
       const dirty = document.createElement("span");

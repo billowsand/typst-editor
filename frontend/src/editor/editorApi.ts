@@ -8,6 +8,7 @@ let editorInitPromise: Promise<void> | null = null;
 let pendingTheme: "light" | "dark" | null = null;
 let pendingFont: { family: string; size: number } | null = null;
 const pendingFileChangeCallbacks: Array<(path: string | null) => void> = [];
+const pendingPreviewEntryChangeCallbacks: Array<(path: string | null) => void> = [];
 
 async function loadEditorModule(): Promise<MonacoEditorModule> {
   if (!editorModulePromise) {
@@ -42,6 +43,9 @@ export async function ensureEditorReady(): Promise<MonacoEditorModule> {
       for (const cb of pendingFileChangeCallbacks) {
         mod.onEditorFileChange(cb);
       }
+      for (const cb of pendingPreviewEntryChangeCallbacks) {
+        mod.onPreviewEntryChange(cb);
+      }
     })();
   }
 
@@ -55,6 +59,16 @@ export function onEditorFileChange(cb: (path: string | null) => void): void {
     void editorInitPromise.then(async () => {
       const mod = await loadEditorModule();
       mod.onEditorFileChange(cb);
+    });
+  }
+}
+
+export function onPreviewEntryChange(cb: (path: string | null) => void): void {
+  pendingPreviewEntryChangeCallbacks.push(cb);
+  if (editorInitPromise) {
+    void editorInitPromise.then(async () => {
+      const mod = await loadEditorModule();
+      mod.onPreviewEntryChange(cb);
     });
   }
 }

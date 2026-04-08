@@ -7,6 +7,7 @@ interface FileEntry {
   name: string;
   path: string;
   is_dir: boolean;
+  is_preview_entry?: boolean;
 }
 
 interface TreeNode {
@@ -27,6 +28,7 @@ let rootContainer: HTMLDivElement | null = null;
 let currentRoot: string | null = null;
 let activeFilePath: string | null = null;
 let treeListEl: HTMLDivElement | null = null;
+let previewEntryPath: string | null = null;
 
 // ─── Public API ───────────────────────────────────────────────────
 
@@ -98,6 +100,26 @@ export function setTreeActiveFile(path: string | null): void {
     node.el.classList.add("active");
     node.el.scrollIntoView({ block: "nearest" });
   }
+}
+
+export function setTreePreviewEntryPath(path: string | null): void {
+  previewEntryPath = path ? normPath(path) : null;
+  nodeMap.forEach((node) => {
+    const isPreviewEntry = node.path === previewEntryPath;
+    node.el.classList.toggle("preview-entry", isPreviewEntry);
+
+    // Update main file badge
+    let badge = node.el.querySelector<HTMLElement>(".preview-entry-badge");
+    if (isPreviewEntry && !badge) {
+      badge = document.createElement("span");
+      badge.className = "preview-entry-badge";
+      badge.innerHTML = SVG_STAR;
+      badge.title = "主文件";
+      node.el.appendChild(badge);
+    } else if (!isPreviewEntry && badge) {
+      badge.remove();
+    }
+  });
 }
 
 // ─── Directory Loading ────────────────────────────────────────────
@@ -175,8 +197,21 @@ function appendTreeItem(
   };
   nodeMap.set(normPath(entry.path), node);
 
-  if (activeFilePath && normPath(entry.path) === normPath(activeFilePath)) {
+  const normalizedPath = normPath(entry.path);
+
+  if (activeFilePath && normalizedPath === normPath(activeFilePath)) {
     item.classList.add("active");
+  }
+
+  // Check if this is the preview entry
+  const isPreviewEntry = normalizedPath === previewEntryPath;
+  if (isPreviewEntry) {
+    item.classList.add("preview-entry");
+    const badge = document.createElement("span");
+    badge.className = "preview-entry-badge";
+    badge.innerHTML = SVG_STAR;
+    badge.title = "主文件";
+    item.appendChild(badge);
   }
 
   if (entry.is_dir) {
@@ -491,65 +526,81 @@ function makeHeaderBtn(svg: string, title: string): HTMLButtonElement {
   return btn;
 }
 
-// ─── File Icon Colors ─────────────────────────────────────────────
+// ─── File Icon Colors (Lucide-inspired palette) ────────────────────────
 
 const EXT_COLOR: Record<string, string> = {
-  typ:  "#3b82f6",
-  bib:  "#22c55e",
-  toml: "#f97316",
-  yaml: "#06b6d4",
-  yml:  "#06b6d4",
-  json: "#eab308",
-  md:   "#8b5cf6",
-  txt:  "#94a3b8",
-  pdf:  "#ef4444",
-  svg:  "#fb923c",
-  img:  "#a855f7",
-  rs:   "#dc2626",
-  ts:   "#1d4ed8",
-  js:   "#ca8a04",
-  py:   "#16a34a",
-  lua:  "#4338ca",
-  sh:   "#334155",
-  css:  "#0ea5e9",
-  html: "#ea580c",
+  typ:  "#0ea5e9",      // Typst - Sky blue
+  bib:  "#22c55e",      // BibTeX - Green
+  toml: "#f97316",      // TOML - Orange
+  yaml: "#06b6d4",      // YAML - Cyan
+  yml:  "#06b6d4",      // YAML - Cyan
+  json: "#eab308",      // JSON - Yellow
+  md:   "#8b5cf6",      // Markdown - Purple
+  txt:  "#64748b",      // Text - Slate
+  pdf:  "#ef4444",      // PDF - Red
+  svg:  "#f59e0b",      // SVG - Amber
+  png:  "#ec4899",      // PNG - Pink
+  jpg:  "#ec4899",      // JPG - Pink
+  jpeg: "#ec4899",      // JPEG - Pink
+  gif:  "#ec4899",      // GIF - Pink
+  webp: "#ec4899",      // WebP - Pink
+  avif: "#ec4899",      // AVIF - Pink
+  bmp:  "#ec4899",      // BMP - Pink
+  tiff: "#ec4899",      // TIFF - Pink
+  img:  "#a855f7",      // Generic image - Purple
+  rs:   "#f97316",      // Rust - Orange
+  ts:   "#3b82f6",      // TypeScript - Blue
+  js:   "#eab308",      // JavaScript - Yellow
+  py:   "#22c55e",      // Python - Green
+  lua:  "#06b6d4",      // Lua - Cyan
+  sh:   "#64748b",      // Shell - Slate
+  css:  "#8b5cf6",      // CSS - Purple
+  html: "#f97316",      // HTML - Orange
+  scss: "#f472b6",      // SCSS - Pink
+  less: "#8b5cf6",      // Less - Purple
+  xml:  "#06b6d4",      // XML - Cyan
+  csv:  "#22c55e",      // CSV - Green
 };
 
 function buildFileIconSvg(ext: string): string {
-  const c = EXT_COLOR[ext] ?? "#64748b";
-  return `<svg width="13" height="15" viewBox="0 0 13 15" fill="none" xmlns="http://www.w3.org/2000/svg">
-    <path d="M1.5 0h6L12 3.5V13.5A1.5 1.5 0 0 1 10.5 15h-9A1.5 1.5 0 0 1 0 13.5V1.5A1.5 1.5 0 0 1 1.5 0z" fill="${c}"/>
-    <path d="M7.5 0L12 3.5H9A1.5 1.5 0 0 1 7.5 2V0z" fill="rgba(0,0,0,0.2)"/>
+  const c = EXT_COLOR[ext] ?? "#94a3b8";
+  return `<svg width="14" height="16" viewBox="0 0 14 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M2 1h7l3 3v9a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1z" fill="${c}" fill-opacity="0.15" stroke="${c}" stroke-width="1"/>
+    <path d="M9 1l3 3H9V1z" fill="${c}" fill-opacity="0.3"/>
   </svg>`;
 }
 
-// ─── SVG Strings ──────────────────────────────────────────────────
+// ─── SVG Strings (Lucide-inspired) ──────────────────────────────────────
 
-const SVG_FOLDER = `<svg width="16" height="13" viewBox="0 0 16 13" fill="none">
-  <path d="M0 3.5A1.5 1.5 0 0 1 1.5 2H6l1.5 1.5h7A1.5 1.5 0 0 1 16 5v6a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 0 11V3.5Z" fill="#c4933f"/>
+const SVG_FOLDER = `<svg width="16" height="14" viewBox="0 0 16 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M1 3.5C1 2.67 1.67 2 2.5 2h5l1.5 1.5h4.5c.83 0 1.5.67 1.5 1.5v6c0 .83-.67 1.5-1.5 1.5h-10c-.83 0-1.5-.67-1.5-1.5v-7.5Z" fill="currentColor" fill-opacity="0.25" stroke="currentColor" stroke-width="1"/>
 </svg>`;
 
-const SVG_FOLDER_OPEN = `<svg width="16" height="13" viewBox="0 0 16 13" fill="none">
-  <path d="M0 3.5A1.5 1.5 0 0 1 1.5 2H6l1.5 1.5h7A1.5 1.5 0 0 1 16 5v1H0V3.5Z" fill="#c4933f" opacity="0.75"/>
-  <path d="M0 6h16L14 12.5A1.5 1.5 0 0 1 12.5 13.5h-11A1.5 1.5 0 0 1 0 12V6Z" fill="#e6aa4e"/>
+const SVG_FOLDER_OPEN = `<svg width="16" height="14" viewBox="0 0 16 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M1 3.5C1 2.67 1.67 2 2.5 2h5l1.5 1.5h4.5c.83 0 1.5.67 1.5 1.5v1.5H1v-2Z" fill="currentColor" fill-opacity="0.15" stroke="currentColor" stroke-width="1"/>
+  <path d="M1 7h13l-1.5 5H2.5L1 7Z" fill="currentColor" fill-opacity="0.25" stroke="currentColor" stroke-width="1"/>
 </svg>`;
 
-const SVG_CHEVRON = `<svg width="8" height="8" viewBox="0 0 8 8" fill="none">
-  <path d="M2 1.5 5 4 2 6.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+const SVG_CHEVRON = `<svg width="10" height="10" viewBox="0 0 10 10" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M3 2l4 3-4 3" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;
 
-const SVG_NEW_FILE = `<svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-  <path d="M3 1.5h5.5L12 5v8a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1v-11a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.2" fill="none"/>
-  <path d="M8.5 1.5V5H12" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
-  <path d="M6 9.5h3M7.5 8v3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+const SVG_STAR = `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M6 1l1.5 3h3.3l-2.6 2 1 3.3L6 8l-3.2 1.3 1-3.3-2.6-2h3.3L6 1Z" fill="currentColor"/>
 </svg>`;
 
-const SVG_NEW_FOLDER = `<svg width="15" height="15" viewBox="0 0 15 15" fill="none">
-  <path d="M1 4.5A1 1 0 0 1 2 3.5h3.5L7 5h6.5A1 1 0 0 1 14.5 6v6a1 1 0 0 1-1 1H2a1 1 0 0 1-1-1V4.5Z" stroke="currentColor" stroke-width="1.2" fill="none"/>
-  <path d="M7.75 8v3M6 9.5h3.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+const SVG_NEW_FILE = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M3 1h6l2 2h3c.55 0 1 .45 1 1v8c0 .55-.45 1-1 1H3c-.55 0-1-.45-1-1V2c0-.55.45-1 1-1z" stroke="currentColor" stroke-width="1.2" fill="none"/>
+  <path d="M9 1l2 2H9V1z" stroke="currentColor" stroke-width="1.2"/>
+  <path d="M5 7h3M6.5 5.5v3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
 </svg>`;
 
-const SVG_REFRESH = `<svg width="13" height="13" viewBox="0 0 13 13" fill="none">
-  <path d="M11.5 2A6 6 0 1 0 12.5 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-  <path d="M9.5 2H12V4.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+const SVG_NEW_FOLDER = `<svg width="14" height="14" viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M1 3.5C1 2.67 1.67 2 2.5 2h5l1.5 1.5h4.5c.83 0 1.5.67 1.5 1.5v6c0 .83-.67 1.5-1.5 1.5h-10c-.83 0-1.5-.67-1.5-1.5v-7.5Z" stroke="currentColor" stroke-width="1.2" fill="none"/>
+  <path d="M7 6.5h3M8.5 5v3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+</svg>`;
+
+const SVG_REFRESH = `<svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <path d="M10 1.5a5 5 0 1 0 .5 5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  <path d="M8.5 1.5h2.5V4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>`;

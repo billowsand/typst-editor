@@ -2,6 +2,7 @@ import {
   hasUnsavedDocumentsAsync,
   jumpToFileOffset,
   onEditorFileChange,
+  onPreviewEntryChange,
   openFileAtPath,
   pickFilePath,
   registerEditorContainer,
@@ -10,7 +11,7 @@ import {
   setMonacoTheme,
 } from "./editor/editorApi";
 import { initPreview } from "./preview/PreviewPanel";
-import { initFileTree, loadTree, setTreeActiveFile } from "./file-tree/FileTree";
+import { initFileTree, loadTree, setTreeActiveFile, setTreePreviewEntryPath } from "./file-tree/FileTree";
 import { initOutlinePanel, type OutlineItem } from "./outline/OutlinePanel";
 import { initWorkspaceShell } from "./workspace/WorkspaceShell";
 import { invoke } from "@tauri-apps/api/core";
@@ -260,6 +261,9 @@ export async function initApp(): Promise<void> {
 
   // Wire editor active file → tree highlight
   onEditorFileChange((path) => setTreeActiveFile(path));
+
+  // Wire preview entry change → tree badge update
+  onPreviewEntryChange((path) => setTreePreviewEntryPath(path));
 
   // Apply saved font
   applyFont(savedFontFamily(), savedFontSize());
