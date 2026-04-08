@@ -394,10 +394,19 @@ async function runCompileJob(job: CompileJob): Promise<void> {
       content: job.content,
     });
 
-    if (job.intentId !== latestCompileRequestId) return;
+    // Always apply the result - if intentId doesn't match anymore, applyCompileResult
+    // will handle it by only updating essential state (previewEntryPath, page count, etc.)
+    // without triggering UI updates that might conflict with a newer request.
     await applyCompileResult(job, result);
   } catch (e) {
-    if (job.intentId !== latestCompileRequestId) return;
+    // For errors, always apply the result even if intentId changed,
+    // because the error state needs to be displayed to the user.
+    if (job.intentId !== latestCompileRequestId) {
+      finalizeCompileStatusTimeout();
+      removeSyncOverlays("unsaved-add-hl");
+      updateStatus("error", `Error: ${e}`);
+      return;
+    }
     finalizeCompileStatusTimeout();
     removeSyncOverlays("unsaved-add-hl");
     if (!job.preservePagesOnError) {
@@ -413,6 +422,7 @@ async function applyCompileResult(job: CompileJob, result: CompileResult): Promi
 
   if (result.success) {
     const oldPreviewEntryPath = previewEntryPath;
+    const entryPathChanged = result.entry_path != null && result.entry_path !== previewEntryPath;
     previewEntryPath = result.entry_path ?? previewEntryPath;
     lastSuccessfulPageCount = result.page_count;
     updatePageStatus(result.page_count);
@@ -424,7 +434,7 @@ async function applyCompileResult(job: CompileJob, result: CompileResult): Promi
     syncOutlineActiveFromEditor();
     updateStatus("success", job.successMessage(result));
     clearDiagnostics();
-    if (job.notifyPreviewEntryChange && oldPreviewEntryPath !== previewEntryPath) {
+    if (job.notifyPreviewEntryChange && entryPathChanged) {
       onPreviewEntryChangeCb?.(previewEntryPath);
     }
     return;
