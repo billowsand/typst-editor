@@ -28,6 +28,7 @@ pub fn run() {
             commands::render_page,
             commands::page_count,
             commands::jump_from_cursor,
+            commands::jump_from_offset,
             commands::jump_from_click,
             commands::get_project_root,
             commands::get_preview_entry,

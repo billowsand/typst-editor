@@ -334,6 +334,30 @@ pub fn jump_from_cursor(
 }
 
 #[tauri::command]
+pub fn jump_from_offset(
+    state: State<'_, CompilerState>,
+    file_path: String,
+    offset: usize,
+) -> Vec<PositionResult> {
+    state
+        .with_document(|world, doc| {
+            let Some(source) = world.source_by_path(&file_path) else {
+                return Vec::new();
+            };
+            let cursor = offset.min(source.text().len());
+            typst_ide::jump_from_cursor(doc, &source, cursor)
+                .into_iter()
+                .map(|pos| PositionResult {
+                    page: pos.page.get(),
+                    x: pos.point.x.to_pt(),
+                    y: pos.point.y.to_pt(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tauri::command]
 pub fn jump_from_click(
     state: State<'_, CompilerState>,
     page: usize,

@@ -121,13 +121,6 @@ interface CompileJob {
   notifyPreviewEntryChange?: boolean;
 }
 
-interface TextRange {
-  startLine: number;
-  startColumn: number;
-  endLine: number;
-  endColumn: number;
-}
-
 interface PreviewPageMetrics {
   pageLeft: number;
   pageTop: number;
@@ -327,7 +320,6 @@ function scheduleCursorPreviewSync(delay = 120): void {
     if (!view) return;
     const selection = view.state.selection.main;
     if (!selection.empty) return;
-    removeSyncOverlays("selection-hl");
     void syncCursorToPreview(selection.head);
   }, delay);
 }
@@ -348,7 +340,7 @@ function createEditorTheme(theme: Theme) {
     },
     ".cm-content": {
       padding: "10px 0 8px",
-      caretColor: dark ? "#0a84ff" : "#0071e3",
+      caretColor: dark ? "#d4a855" : "#b5843a",
     },
     ".cm-line": {
       padding: "0 12px",
@@ -365,10 +357,13 @@ function createEditorTheme(theme: Theme) {
       backgroundColor: dark ? "#2c2c2e" : "#f5f5f7",
     },
     ".cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection": {
-      backgroundColor: dark ? "#0a84ff28" : "#0071e326",
+      backgroundColor: dark ? "#d4a85530" : "#b5843a25",
+    },
+    ".cm-selectionBackground": {
+      borderRadius: "2px",
     },
     ".cm-cursor, .cm-dropCursor": {
-      borderLeftColor: dark ? "#0a84ff" : "#0071e3",
+      borderLeftColor: dark ? "#d4a855" : "#b5843a",
     },
     ".cm-tooltip": {
       backgroundColor: "var(--c-toolbar)",
@@ -391,6 +386,14 @@ function createFontTheme(family: string, size: number) {
   return EditorView.theme({
     "&": {
       "--editor-font-family": family || "ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace",
+    },
+    ".cm-scroller": {
+      fontSize: `${size}px`,
+    },
+    ".cm-content": {
+      fontSize: `${size}px`,
+    },
+    ".cm-gutters": {
       fontSize: `${size}px`,
     },
   });
@@ -544,13 +547,9 @@ function handleViewUpdate(update: ViewUpdate): void {
   if (suppressCursorSync > 0) return;
 
   if (selection.empty) {
-    removeSyncOverlays("selection-hl");
     scheduleCursorPreviewSync(selectionSetDelay(update));
   } else {
     if (selSyncTimeout) clearTimeout(selSyncTimeout);
-    selSyncTimeout = setTimeout(() => {
-      void syncSelectionToPreview(selection.from, selection.to);
-    }, 200);
   }
 
   if (line.number !== lastOutlineSyncLine) {
@@ -647,6 +646,15 @@ function enqueueCompile(job: Omit<CompileJob, "intentId">): void {
   void drainCompileQueue();
 }
 
+function launchCompile(job: Omit<CompileJob, "intentId">): void {
+  const compileJob: CompileJob = {
+    ...job,
+    intentId: ++latestCompileRequestId,
+  };
+  pendingCompileJob = null;
+  void runCompileJob(compileJob);
+}
+
 async function drainCompileQueue(): Promise<void> {
   if (activeCompileJob || !pendingCompileJob) return;
   const job = pendingCompileJob;
@@ -678,7 +686,6 @@ async function runCompileJob(job: CompileJob): Promise<void> {
   } catch (error) {
     if (job.intentId !== latestCompileRequestId) return;
     finalizeCompileStatusTimeout();
-    removeSyncOverlays("unsaved-add-hl");
     if (!job.preservePagesOnError) {
       updatePageStatus(0);
       clearOutlinePanel();
@@ -696,8 +703,6 @@ async function applyCompileResult(job: CompileJob, result: CompileResult): Promi
     updatePageStatus(result.page_count);
     await renderAllPages(result.page_count, result.page_hashes);
     if (job.intentId !== latestCompileRequestId) return;
-    await renderUnsavedInsertHighlights(job.filePath, job.savedContent, job.content);
-    if (job.intentId !== latestCompileRequestId) return;
     setOutlineItems(result.outline ?? []);
     syncOutlineActiveFromEditor();
     updateStatus("success", job.successMessage(result));
@@ -712,8 +717,6 @@ async function applyCompileResult(job: CompileJob, result: CompileResult): Promi
     updateStatus("compiling", "Syncing preview…");
     return;
   }
-
-  removeSyncOverlays("unsaved-add-hl");
   if (!job.preservePagesOnError) {
     updatePageStatus(0);
     clearOutlinePanel();
@@ -945,79 +948,6 @@ function offsetToLineColumn(text: string, offset: number): { line: number; colum
   return { line: Math.max(1, lines.length), column: lastLine.length + 1 };
 }
 
-function computeUnsavedChangedTextRanges(savedContent: string, compiledContent: string): TextRange[] {
-  if (savedContent === compiledContent) return [];
-
-  let prefix = 0;
-  const sharedPrefixLimit = Math.min(savedContent.length, compiledContent.length);
-  while (prefix < sharedPrefixLimit && savedContent[prefix] === compiledContent[prefix]) {
-    prefix++;
-  }
-
-  let savedSuffix = savedContent.length;
-  let compiledSuffix = compiledContent.length;
-  while (
-    savedSuffix > prefix &&
-    compiledSuffix > prefix &&
-    savedContent[savedSuffix - 1] === compiledContent[compiledSuffix - 1]
-  ) {
-    savedSuffix--;
-    compiledSuffix--;
-  }
-
-  if (compiledSuffix <= prefix) return [];
-  const start = offsetToLineColumn(compiledContent, prefix);
-  const end = offsetToLineColumn(compiledContent, compiledSuffix);
-  return [{
-    startLine: start.line,
-    startColumn: start.column,
-    endLine: end.line,
-    endColumn: end.column,
-  }];
-}
-
-async function renderUnsavedInsertHighlights(
-  filePath: string,
-  savedContent: string,
-  compiledContent: string,
-): Promise<void> {
-  removeSyncOverlays("unsaved-add-hl");
-  if (!currentFilePath || currentFilePath !== filePath || lastSuccessfulPageCount === 0) return;
-  const ranges = computeUnsavedChangedTextRanges(savedContent, compiledContent);
-  if (ranges.length === 0) return;
-
-  for (let rangeIndex = 0; rangeIndex < ranges.length; rangeIndex++) {
-    const range = ranges[rangeIndex];
-    try {
-      const [startPositions, endPositions] = await Promise.all([
-        invoke<PagePos[]>("jump_from_cursor", {
-          filePath,
-          line: range.startLine - 1,
-          character: Math.max(0, range.startColumn - 1),
-        }),
-        invoke<PagePos[]>("jump_from_cursor", {
-          filePath,
-          line: range.endLine - 1,
-          character: Math.max(0, range.endColumn - 1),
-        }),
-      ]);
-      if (startPositions.length === 0 || endPositions.length === 0) continue;
-      const maxLen = Math.max(startPositions.length, endPositions.length);
-      for (let idx = 0; idx < maxLen; idx++) {
-        const start = startPositions[idx] ?? startPositions[0];
-        const end = endPositions[idx] ?? endPositions[0];
-        highlightRangeInPreview(start, end, {
-          clearFirst: idx === 0 && rangeIndex === 0,
-          overlayClass: "unsaved-add-hl",
-          scroll: false,
-        });
-      }
-    } catch {
-      // ignore
-    }
-  }
-}
-
 function utf8BytesForText(text: string): number {
   let bytes = 0;
   for (let index = 0; index < text.length; index++) {
@@ -1072,13 +1002,12 @@ async function syncCursorToPreview(head: number): Promise<void> {
   if (renderedPageHashes.length === 0) return;
   if (Date.now() - lastEditTime < 400) return;
 
-  const position = offsetToLineColumn(view.state.doc.toString(), head);
+  const byteOffset = charOffsetToUtf8ByteOffset(view.state.doc.toString(), head);
   const requestId = ++latestCursorRequestId;
   try {
-    const positions = await invoke<PagePos[]>("jump_from_cursor", {
+    const positions = await invoke<PagePos[]>("jump_from_offset", {
       filePath: currentFilePath,
-      line: position.line - 1,
-      character: position.column - 1,
+      offset: byteOffset,
     });
     if (requestId !== latestCursorRequestId) return;
     const previewPos = pickBestPreviewPosition(positions);
@@ -1089,43 +1018,6 @@ async function syncCursorToPreview(head: number): Promise<void> {
         scroll: shouldScroll,
         behavior: "auto",
         persistent: true,
-      });
-    }
-  } catch {
-    // ignore
-  }
-}
-
-async function syncSelectionToPreview(from: number, to: number): Promise<void> {
-  const view = editorView;
-  if (!view || !currentFilePath || from === to) return;
-  const text = view.state.doc.toString();
-  const startPos = offsetToLineColumn(text, from);
-  const endPos = offsetToLineColumn(text, to);
-
-  try {
-    const [startPositions, endPositions] = await Promise.all([
-      invoke<PagePos[]>("jump_from_cursor", {
-        filePath: currentFilePath,
-        line: startPos.line - 1,
-        character: startPos.column - 1,
-      }),
-      invoke<PagePos[]>("jump_from_cursor", {
-        filePath: currentFilePath,
-        line: endPos.line - 1,
-        character: endPos.column - 1,
-      }),
-    ]);
-
-    if (startPositions.length === 0 || endPositions.length === 0) return;
-    removeSyncOverlays("cursor-hl");
-    const maxLen = Math.max(startPositions.length, endPositions.length);
-    for (let index = 0; index < maxLen; index++) {
-      const start = startPositions[index] ?? startPositions[0];
-      const end = endPositions[index] ?? endPositions[0];
-      highlightRangeInPreview(start, end, {
-        clearFirst: index === 0,
-        scroll: false,
       });
     }
   } catch {
@@ -1167,12 +1059,11 @@ async function syncHoverToPreview(offset: number): Promise<void> {
 
   const view = editorView;
   if (!view) return;
-  const pos = offsetToLineColumn(view.state.doc.toString(), offset);
+  const byteOffset = charOffsetToUtf8ByteOffset(view.state.doc.toString(), offset);
   try {
-    const positions = await invoke<PagePos[]>("jump_from_cursor", {
+    const positions = await invoke<PagePos[]>("jump_from_offset", {
       filePath: currentFilePath,
-      line: pos.line - 1,
-      character: pos.column - 1,
+      offset: byteOffset,
     });
     const previewPos = pickBestPreviewPosition(positions);
     if (previewPos && previewPos.page <= renderedPageHashes.length) {
@@ -1223,10 +1114,10 @@ function highlightCursorInPreview(
 
   const overlay = document.createElement("div");
   overlay.className = "highlight-overlay cursor-hl";
-  overlay.style.left = `${panePoint.left}px`;
-  overlay.style.top = `${panePoint.top - 12}px`;
-  overlay.style.width = `${panePoint.pageWidth}px`;
-  overlay.style.height = "24px";
+  overlay.style.left = `${Math.max(0, panePoint.left - 18)}px`;
+  overlay.style.top = `${Math.max(0, panePoint.top - 14)}px`;
+  overlay.style.width = "36px";
+  overlay.style.height = "28px";
   getPreviewContent()?.appendChild(overlay);
   if (options.scroll) {
     scrollPreviewToPosition(pos, options.behavior ?? "auto");
@@ -1265,121 +1156,6 @@ function appendRangeOverlay(overlayClass: string, left: number, top: number, wid
   content.appendChild(overlay);
 }
 
-function highlightRangeInPreview(
-  start: PagePos,
-  end: PagePos,
-  options: { clearFirst?: boolean; overlayClass?: string; scroll?: boolean } = {},
-): void {
-  const clearFirst = options.clearFirst ?? true;
-  const overlayClass = options.overlayClass ?? "selection-hl";
-  const scroll = options.scroll ?? true;
-  if (clearFirst) removeSyncOverlays(overlayClass);
-
-  const pageCount = getPreviewContent()?.querySelectorAll<SVGSVGElement>("svg").length ?? 0;
-  if (pageCount === 0) return;
-
-  const firstPage = Math.min(start.page, end.page);
-  const lastPage = Math.max(start.page, end.page);
-  const startMetrics = getPreviewPageMetrics(start);
-  const endMetrics = getPreviewPageMetrics(end);
-  if (!startMetrics || !endMetrics) return;
-
-  const linePaddingTop = 12;
-  const linePaddingBottom = 8;
-  const lineHeight = 20;
-
-  for (let page = firstPage; page <= Math.min(lastPage, pageCount); page++) {
-    const pageMetrics = getPreviewPageMetrics({ page, x: 0, y: 0 });
-    if (!pageMetrics) continue;
-
-    if (firstPage === lastPage) {
-      const sameLine = Math.abs(endMetrics.y - startMetrics.y) < lineHeight;
-      if (sameLine) {
-        appendRangeOverlay(
-          overlayClass,
-          startMetrics.x,
-          startMetrics.y - linePaddingTop,
-          endMetrics.x - startMetrics.x,
-          lineHeight + linePaddingTop + linePaddingBottom,
-        );
-      } else {
-        appendRangeOverlay(
-          overlayClass,
-          startMetrics.x,
-          startMetrics.y - linePaddingTop,
-          pageMetrics.pageLeft + pageMetrics.pageWidth - startMetrics.x,
-          lineHeight + linePaddingTop + linePaddingBottom,
-        );
-        if (endMetrics.y - startMetrics.y > lineHeight) {
-          appendRangeOverlay(
-            overlayClass,
-            pageMetrics.pageLeft + 2,
-            startMetrics.y + linePaddingBottom,
-            pageMetrics.pageWidth - 4,
-            endMetrics.y - startMetrics.y - lineHeight,
-          );
-        }
-        appendRangeOverlay(
-          overlayClass,
-          pageMetrics.pageLeft + 2,
-          endMetrics.y - linePaddingTop,
-          endMetrics.x - pageMetrics.pageLeft - 2,
-          lineHeight + linePaddingTop + linePaddingBottom,
-        );
-      }
-      break;
-    }
-
-    if (page === firstPage) {
-      appendRangeOverlay(
-        overlayClass,
-        startMetrics.x,
-        startMetrics.y - linePaddingTop,
-        pageMetrics.pageLeft + pageMetrics.pageWidth - startMetrics.x,
-        lineHeight + linePaddingTop + linePaddingBottom,
-      );
-      appendRangeOverlay(
-        overlayClass,
-        pageMetrics.pageLeft + 2,
-        startMetrics.y + linePaddingBottom,
-        pageMetrics.pageWidth - 4,
-        pageMetrics.pageTop + pageMetrics.pageHeight - startMetrics.y - linePaddingBottom,
-      );
-      continue;
-    }
-
-    if (page === lastPage) {
-      appendRangeOverlay(
-        overlayClass,
-        pageMetrics.pageLeft + 2,
-        pageMetrics.pageTop,
-        pageMetrics.pageWidth - 4,
-        Math.max(0, endMetrics.y - pageMetrics.pageTop - linePaddingTop),
-      );
-      appendRangeOverlay(
-        overlayClass,
-        pageMetrics.pageLeft + 2,
-        endMetrics.y - linePaddingTop,
-        endMetrics.x - pageMetrics.pageLeft - 2,
-        lineHeight + linePaddingTop + linePaddingBottom,
-      );
-      continue;
-    }
-
-    appendRangeOverlay(
-      overlayClass,
-      pageMetrics.pageLeft + 2,
-      pageMetrics.pageTop,
-      pageMetrics.pageWidth - 4,
-      pageMetrics.pageHeight,
-    );
-  }
-
-  if (scroll) {
-    scrollPreviewToPosition(start, "auto");
-  }
-}
-
 function pickBestPreviewPosition(positions: PagePos[]): PagePos | null {
   if (positions.length === 0) return null;
   return positions[positions.length - 1] ?? positions[0] ?? null;
@@ -1396,10 +1172,10 @@ function highlightHoverInPreview(pos: PagePos): void {
   if (!panePoint || !svgEl) return;
   const overlay = document.createElement("div");
   overlay.className = "highlight-overlay hover-hl";
-  overlay.style.left = `${panePoint.left}px`;
-  overlay.style.top = `${panePoint.top - 10}px`;
-  overlay.style.width = `${panePoint.pageWidth}px`;
-  overlay.style.height = "22px";
+  overlay.style.left = `${Math.max(0, panePoint.left - 14)}px`;
+  overlay.style.top = `${Math.max(0, panePoint.top - 10)}px`;
+  overlay.style.width = "28px";
+  overlay.style.height = "20px";
   getPreviewContent()?.appendChild(overlay);
 }
 
@@ -1480,8 +1256,6 @@ function resetPreviewState(): void {
   lastCursorPreviewPage = null;
   clearPreviewSourceHover();
   removeSyncOverlays("cursor-hl");
-  removeSyncOverlays("selection-hl");
-  removeSyncOverlays("unsaved-add-hl");
   resetPreviewContent();
 }
 
@@ -1642,7 +1416,7 @@ async function setCurrentDocumentAsPreviewEntry(): Promise<void> {
   const content = view.state.doc.toString();
   resetPreviewState();
   showWorkspaceLayout();
-  enqueueCompile({
+  launchCompile({
     command: "set_preview_entry",
     filePath: currentFilePath,
     content,
@@ -1829,29 +1603,63 @@ export function updateStatus(type: "success" | "error" | "compiling", message: s
   const element = document.getElementById("compile-status");
   if (!element) return;
   element.className = `status-chip status ${type}`;
-  element.textContent = message;
+
+  const icons = {
+    success: `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.1"/>
+      <path d="M4 6l1.5 1.5L8 4.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>`,
+    error: `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.1"/>
+      <path d="M4.5 4.5l3 3M7.5 4.5l-3 3" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+    </svg>`,
+    compiling: `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.1" stroke-dasharray="3 2"/>
+    </svg>`,
+  };
+
+  element.innerHTML = `${icons[type]} ${message}`;
 }
 
 function updateStatusFile(path: string | null): void {
   const element = document.getElementById("status-file");
   if (!element) return;
-  element.textContent = path ? path.split(/[\\/]/).pop() || path : "未打开文件";
+  const icon = `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M2 1.5h5.5l2 2v7.5H2V1.5z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+    <path d="M7.5 1.5v2h2" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+  </svg>`;
+  element.innerHTML = `${icon} ${path ? path.split(/[\\/]/).pop() || path : "未打开文件"}`;
   element.setAttribute("title", path ?? "未打开文件");
 }
 
 function updateCursorStatus(line: number, column: number): void {
   const element = document.getElementById("status-cursor");
-  if (element) element.textContent = `Ln ${line}, Col ${column}`;
+  if (!element) return;
+  const icon = `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M3 1v10M3 1l4 4M3 1l4-1" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+  element.innerHTML = `${icon} Ln ${line}, Col ${column}`;
 }
 
 function updatePageStatus(pageCount: number): void {
   const element = document.getElementById("status-pages");
-  if (element) element.textContent = `${pageCount} page(s)`;
+  if (!element) return;
+  const icon = `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="1.5" y="1.5" width="9" height="9" rx="1" stroke="currentColor" stroke-width="1.1"/>
+    <path d="M4 5h4M4 7h4M4 4h2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+  </svg>`;
+  element.innerHTML = `${icon} ${pageCount} page(s)`;
 }
 
 function updateZoomStatus(zoom: number): void {
   const element = document.getElementById("status-zoom-bar");
-  if (element) element.textContent = `${Math.round(zoom * 100)}%`;
+  if (!element) return;
+  const icon = `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="5.5" cy="5.5" r="3.5" stroke="currentColor" stroke-width="1.1"/>
+    <path d="M5.5 4v3M4 5.5h3" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+    <path d="M8.5 8.5L11 11" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+  </svg>`;
+  element.innerHTML = `${icon} ${Math.round(zoom * 100)}%`;
 }
 
 function isTransientCompileResult(result: CompileResult): boolean {

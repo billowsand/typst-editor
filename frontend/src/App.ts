@@ -42,13 +42,13 @@ const PINNED_FONTS = [
 
 const SYSTEM_FALLBACK = "ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace";
 let currentZoom = 1.0;
+let isPreviewVisible = true;
+let hasOpenFile = false;
 
 // ─── Theme ────────────────────────────────────────────────────────
 function applyTheme(theme: Theme): void {
   document.documentElement.dataset.theme = theme;
   setPref("theme", theme);
-  const icon = document.getElementById("theme-icon");
-  if (icon) icon.textContent = theme === "dark" ? "☀" : "🌙";
   setEditorTheme(theme);
 }
 
@@ -70,51 +70,101 @@ export function createApp(): {
   const app = document.getElementById("app")!;
   document.documentElement.dataset.theme = savedTheme();
 
-  const themeIcon = savedTheme() === "dark" ? "☀" : "🌙";
   const fontSize  = savedFontSize();
 
   // ── Toolbar ──────────────────────────────────────────────────────
   const toolbar = document.createElement("div");
   toolbar.className = "toolbar";
 
-  // Windows-style SVG icons (Segoe-flavoured)
+  // Toolbar button icons
+  const ICON_FILES = `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="2" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.2"/>
+    <rect x="2" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.2"/>
+    <rect x="9" y="2" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.2"/>
+    <rect x="9" y="9" width="5" height="5" rx="1" stroke="currentColor" stroke-width="1.2"/>
+  </svg>`;
+  const ICON_OPEN = `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M3 2h4l1 1h5v10H3V2z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+    <path d="M6 2v3h3" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+  </svg>`;
+  const ICON_SAVE = `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M2 2h9l3 3v9H2V2z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+    <rect x="4" y="2" width="8" height="6" rx="0.5" stroke="currentColor" stroke-width="1.2"/>
+    <rect x="5" y="9" width="6" height="4" rx="0.5" stroke="currentColor" stroke-width="1.2"/>
+  </svg>`;
+  const ICON_EXPORT = `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="2" y="1.5" width="12" height="13" rx="1.5" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M5 9h6M8 6.5v5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M4 5.5h8" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  </svg>`;
+  const ICON_ZOOM_IN = `<svg viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M6 4v4M4 6h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M9.5 9.5L13 13" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  </svg>`;
+  const ICON_ZOOM_OUT = `<svg viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M4 6h4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+    <path d="M9.5 9.5L13 13" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  </svg>`;
+  const ICON_FIT = `<svg viewBox="0 0 14 14" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M2 5V2h3M9 2h3v3M12 9v3H9M5 12H2V9" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+  const ICON_SETTINGS = `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="8" cy="8" r="2.5" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.5 1.5M11.5 11.5L13 13M3 13l1.5-1.5M11.5 4.5L13 3" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  </svg>`;
+  const ICON_THEME = `<svg viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M8 1.5C4.41 1.5 1.5 4.41 1.5 8s2.91 6.5 6.5 6.5 6.5-2.91 6.5-6.5S11.59 1.5 8 1.5Z" stroke="currentColor" stroke-width="1.2"/>
+    <path d="M8 1.5C9.78 2.8 10.9 4.9 10.9 7.25S9.78 11.7 8 14.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+  </svg>`;
+
+  // Windows-style window control icons
   const ICON_MIN  = `<svg viewBox="0 0 10 10"><rect x="0" y="4.5" width="10" height="1"/></svg>`;
   const ICON_MAX  = `<svg viewBox="0 0 10 10"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1"/></svg>`;
   const ICON_REST = `<svg viewBox="0 0 10 10"><rect x="2" y="0" width="8" height="8" fill="none" stroke="currentColor" stroke-width="1"/><rect x="0" y="2" width="8" height="8" fill="var(--c-toolbar)" stroke="currentColor" stroke-width="1"/></svg>`;
   const ICON_CLS  = `<svg viewBox="0 0 10 10"><line x1="0" y1="0" x2="10" y2="10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/><line x1="10" y1="0" x2="0" y2="10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>`;
 
+  // App logo SVG
+  const LOGO_TYPST = `<svg width="22" height="22" viewBox="0 0 22 22" fill="none" xmlns="http://www.w3.org/2000/svg" class="app-logo">
+    <rect width="22" height="22" rx="5" fill="var(--c-accent)"/>
+    <path d="M6 16V6l5 8 5-8v10" stroke="white" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+
   toolbar.innerHTML = `
     <!-- Draggable title area (left, before buttons) -->
     <div class="title-drag">
+      ${LOGO_TYPST}
       <span class="app-title">Typst</span>
     </div>
 
     <div class="toolbar-separator"></div>
 
     <!-- File & edit buttons -->
-    <button id="btn-files"  title="切换文件树 (Ctrl+B)">Files</button>
-    <button id="btn-open"   title="打开 (Ctrl+O)">Open</button>
-    <button id="btn-save"   title="保存 (Ctrl+S)">Save</button>
-    <button id="btn-export" title="导出 PDF (Ctrl+Shift+E)">Export PDF</button>
+    <button id="btn-files" class="btn-labeled" title="切换文件树 (Ctrl+B)">${ICON_FILES} 文件</button>
+    <button id="btn-preview" class="btn-labeled" title="切换预览面板">${ICON_EXPORT} 预览</button>
+    <button id="btn-open" class="btn-labeled" title="打开 (Ctrl+O)">${ICON_OPEN} 打开</button>
+    <button id="btn-save" class="btn-labeled" title="保存 (Ctrl+S)">${ICON_SAVE} 保存</button>
+    <button id="btn-export" class="btn-labeled" title="导出 PDF (Ctrl+Shift+E)">${ICON_EXPORT} 导出</button>
 
     <div class="toolbar-separator"></div>
 
     <!-- Zoom -->
-    <button id="btn-zoom-out" class="btn-icon" title="缩小">−</button>
+    <button id="btn-zoom-out" class="btn-icon" title="缩小">${ICON_ZOOM_OUT}</button>
     <span   id="zoom-level"   class="zoom-label">100%</span>
-    <button id="btn-zoom-in"  class="btn-icon" title="放大">+</button>
-    <button id="btn-zoom-fit" title="适合宽度">Fit</button>
+    <button id="btn-zoom-in"  class="btn-icon" title="放大">${ICON_ZOOM_IN}</button>
+    <button id="btn-zoom-fit" class="btn-icon" title="适合宽度">${ICON_FIT}</button>
 
     <div class="toolbar-separator"></div>
 
     <!-- Theme toggle -->
-    <button id="btn-theme" class="btn-icon" title="切换主题">
-      <span id="theme-icon">${themeIcon}</span>
+    <button id="btn-theme" class="btn-labeled" title="切换浅色/深色主题">
+      ${ICON_THEME} 主题
     </button>
 
     <!-- Settings -->
     <div class="settings-container">
-      <button id="btn-settings" class="btn-icon" title="设置">⚙</button>
+      <button id="btn-settings" class="btn-icon" title="设置">${ICON_SETTINGS}</button>
 
       <div class="settings-dropdown" id="settings-dropdown" hidden>
 
@@ -212,17 +262,39 @@ export function createApp(): {
   splitContainer.append(sidebarPane, treeGutter, editorPane, gutter, previewPane);
   app.appendChild(splitContainer);
 
+  // Status bar icons
+  const ICON_FILE = `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M2 1.5h5.5l2 2v7.5H2V1.5z" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+    <path d="M7.5 1.5v2h2" stroke="currentColor" stroke-width="1.1" stroke-linejoin="round"/>
+  </svg>`;
+  const ICON_CURSOR = `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <path d="M3 1v10M3 1l4 4M3 1l4-1" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+  const ICON_PAGES = `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <rect x="1.5" y="1.5" width="9" height="9" rx="1" stroke="currentColor" stroke-width="1.1"/>
+    <path d="M4 5h4M4 7h4M4 4h2" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+  </svg>`;
+  const ICON_ZOOM = `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="5.5" cy="5.5" r="3.5" stroke="currentColor" stroke-width="1.1"/>
+    <path d="M5.5 4v3M4 5.5h3" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+    <path d="M8.5 8.5L11 11" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>
+  </svg>`;
+  const ICON_READY = `<svg viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
+    <circle cx="6" cy="6" r="4.5" stroke="currentColor" stroke-width="1.1"/>
+    <path d="M4 6l1.5 1.5L8 4.5" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>`;
+
   const statusBar = document.createElement("div");
   statusBar.className = "status-bar";
   statusBar.innerHTML = `
     <div class="status-group">
-      <span id="status-file" class="status-chip wide">未打开文件</span>
-      <span id="status-cursor" class="status-chip">Ln 1, Col 1</span>
+      <span id="status-file" class="status-chip wide">${ICON_FILE} 未打开文件</span>
+      <span id="status-cursor" class="status-chip">${ICON_CURSOR} Ln 1, Col 1</span>
     </div>
     <div class="status-group status-group-right">
-      <span id="status-pages" class="status-chip">0 page(s)</span>
-      <span id="status-zoom-bar" class="status-chip">100%</span>
-      <span id="compile-status" class="status-chip status">Ready</span>
+      <span id="status-pages" class="status-chip">${ICON_PAGES} 0 page(s)</span>
+      <span id="status-zoom-bar" class="status-chip">${ICON_ZOOM} 100%</span>
+      <span id="compile-status" class="status-chip status success">${ICON_READY} Ready</span>
     </div>
   `;
   app.appendChild(statusBar);
@@ -258,9 +330,13 @@ export async function initApp(): Promise<void> {
   setupSettingsPanel();
   setupWindowControls();          // ← frameless window controls
   await initFileTree(fileTreeContainer);
+  syncToolbarState(null);
 
   // Wire editor active file → tree highlight
-  onEditorFileChange((path) => setTreeActiveFile(path));
+  onEditorFileChange((path) => {
+    setTreeActiveFile(path);
+    syncToolbarState(path);
+  });
 
   // Wire preview entry change → tree badge update
   onPreviewEntryChange((path) => setTreePreviewEntryPath(path));
@@ -516,12 +592,20 @@ function bindToolbarButtons(fileTreeContainer: HTMLDivElement): void {
   });
 
   document.getElementById("btn-files")?.addEventListener("click", () => {
+    const filesButton = document.getElementById("btn-files") as HTMLButtonElement | null;
+    if (filesButton?.disabled) return;
     const pane   = document.getElementById("file-tree-pane") as HTMLElement | null;
     const gutter = document.querySelector<HTMLElement>(".tree-gutter");
     if (!pane || !gutter) return;
     const hidden = pane.style.display === "none";
     pane.style.display   = hidden ? "" : "none";
     gutter.style.display = hidden ? "" : "none";
+  });
+
+  document.getElementById("btn-preview")?.addEventListener("click", () => {
+    const previewButton = document.getElementById("btn-preview") as HTMLButtonElement | null;
+    if (previewButton?.disabled) return;
+    setPreviewVisibility(!isPreviewVisible);
   });
 
   document.getElementById("btn-open")?.addEventListener("click", async () => {
@@ -550,6 +634,37 @@ function bindToolbarButtons(fileTreeContainer: HTMLDivElement): void {
     setZoom(1.0);
     updateZoomLabel();
   });
+}
+
+function syncToolbarState(activeFilePath: string | null): void {
+  const filesButton = document.getElementById("btn-files") as HTMLButtonElement | null;
+  const previewButton = document.getElementById("btn-preview") as HTMLButtonElement | null;
+  if (!filesButton || !previewButton) return;
+
+  hasOpenFile = !!activeFilePath;
+  filesButton.disabled = !hasOpenFile;
+  filesButton.title = hasOpenFile ? "切换文件树 (Ctrl+B)" : "打开文件后才能切换文件树";
+  previewButton.disabled = !hasOpenFile;
+  previewButton.title = hasOpenFile
+    ? (isPreviewVisible ? "隐藏预览面板" : "显示预览面板")
+    : "打开文件后才能切换预览面板";
+  previewButton.classList.toggle("panel-open", hasOpenFile && isPreviewVisible);
+}
+
+function setPreviewVisibility(visible: boolean): void {
+  isPreviewVisible = visible;
+
+  const pane = document.getElementById("preview-pane") as HTMLElement | null;
+  const gutter = document.querySelectorAll<HTMLElement>(".gutter")[1] ?? null;
+  const editorPane = document.getElementById("editor-pane") as HTMLElement | null;
+
+  if (!pane || !gutter || !editorPane) return;
+
+  pane.style.display = visible ? "" : "none";
+  gutter.style.display = visible ? "" : "none";
+  editorPane.style.flexGrow = visible ? "" : "1";
+
+  syncToolbarState(hasOpenFile ? "__active__" : null);
 }
 
 async function promptOpenFile(fileTreeContainer: HTMLDivElement): Promise<void> {
@@ -649,13 +764,5 @@ function setupGutterDrag(
     gutter.classList.remove("dragging");
     document.body.style.cursor = "";
     document.body.style.userSelect = "";
-
-    // Let preview pane fill remaining space via flex: 1 (CSS default)
-    // Editor pane keeps its flexBasis to maintain the split position
-    if (previewPane) {
-      previewPane.style.flexBasis = "";
-      previewPane.style.flexShrink = "";
-      previewPane.style.flexGrow = "";
-    }
   });
 }
