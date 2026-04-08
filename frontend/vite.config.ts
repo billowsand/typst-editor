@@ -15,4 +15,7 @@ export default defineConfig({
       ignored: ["**/src-tauri/**"],
     },
   },
+  optimizeDeps: {
+    include: ["monaco-editor"],
+  },
 });

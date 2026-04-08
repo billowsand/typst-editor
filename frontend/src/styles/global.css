@@ -97,9 +97,6 @@ html, body {
                "Segoe UI", Arial, sans-serif;
   background: var(--c-bg);
   color: var(--c-text);
-  /* Prevent text selection during window drag */
-  -webkit-user-select: none;
-  user-select: none;
 }
 
 /* Re-enable selection inside the editor and preview */
@@ -746,83 +743,6 @@ html, body {
 .editor-surface {
   flex: 1 1 auto;
   min-height: 0;
-  position: relative;
-}
-
-.editor-surface .cm-editor {
-  height: 100%;
-}
-
-.editor-surface .cm-scroller {
-  overflow: auto;
-}
-
-.editor-surface .cm-content,
-.editor-surface .cm-gutterElement {
-  font-variant-numeric: tabular-nums;
-}
-
-.editor-surface .cm-focused {
-  outline: none;
-}
-
-.editor-surface .cm-gutters {
-  user-select: none;
-}
-
-.editor-surface .cm-tooltip-autocomplete ul {
-  max-height: 280px;
-}
-
-.editor-surface .cm-completionLabel {
-  font-size: 12.5px;
-}
-
-.editor-surface .cm-typst-heading {
-  color: color-mix(in srgb, var(--c-accent) 85%, var(--c-text));
-  font-weight: 700;
-}
-
-.editor-surface .cm-typst-comment {
-  color: var(--c-text-3);
-  font-style: italic;
-}
-
-.editor-surface .cm-typst-string {
-  color: #c0392b;
-}
-
-.editor-surface .cm-typst-number {
-  color: #7d3eb5;
-}
-
-.editor-surface .cm-typst-directive,
-.editor-surface .cm-typst-keyword {
-  color: #0066b8;
-  font-weight: 600;
-}
-
-.editor-surface .cm-typst-strong {
-  color: var(--c-text);
-  font-weight: 700;
-}
-
-.editor-surface .cm-typst-emphasis {
-  color: var(--c-text);
-  font-style: italic;
-}
-
-[data-theme="dark"] .editor-surface .cm-typst-string {
-  color: #ff9580;
-}
-
-[data-theme="dark"] .editor-surface .cm-typst-number {
-  color: #d4a0ff;
-}
-
-[data-theme="dark"] .editor-surface .cm-typst-directive,
-[data-theme="dark"] .editor-surface .cm-typst-keyword {
-  color: #79bcff;
 }
 
 .editor-tab {
@@ -1008,32 +928,55 @@ html, body {
   position: absolute;
   pointer-events: none;
   z-index: 5;
-  border-radius: 3px;
-  transition: opacity 0.45s ease;
+  border-radius: 4px;
+  transition: opacity 0.45s ease, transform 0.2s ease, box-shadow 0.2s ease;
 }
 
-/* Cursor position indicator: full-width line with left accent */
+/* Cursor position indicator: focused text highlight with precise positioning */
 .highlight-overlay.cursor-hl {
-  background: radial-gradient(circle at center,
-    color-mix(in srgb, var(--hl-cursor-line) 26%, transparent),
-    color-mix(in srgb, var(--hl-cursor-line) 10%, transparent) 58%,
-    transparent 100%);
-  border: 1.5px solid color-mix(in srgb, var(--hl-cursor-line) 70%, transparent);
-  border-radius: 999px;
-  box-shadow: 0 0 0 1px color-mix(in srgb, #ffffff 10%, transparent);
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--hl-cursor-bg) 0%, transparent) 0%,
+    color-mix(in srgb, var(--hl-cursor-bg) 100%, transparent) 100%);
+  border: 1px solid color-mix(in srgb, var(--hl-cursor-line) 45%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--hl-cursor-line) 70%, transparent);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--hl-cursor-line) 8%, transparent),
+              0 0 0 1px color-mix(in srgb, var(--hl-cursor-line) 6%, transparent);
 }
 
-/* Preview hover indicator: very subtle, shows clickable line without changing text color */
+/* Preview hover indicator: minimal, elegant underline style */
 .highlight-overlay.hover-hl {
-  background: radial-gradient(circle at center,
-    color-mix(in srgb, var(--c-accent) 16%, transparent),
-    transparent 75%);
-  border: 1px solid color-mix(in srgb, var(--c-accent) 34%, transparent);
-  border-radius: 999px;
-  transition: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid color-mix(in srgb, var(--c-accent) 50%, transparent);
+  border-radius: 0;
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--c-accent) 12%, transparent);
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 
-.highlight-overlay.fade { opacity: 0; }
+.highlight-overlay.hover-hl:hover {
+  border-bottom-color: color-mix(in srgb, var(--c-accent) 65%, transparent);
+  box-shadow: 0 2px 6px color-mix(in srgb, var(--c-accent) 18%, transparent);
+}
+
+.highlight-overlay.fade { opacity: 0; transform: translateY(2px); }
+
+/* Selection highlight style */
+.highlight-overlay.selection-hl {
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--hl-sel-bg) 0%, transparent) 0%,
+    color-mix(in srgb, var(--hl-sel-bg) 100%, transparent) 100%);
+  border: 1px solid color-mix(in srgb, var(--hl-sel-border) 40%, transparent);
+  box-shadow: 0 1px 4px color-mix(in srgb, var(--hl-sel-border) 6%, transparent);
+}
+
+/* Unsaved changes highlight */
+.highlight-overlay.unsaved-add-hl {
+  background: linear-gradient(135deg,
+    color-mix(in srgb, var(--hl-unsaved-bg) 0%, transparent) 0%,
+    color-mix(in srgb, var(--hl-unsaved-bg) 100%, transparent) 100%);
+  border: 1px dashed color-mix(in srgb, var(--hl-unsaved-border) 50%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--hl-unsaved-border) 75%, transparent);
+}
 
 /* ─── Diagnostics Panel ──────────────────────────────────────── */
 .diagnostics-panel {

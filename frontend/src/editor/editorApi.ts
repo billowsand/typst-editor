@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
-type EditorModule = typeof import("./CodeMirrorEditor");
+type MonacoEditorModule = typeof import("./MonacoEditor");
 
-let editorModulePromise: Promise<EditorModule> | null = null;
+let editorModulePromise: Promise<MonacoEditorModule> | null = null;
 let editorContainer: HTMLDivElement | null = null;
 let editorInitPromise: Promise<void> | null = null;
 let pendingTheme: "light" | "dark" | null = null;
@@ -10,9 +10,12 @@ let pendingFont: { family: string; size: number } | null = null;
 const pendingFileChangeCallbacks: Array<(path: string | null) => void> = [];
 const pendingPreviewEntryChangeCallbacks: Array<(path: string | null) => void> = [];
 
-async function loadEditorModule(): Promise<EditorModule> {
+async function loadEditorModule(): Promise<MonacoEditorModule> {
   if (!editorModulePromise) {
-    editorModulePromise = import("./CodeMirrorEditor");
+    editorModulePromise = (async () => {
+      await import("../monaco-env");
+      return import("./MonacoEditor");
+    })();
   }
   return editorModulePromise;
 }
@@ -21,7 +24,7 @@ export function registerEditorContainer(container: HTMLDivElement): void {
   editorContainer = container;
 }
 
-export async function ensureEditorReady(): Promise<EditorModule> {
+export async function ensureEditorReady(): Promise<MonacoEditorModule> {
   if (!editorContainer) {
     throw new Error("Editor container is not registered");
   }
@@ -125,7 +128,7 @@ export async function revealSourceOffsetInPreview(
 
 export async function runEditorAction(actionId: string): Promise<void> {
   const mod = await ensureEditorReady();
-  await mod.runEditorAction(actionId);
+  mod.getEditor()?.getAction(actionId)?.run();
 }
 
 export async function closeDocument(path: string): Promise<boolean> {
