@@ -683,6 +683,83 @@ html, body {
 .editor-surface {
   flex: 1 1 auto;
   min-height: 0;
+  position: relative;
+}
+
+.editor-surface .cm-editor {
+  height: 100%;
+}
+
+.editor-surface .cm-scroller {
+  overflow: auto;
+}
+
+.editor-surface .cm-content,
+.editor-surface .cm-gutterElement {
+  font-variant-numeric: tabular-nums;
+}
+
+.editor-surface .cm-focused {
+  outline: none;
+}
+
+.editor-surface .cm-gutters {
+  user-select: none;
+}
+
+.editor-surface .cm-tooltip-autocomplete ul {
+  max-height: 280px;
+}
+
+.editor-surface .cm-completionLabel {
+  font-size: 12.5px;
+}
+
+.editor-surface .cm-typst-heading {
+  color: color-mix(in srgb, var(--c-accent) 90%, var(--c-text));
+  font-weight: 700;
+}
+
+.editor-surface .cm-typst-comment {
+  color: var(--c-text-3);
+  font-style: italic;
+}
+
+.editor-surface .cm-typst-string {
+  color: #c0392b;
+}
+
+.editor-surface .cm-typst-number {
+  color: #7d3eb5;
+}
+
+.editor-surface .cm-typst-directive,
+.editor-surface .cm-typst-keyword {
+  color: #0064d2;
+  font-weight: 600;
+}
+
+.editor-surface .cm-typst-strong {
+  color: var(--c-text);
+  font-weight: 700;
+}
+
+.editor-surface .cm-typst-emphasis {
+  color: var(--c-text);
+  font-style: italic;
+}
+
+[data-theme="dark"] .editor-surface .cm-typst-string {
+  color: #ff7b72;
+}
+
+[data-theme="dark"] .editor-surface .cm-typst-number {
+  color: #bf5af2;
+}
+
+[data-theme="dark"] .editor-surface .cm-typst-directive,
+[data-theme="dark"] .editor-surface .cm-typst-keyword {
+  color: #409cff;
 }
 
 .editor-tab {

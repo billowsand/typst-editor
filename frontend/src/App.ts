@@ -8,7 +8,7 @@ import {
   registerEditorContainer,
   runEditorAction,
   setEditorFont,
-  setMonacoTheme,
+  setEditorTheme,
 } from "./editor/editorApi";
 import { initPreview } from "./preview/PreviewPanel";
 import { initFileTree, loadTree, setTreeActiveFile, setTreePreviewEntryPath } from "./file-tree/FileTree";
@@ -49,7 +49,7 @@ function applyTheme(theme: Theme): void {
   setPref("theme", theme);
   const icon = document.getElementById("theme-icon");
   if (icon) icon.textContent = theme === "dark" ? "☀" : "🌙";
-  setMonacoTheme(theme);
+  setEditorTheme(theme);
 }
 
 // ─── Font ─────────────────────────────────────────────────────────

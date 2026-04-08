@@ -1,11 +1,32 @@
-import * as monaco from "monaco-editor/esm/vs/editor/editor.api";
 import { invoke } from "@tauri-apps/api/core";
+import { basicSetup } from "codemirror";
+import {
+  autocompletion,
+  closeBrackets,
+  closeBracketsKeymap,
+  type Completion,
+  type CompletionContext,
+} from "@codemirror/autocomplete";
+import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
+import { Compartment, EditorSelection, EditorState, RangeSetBuilder, StateEffect, StateField, type Extension } from "@codemirror/state";
+import {
+  Decoration,
+  drawSelection,
+  EditorView,
+  highlightActiveLine,
+  highlightActiveLineGutter,
+  keymap,
+  lineNumbers,
+  rectangularSelection,
+  ViewPlugin,
+  ViewUpdate,
+} from "@codemirror/view";
 import {
   clientPointToPagePoint,
   ensurePreviewPageNode,
   getPreviewContent,
-  getPreviewPane,
   getPreviewPageSvg,
+  getPreviewPane,
   pagePointToPanePoint,
   replacePreviewPageSvg,
   resetPreviewContent,
@@ -16,75 +37,76 @@ import {
   clearOutlinePanel,
   setOutlineItems,
   updateOutlineActiveItem,
+  type OutlineItem,
 } from "../outline/OutlinePanel";
 import { showEmptyWorkspace, showWorkspaceLayout } from "../workspace/WorkspaceShell";
 
-let editor: monaco.editor.IStandaloneCodeEditor | null = null;
+let editorView: EditorView | null = null;
 let onFileChangeCb: ((path: string | null) => void) | null = null;
 let onPreviewEntryChangeCb: ((path: string | null) => void) | null = null;
 
-/** Register a callback that fires whenever the active file path changes. */
-export function onEditorFileChange(cb: (path: string | null) => void): void {
-  onFileChangeCb = cb;
-}
-
-/** Register a callback that fires whenever the preview entry path changes. */
-export function onPreviewEntryChange(cb: (path: string | null) => void): void {
-  onPreviewEntryChangeCb = cb;
-}
-let compileTimeout:    ReturnType<typeof setTimeout> | null = null;
+let compileTimeout: ReturnType<typeof setTimeout> | null = null;
 let cursorSyncTimeout: ReturnType<typeof setTimeout> | null = null;
-let selSyncTimeout:    ReturnType<typeof setTimeout> | null = null;
-let hoverSyncTimeout:  ReturnType<typeof setTimeout> | null = null;
+let selSyncTimeout: ReturnType<typeof setTimeout> | null = null;
+let hoverSyncTimeout: ReturnType<typeof setTimeout> | null = null;
 let compileStatusTimeout: ReturnType<typeof setTimeout> | null = null;
-// Prevents sync loop when we programmatically move the editor cursor from a preview click
-// Use a counter instead of boolean to handle nested operations correctly
+
 let suppressCursorSync = 0;
 let suppressProgrammaticCompile = false;
-// Tracks last user edit timestamp — used to suppress expensive cursor sync during active typing
 let lastEditTime = 0;
-// Tracks the last line number synced to the outline — outline sync skips column-only changes
 let lastOutlineSyncLine = -1;
 
-let currentFilePath         = "";
-let previewEntryPath        = "";
+let currentFilePath = "";
+let previewEntryPath = "";
 let lastSuccessfulPageCount = 0;
-let latestCompileRequestId  = 0;
+let latestCompileRequestId = 0;
 let renderedPageHashes: number[] = [];
 let tabsHost: HTMLDivElement | null = null;
 let editorHost: HTMLDivElement | null = null;
 let tabContextMenu: HTMLDivElement | null = null;
 let previewHoverRequestId = 0;
 let previewHoverTargetKey = "";
-let sourceHoverDecorationIds: string[] = [];
 let sourceHoverTarget: { file: string; offset: number } | null = null;
 let latestCursorRequestId = 0;
 let lastCursorPreviewPage: number | null = null;
-let offsetCache:
-  | {
-    model: monaco.editor.ITextModel;
-    versionId: number;
-    lineStartChars: number[];
-    lineStartBytes: number[];
-    eol: string;
-    eolCharLength: number;
-    eolByteLength: number;
-  }
-  | null = null;
+
+type Theme = "light" | "dark";
+type CompileCommand = "compile_current" | "open_file" | "set_preview_entry";
+
+interface CompileResult {
+  success: boolean;
+  page_count: number;
+  page_hashes: number[];
+  outline: OutlineItem[];
+  errors: string[];
+  duration_ms?: number;
+  entry_path?: string | null;
+}
+
+interface JumpResult {
+  type: string;
+  file?: string | null;
+  offset?: number | null;
+  url?: string | null;
+  position?: PagePos | null;
+}
+
+interface PagePos {
+  page: number;
+  x: number;
+  y: number;
+}
 
 interface OpenDocument {
   path: string;
-  model: monaco.editor.ITextModel;
-  viewState: monaco.editor.ICodeEditorViewState | null;
+  state: EditorState;
   savedContent: string;
-  /** Monaco alternative version ID at the time of last save — O(1) dirty check */
-  savedVersionId: number;
+  version: number;
+  savedVersion: number;
   dirty: boolean;
+  scrollTop: number;
+  scrollLeft: number;
 }
-
-const openDocuments = new Map<string, OpenDocument>();
-
-type CompileCommand = "compile_current" | "open_file" | "set_preview_entry";
 
 interface CompileJob {
   intentId: number;
@@ -97,101 +119,379 @@ interface CompileJob {
   notifyPreviewEntryChange?: boolean;
 }
 
+interface TextRange {
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
+}
+
+interface PreviewPageMetrics {
+  pageLeft: number;
+  pageTop: number;
+  pageWidth: number;
+  pageHeight: number;
+  x: number;
+  y: number;
+}
+
+interface SyntaxToken {
+  from: number;
+  to: number;
+  className: string;
+}
+
+const openDocuments = new Map<string, OpenDocument>();
+
+const themeCompartment = new Compartment();
+const fontCompartment = new Compartment();
+
 let activeCompileJob: Promise<void> | null = null;
 let pendingCompileJob: CompileJob | null = null;
+
+const setSourceHoverEffect = StateEffect.define<{ from: number; to: number } | null>({
+  map(value, mapping) {
+    if (!value) return null;
+    return {
+      from: mapping.mapPos(value.from),
+      to: mapping.mapPos(value.to),
+    };
+  },
+});
+
+const sourceHoverField = StateField.define({
+  create() {
+    return Decoration.none;
+  },
+  update(decorations, transaction) {
+    decorations = decorations.map(transaction.changes);
+    for (const effect of transaction.effects) {
+      if (!effect.is(setSourceHoverEffect)) continue;
+      if (!effect.value) {
+        return Decoration.none;
+      }
+      const builder = new RangeSetBuilder<Decoration>();
+      builder.add(
+        effect.value.from,
+        effect.value.to,
+        Decoration.mark({ class: "editor-source-hover" }),
+      );
+      return builder.finish();
+    }
+    return decorations;
+  },
+  provide(field) {
+    return EditorView.decorations.from(field);
+  },
+});
+
+const TYPOGRAPHIC_COMPLETIONS: Completion[] = [
+  { label: "set", type: "keyword", apply: "set " },
+  { label: "show", type: "keyword", apply: "show " },
+  { label: "let", type: "keyword", apply: "let " },
+  { label: "if", type: "keyword", apply: "if " },
+  { label: "for", type: "keyword", apply: "for  in " },
+  { label: "while", type: "keyword", apply: "while " },
+  { label: "import", type: "keyword", apply: "import " },
+  { label: "include", type: "keyword", apply: "include " },
+  { label: "page", type: "function", apply: "page(width: auto, height: auto)" },
+  { label: "text", type: "function", apply: "text(size: )" },
+  { label: "align", type: "function", apply: "align(center)" },
+  { label: "image", type: "function", apply: 'image("")' },
+  { label: "lorem", type: "function", apply: "lorem(50)" },
+];
+
+const typstKeywordPattern = /\b(set|show|let|if|for|while|import|include)\b/g;
+const typstDirectivePattern = /#[A-Za-z_]\w*/g;
+const typstNumberPattern = /\b\d+(?:\.\d+)?\b/g;
+const typstStringPattern = /"(?:\\.|[^"\\])*"/g;
+const typstStrongPattern = /\*[^*\n]+\*/g;
+const typstEmphasisPattern = /_[^_\n]+_/g;
+
+const typstSyntaxHighlighting = ViewPlugin.fromClass(class {
+  decorations;
+
+  constructor(view: EditorView) {
+    this.decorations = buildSyntaxDecorations(view);
+  }
+
+  update(update: ViewUpdate) {
+    if (update.docChanged || update.viewportChanged) {
+      this.decorations = buildSyntaxDecorations(update.view);
+    }
+  }
+}, {
+  decorations: (plugin) => plugin.decorations,
+});
+
+function typstCompletionSource(context: CompletionContext) {
+  const word = context.matchBefore(/[A-Za-z_]\w*/);
+  if (!word && !context.explicit) return null;
+  return {
+    from: word?.from ?? context.pos,
+    options: TYPOGRAPHIC_COMPLETIONS,
+  };
+}
+
+function buildSyntaxDecorations(view: EditorView) {
+  const builder = new RangeSetBuilder<Decoration>();
+
+  for (const { from, to } of view.visibleRanges) {
+    let line = view.state.doc.lineAt(from);
+    while (line.from <= to) {
+      for (const token of getLineSyntaxTokens(line.text, line.from)) {
+        builder.add(
+          token.from,
+          token.to,
+          Decoration.mark({ class: token.className }),
+        );
+      }
+
+      if (line.to >= to || line.number >= view.state.doc.lines) break;
+      line = view.state.doc.line(line.number + 1);
+    }
+  }
+
+  return builder.finish();
+}
+
+function getLineSyntaxTokens(text: string, lineFrom: number): SyntaxToken[] {
+  const tokens: SyntaxToken[] = [];
+  const occupied: Array<{ from: number; to: number }> = [];
+
+  const pushToken = (from: number, to: number, className: string) => {
+    if (from >= to || overlapsOccupied(occupied, from, to)) return;
+    occupied.push({ from, to });
+    tokens.push({ from: lineFrom + from, to: lineFrom + to, className });
+  };
+
+  const headingMatch = text.match(/^\s*={1,6}\s+[^\n]*/);
+  if (headingMatch && headingMatch[0].length > 0) {
+    pushToken(0, headingMatch[0].length, "cm-typst-heading");
+  }
+
+  const lineCommentStart = text.indexOf("//");
+  if (lineCommentStart >= 0) {
+    pushToken(lineCommentStart, text.length, "cm-typst-comment");
+  }
+
+  addRegexTokens(text, typstStringPattern, "cm-typst-string", pushToken);
+  addRegexTokens(text, typstDirectivePattern, "cm-typst-directive", pushToken);
+  addRegexTokens(text, typstKeywordPattern, "cm-typst-keyword", pushToken);
+  addRegexTokens(text, typstNumberPattern, "cm-typst-number", pushToken);
+  addRegexTokens(text, typstStrongPattern, "cm-typst-strong", pushToken);
+  addRegexTokens(text, typstEmphasisPattern, "cm-typst-emphasis", pushToken);
+
+  tokens.sort((left, right) => left.from - right.from);
+  return tokens;
+}
+
+function addRegexTokens(
+  text: string,
+  pattern: RegExp,
+  className: string,
+  pushToken: (from: number, to: number, className: string) => void,
+): void {
+  pattern.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = pattern.exec(text)) !== null) {
+    pushToken(match.index, match.index + match[0].length, className);
+    if (match[0].length === 0) {
+      pattern.lastIndex++;
+    }
+  }
+}
+
+function overlapsOccupied(
+  occupied: Array<{ from: number; to: number }>,
+  from: number,
+  to: number,
+): boolean {
+  return occupied.some((range) => from < range.to && to > range.from);
+}
+
+export function onEditorFileChange(cb: (path: string | null) => void): void {
+  onFileChangeCb = cb;
+}
+
+export function onPreviewEntryChange(cb: (path: string | null) => void): void {
+  onPreviewEntryChangeCb = cb;
+}
 
 function scheduleCursorPreviewSync(delay = 120): void {
   if (cursorSyncTimeout) clearTimeout(cursorSyncTimeout);
   cursorSyncTimeout = setTimeout(() => {
-    const currentEditor = editor;
-    const sel = currentEditor?.getSelection();
-    const pos = currentEditor?.getPosition();
-    if (!currentEditor || !sel || !pos || !sel.isEmpty()) return;
+    const view = editorView;
+    if (!view) return;
+    const selection = view.state.selection.main;
+    if (!selection.empty) return;
     removeSyncOverlays("selection-hl");
-    void syncCursorToPreview(pos);
+    void syncCursorToPreview(selection.head);
   }, delay);
 }
 
-// ─── Monaco Theme Definitions ─────────────────────────────────────
-function defineMonacoThemes(): void {
-  monaco.editor.defineTheme("typst-light", {
-    base: "vs",
-    inherit: true,
-    rules: [
-      { token: "keyword",  foreground: "0064d2", fontStyle: "bold" },
-      { token: "comment",  foreground: "8e8e93", fontStyle: "italic" },
-      { token: "string",   foreground: "c0392b" },
-      { token: "number",   foreground: "7d3eb5" },
-      { token: "strong",   foreground: "1d1d1f", fontStyle: "bold" },
-      { token: "emphasis", foreground: "1d1d1f", fontStyle: "italic" },
-    ],
-    colors: {
-      "editor.background":               "#ffffff",
-      "editor.foreground":               "#1d1d1f",
-      "editorLineNumber.foreground":     "#c7c7cc",
-      "editorLineNumber.activeForeground": "#6e6e73",
-      "editor.selectionBackground":      "#0071e326",
-      "editor.inactiveSelectionBackground": "#0071e314",
-      "editor.lineHighlightBackground":  "#f5f5f7",
-      "editor.lineHighlightBorder":      "#00000000",
-      "editorCursor.foreground":         "#0071e3",
-      "editorWhitespace.foreground":     "#d1d1d6",
-      "editorIndentGuide.background1":   "#f0f0f0",
-      "editorIndentGuide.activeBackground1": "#c7c7cc",
-      "scrollbar.shadow":                "#00000014",
+function createEditorTheme(theme: Theme) {
+  const dark = theme === "dark";
+  return EditorView.theme({
+    "&": {
+      height: "100%",
+      backgroundColor: dark ? "#1c1c1e" : "#ffffff",
+      color: dark ? "#f5f5f7" : "#1d1d1f",
+      fontSize: "14px",
+    },
+    ".cm-scroller": {
+      fontFamily: "var(--editor-font-family)",
+      lineHeight: "1.6",
+      overflow: "auto",
+    },
+    ".cm-content": {
+      padding: "10px 0 8px",
+      caretColor: dark ? "#0a84ff" : "#0071e3",
+    },
+    ".cm-line": {
+      padding: "0 12px",
+    },
+    ".cm-gutters": {
+      backgroundColor: dark ? "#1c1c1e" : "#ffffff",
+      color: dark ? "#48484a" : "#c7c7cc",
+      borderRight: "1px solid transparent",
+    },
+    ".cm-activeLineGutter": {
+      color: dark ? "#8e8e93" : "#6e6e73",
+    },
+    ".cm-activeLine": {
+      backgroundColor: dark ? "#2c2c2e" : "#f5f5f7",
+    },
+    ".cm-selectionBackground, &.cm-focused .cm-selectionBackground, ::selection": {
+      backgroundColor: dark ? "#0a84ff28" : "#0071e326",
+    },
+    ".cm-cursor, .cm-dropCursor": {
+      borderLeftColor: dark ? "#0a84ff" : "#0071e3",
+    },
+    ".cm-tooltip": {
+      backgroundColor: "var(--c-toolbar)",
+      border: "1px solid var(--c-border)",
+      color: "var(--c-text)",
+      backdropFilter: "blur(18px)",
+    },
+    ".cm-tooltip-autocomplete > ul > li[aria-selected]": {
+      backgroundColor: "var(--c-item-active)",
+      color: "var(--c-accent)",
+    },
+    ".cm-panels": {
+      backgroundColor: "var(--c-editor)",
+      color: "var(--c-text)",
+    },
+  }, { dark });
+}
+
+function createFontTheme(family: string, size: number) {
+  return EditorView.theme({
+    "&": {
+      "--editor-font-family": family || "ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace",
+      fontSize: `${size}px`,
     },
   });
+}
 
-  monaco.editor.defineTheme("typst-dark", {
-    base: "vs-dark",
-    inherit: true,
-    rules: [
-      { token: "keyword",  foreground: "409cff", fontStyle: "bold" },
-      { token: "comment",  foreground: "6e6e73", fontStyle: "italic" },
-      { token: "string",   foreground: "ff7b72" },
-      { token: "number",   foreground: "bf5af2" },
-      { token: "strong",   foreground: "f5f5f7", fontStyle: "bold" },
-      { token: "emphasis", foreground: "f5f5f7", fontStyle: "italic" },
-    ],
-    colors: {
-      "editor.background":               "#1c1c1e",
-      "editor.foreground":               "#f5f5f7",
-      "editorLineNumber.foreground":     "#48484a",
-      "editorLineNumber.activeForeground": "#8e8e93",
-      "editor.selectionBackground":      "#0a84ff28",
-      "editor.inactiveSelectionBackground": "#0a84ff14",
-      "editor.lineHighlightBackground":  "#2c2c2e",
-      "editor.lineHighlightBorder":      "#00000000",
-      "editorCursor.foreground":         "#0a84ff",
-      "editorWhitespace.foreground":     "#3a3a3c",
-      "editorIndentGuide.background1":   "#2c2c2e",
-      "editorIndentGuide.activeBackground1": "#48484a",
-      "scrollbar.shadow":                "#00000040",
-    },
+function createBaseExtensions(): Extension[] {
+  return [
+    lineNumbers(),
+    highlightActiveLineGutter(),
+    highlightActiveLine(),
+    drawSelection(),
+    rectangularSelection(),
+    history(),
+    closeBrackets(),
+    basicSetup,
+    EditorView.lineWrapping,
+    sourceHoverField,
+    typstSyntaxHighlighting,
+    autocompletion({ override: [typstCompletionSource] }),
+    themeCompartment.of(createEditorTheme(savedTheme())),
+    fontCompartment.of(createFontTheme(savedFontFamilyCss(), savedFontSize())),
+    keymap.of([
+      ...closeBracketsKeymap,
+      ...defaultKeymap,
+      ...historyKeymap,
+      {
+        key: "Mod-s",
+        run: () => {
+          void saveCurrentFile();
+          return true;
+        },
+      },
+      {
+        key: "Mod-Enter",
+        run: () => {
+          void compileAndPreview();
+          return true;
+        },
+      },
+      {
+        key: "Mod-Shift-e",
+        run: () => {
+          void exportPdf();
+          return true;
+        },
+      },
+      {
+        key: "Mod-o",
+        run: () => {
+          void openFile();
+          return true;
+        },
+      },
+      {
+        key: "Mod-w",
+        run: () => {
+          void closeCurrentTab();
+          return true;
+        },
+      },
+      {
+        key: "Mod-Shift-Enter",
+        run: () => {
+          void setCurrentDocumentAsPreviewEntry();
+          return true;
+        },
+      },
+      {
+        key: "Mod-Alt-Enter",
+        run: () => {
+          void clearPreviewEntryPin();
+          return true;
+        },
+      },
+    ]),
+    EditorView.updateListener.of((update) => {
+      handleViewUpdate(update);
+    }),
+    EditorView.domEventHandlers({
+      mousemove(event, view) {
+        if (hoverSyncTimeout) clearTimeout(hoverSyncTimeout);
+        hoverSyncTimeout = setTimeout(() => {
+          const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+          if (pos == null) return;
+          void syncHoverToPreview(pos);
+        }, 150);
+      },
+      mouseleave() {
+        if (hoverSyncTimeout) clearTimeout(hoverSyncTimeout);
+        clearPreviewSourceHover();
+      },
+    }),
+  ];
+}
+
+function createEditorState(content: string): EditorState {
+  return EditorState.create({
+    doc: content,
+    extensions: createBaseExtensions(),
   });
 }
 
-// ─── Public: Theme & Font ─────────────────────────────────────────
-export function setMonacoTheme(theme: "light" | "dark"): void {
-  monaco.editor.setTheme(theme === "dark" ? "typst-dark" : "typst-light");
-}
-
-export function setEditorFont(family: string, size: number): void {
-  editor?.updateOptions({
-    fontFamily: family,
-    fontSize: size,
-    fontLigatures: true,
-  });
-}
-
-// ─── Init ─────────────────────────────────────────────────────────
 export async function initEditor(container: HTMLDivElement): Promise<void> {
-  defineMonacoThemes();
-  registerTypstLanguage();
-
-  const savedTheme = (localStorage.getItem("typst-theme") ?? "dark") as "light" | "dark";
-  const savedSize  = parseInt(localStorage.getItem("typst-font-size") ?? "14", 10);
-
   container.replaceChildren();
 
   tabsHost = document.createElement("div");
@@ -202,31 +502,9 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
   editorHost.className = "editor-surface";
   container.appendChild(editorHost);
 
-  editor = monaco.editor.create(editorHost, {
-    language: "typst",
-    theme: savedTheme === "dark" ? "typst-dark" : "typst-light",
-    automaticLayout: true,
-    minimap: { enabled: false },
-    fontSize: savedSize,
-    lineNumbers: "on",
-    scrollBeyondLastLine: false,
-    wordWrap: "on",
-    padding: { top: 10, bottom: 8 },
-    tabSize: 2,
-    autoClosingBrackets: "always",
-    autoClosingQuotes: "always",
-    // "keep" just preserves the current line's indentation on Enter — far cheaper than
-    // "full" which runs a full syntax analysis pass on every keystroke
-    autoIndent: "keep",
-    renderLineHighlight: "line",
-    fontLigatures: true,
-    smoothScrolling: true,
-    cursorSmoothCaretAnimation: "on",
-    renderWhitespace: "none",
-    // Bracket colorization requires a full bracket-matching pass on every edit;
-    // the Typst tokenizer doesn't benefit from it enough to justify the cost
-    bracketPairColorization: { enabled: false },
-    occurrencesHighlight: "off",
+  editorView = new EditorView({
+    state: createEditorState(""),
+    parent: editorHost,
   });
 
   setCurrentFilePath(null);
@@ -234,109 +512,100 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
   updatePageStatus(0);
   clearOutlinePanel();
   updateStatus("success", "Ready");
+  updateCursorStatus(1, 1);
+}
 
-  // ── Live compile (debounced 650 ms) ──────────────────────────
-  editor.onDidChangeModelContent(() => {
+function handleViewUpdate(update: ViewUpdate): void {
+  const doc = getActiveDocument();
+  if (!doc) return;
+
+  doc.state = update.state;
+  doc.scrollTop = update.view.scrollDOM.scrollTop;
+  doc.scrollLeft = update.view.scrollDOM.scrollLeft;
+
+  if (update.docChanged) {
+    doc.version++;
     lastEditTime = Date.now();
     updateActiveDocumentState();
-    if (suppressProgrammaticCompile) return;
-    scheduleCompile();
-  });
-
-  // ── Cursor → Preview (user-initiated only, debounced 120 ms) ────
-  // We suppress sync when we move the cursor programmatically (preview→editor).
-  editor.onDidChangeCursorPosition((e) => {
-    updateCursorStatus(e.position.lineNumber, e.position.column);
-    if (suppressCursorSync > 0) return;
-    scheduleCursorPreviewSync();
-    // Outline heading boundaries are line-level — skip the O(n) byte-offset conversion
-    // when only the column changed (e.g. typing characters on the same line)
-    if (e.position.lineNumber !== lastOutlineSyncLine) {
-      lastOutlineSyncLine = e.position.lineNumber;
-      syncOutlineActiveFromEditor();
+    if (!suppressProgrammaticCompile) {
+      scheduleCompile();
     }
+  }
+
+  if (!update.docChanged && !update.selectionSet) return;
+
+  const selection = update.state.selection.main;
+  const line = update.state.doc.lineAt(selection.head);
+  const column = selection.head - line.from + 1;
+  updateCursorStatus(line.number, column);
+
+  if (suppressCursorSync > 0) return;
+
+  if (selection.empty) {
+    removeSyncOverlays("selection-hl");
+    scheduleCursorPreviewSync(selectionSetDelay(update));
+  } else {
+    if (selSyncTimeout) clearTimeout(selSyncTimeout);
+    selSyncTimeout = setTimeout(() => {
+      void syncSelectionToPreview(selection.from, selection.to);
+    }, 200);
+  }
+
+  if (line.number !== lastOutlineSyncLine) {
+    lastOutlineSyncLine = line.number;
+    syncOutlineActiveFromEditor();
+  }
+}
+
+function selectionSetDelay(update: ViewUpdate): number {
+  return update.selectionSet && !update.docChanged ? 80 : 120;
+}
+
+export function setEditorTheme(theme: Theme): void {
+  editorView?.dispatch({
+    effects: themeCompartment.reconfigure(createEditorTheme(theme)),
   });
 
-  const initialPos = editor.getPosition();
-  if (initialPos) updateCursorStatus(initialPos.lineNumber, initialPos.column);
+  for (const doc of openDocuments.values()) {
+    doc.state = doc.state.update({
+      effects: themeCompartment.reconfigure(createEditorTheme(theme)),
+    }).state;
+  }
+}
 
-  // ── Selection → Preview (debounced 200 ms) ────────────────────
-  editor.onDidChangeCursorSelection((e) => {
-    const sel = e.selection;
-    if (sel.isEmpty()) {
-      // Selection cleared — remove selection overlays
-      removeSyncOverlays("selection-hl");
-      if (suppressCursorSync === 0) scheduleCursorPreviewSync(80);
-    } else {
-      if (selSyncTimeout) clearTimeout(selSyncTimeout);
-      selSyncTimeout = setTimeout(() => void syncSelectionToPreview(sel), 200);
-    }
+export function setEditorFont(family: string, size: number): void {
+  const fontTheme = createFontTheme(family, size);
+  editorView?.dispatch({
+    effects: fontCompartment.reconfigure(fontTheme),
   });
 
-  editor.onMouseMove((e) => {
-    const { position } = e.target;
-    if (!position) return;
-    if (hoverSyncTimeout) clearTimeout(hoverSyncTimeout);
-    hoverSyncTimeout = setTimeout(() => {
-      void syncHoverToPreview(position);
-    }, 150);
-  });
+  for (const doc of openDocuments.values()) {
+    doc.state = doc.state.update({
+      effects: fontCompartment.reconfigure(fontTheme),
+    }).state;
+  }
+}
 
-  editor.onMouseLeave(() => {
-    if (hoverSyncTimeout) clearTimeout(hoverSyncTimeout);
-    clearPreviewSourceHover();
-  });
+export function getContent(): string {
+  return editorView?.state.doc.toString() ?? "";
+}
 
-  // ── Keyboard shortcuts ─────────────────────────────────────────
-  editor.addAction({
-    id: "save-file",
-    label: "Save File",
-    keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
-    run: () => saveCurrentFile(),
-  });
-  editor.addAction({
-    id: "force-compile",
-    label: "Force Compile",
-    keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
-    run: () => compileAndPreview(),
-  });
-  editor.addAction({
-    id: "export-pdf",
-    label: "Export PDF",
-    keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyE],
-    run: () => exportPdf(),
-  });
-  editor.addAction({
-    id: "open-file",
-    label: "Open File",
-    keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO],
-    run: () => openFile(),
-  });
-  editor.addAction({
-    id: "close-file-tab",
-    label: "Close File Tab",
-    keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyW],
-    run: () => closeCurrentTab(),
-  });
-  editor.addAction({
-    id: "set-preview-entry",
-    label: "Set Preview Entry",
-    keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter],
-    run: () => setCurrentDocumentAsPreviewEntry(),
-  });
-  editor.addAction({
-    id: "clear-preview-entry-pin",
-    label: "Clear Preview Entry Pin",
-    keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.Enter],
-    run: () => clearPreviewEntryPin(),
+export function setContent(content: string): void {
+  const view = editorView;
+  if (!view) return;
+  view.dispatch({
+    changes: {
+      from: 0,
+      to: view.state.doc.length,
+      insert: content,
+    },
   });
 }
 
-// ─── Accessors ────────────────────────────────────────────────────
-export function getEditor(): monaco.editor.IStandaloneCodeEditor | null { return editor; }
-export function getContent(): string { return editor?.getValue() ?? ""; }
-export function setContent(content: string): void { editor?.setValue(content); }
-export function getCurrentFilePath(): string | null { return currentFilePath || null; }
+export function getCurrentFilePath(): string | null {
+  return currentFilePath || null;
+}
+
 export function hasUnsavedDocuments(): boolean {
   return Array.from(openDocuments.values()).some((doc) => doc.dirty);
 }
@@ -352,7 +621,6 @@ export function setCurrentFilePath(path: string | null): void {
   onFileChangeCb?.(path);
 }
 
-// ─── Zoom ─────────────────────────────────────────────────────────
 let currentZoom = 1.0;
 
 export function setZoom(zoom: number): void {
@@ -365,25 +633,8 @@ export function setZoom(zoom: number): void {
   updateZoomStatus(zoom);
 }
 
-export function getZoom(): number { return currentZoom; }
-
-// ─── Compilation ──────────────────────────────────────────────────
-interface CompileResult {
-  success: boolean;
-  page_count: number;
-  page_hashes: number[];
-  outline: import("../outline/OutlinePanel").OutlineItem[];
-  errors: string[];
-  duration_ms?: number;
-  entry_path?: string | null;
-}
-
-interface JumpResult {
-  type: string;
-  file?: string | null;
-  offset?: number | null;
-  url?: string | null;
-  position?: PagePos | null;
+export function getZoom(): number {
+  return currentZoom;
 }
 
 function enqueueCompile(job: Omit<CompileJob, "intentId">): void {
@@ -396,7 +647,6 @@ function enqueueCompile(job: Omit<CompileJob, "intentId">): void {
 
 async function drainCompileQueue(): Promise<void> {
   if (activeCompileJob || !pendingCompileJob) return;
-
   const job = pendingCompileJob;
   pendingCompileJob = null;
   activeCompileJob = runCompileJob(job).finally(() => {
@@ -405,7 +655,6 @@ async function drainCompileQueue(): Promise<void> {
       void drainCompileQueue();
     }
   });
-
   await activeCompileJob;
 }
 
@@ -422,10 +671,9 @@ async function runCompileJob(job: CompileJob): Promise<void> {
       filePath: job.filePath,
       content: job.content,
     });
-
     if (job.intentId !== latestCompileRequestId) return;
     await applyCompileResult(job, result);
-  } catch (e) {
+  } catch (error) {
     if (job.intentId !== latestCompileRequestId) return;
     finalizeCompileStatusTimeout();
     removeSyncOverlays("unsaved-add-hl");
@@ -433,7 +681,7 @@ async function runCompileJob(job: CompileJob): Promise<void> {
       updatePageStatus(0);
       clearOutlinePanel();
     }
-    updateStatus("error", `Error: ${e}`);
+    updateStatus("error", `Error: ${error}`);
   }
 }
 
@@ -480,14 +728,15 @@ function finalizeCompileStatusTimeout(): void {
 }
 
 export async function compileAndPreview(): Promise<void> {
-  if (!editor) return;
-  if (!currentFilePath) return;
+  const view = editorView;
+  if (!view || !currentFilePath) return;
   const activeDoc = getActiveDocument();
+  const content = view.state.doc.toString();
   enqueueCompile({
     command: "compile_current",
     filePath: currentFilePath,
-    content: editor.getValue(),
-    savedContent: activeDoc?.savedContent ?? editor.getValue(),
+    content,
+    savedContent: activeDoc?.savedContent ?? content,
     preservePagesOnError: false,
     notifyPreviewEntryChange: true,
     successMessage: (result) => `Compiled in ${result.duration_ms ?? "?"}ms · ${result.page_count} page(s)`,
@@ -502,7 +751,6 @@ function scheduleCompile(delay = 650): void {
   }, delay);
 }
 
-// ─── File Operations ──────────────────────────────────────────────
 export async function openFile(): Promise<void> {
   const path = await pickFilePath();
   if (!path) return;
@@ -524,14 +772,15 @@ export async function openFileAtPath(path: string): Promise<void> {
     const content = await invoke<string>("read_text_file", { path });
     const doc = createDocument(path, content);
     await switchToDocument(doc);
-  } catch (e) {
+  } catch (error) {
     suppressProgrammaticCompile = false;
-    updateStatus("error", `Failed to open: ${e}`);
+    updateStatus("error", `Failed to open: ${error}`);
   }
 }
 
 async function saveCurrentFile(): Promise<void> {
-  if (!editor) return;
+  const view = editorView;
+  if (!view) return;
   let path = currentFilePath;
   let activeDoc = getActiveDocument();
 
@@ -542,18 +791,18 @@ async function saveCurrentFile(): Promise<void> {
       setCurrentFilePath(picked);
       path = picked;
       activeDoc = getActiveDocument();
-    } catch (e) {
-      updateStatus("error", `Save dialog failed: ${e}`);
+    } catch (error) {
+      updateStatus("error", `Save dialog failed: ${error}`);
       return;
     }
   }
 
-  const content = editor.getValue();
+  const content = view.state.doc.toString();
   try {
     await invoke("save_file", { content, filePath: path });
     if (activeDoc) {
       activeDoc.savedContent = content;
-      activeDoc.savedVersionId = activeDoc.model.getAlternativeVersionId();
+      activeDoc.savedVersion = activeDoc.version;
       activeDoc.dirty = false;
       renderTabs();
     }
@@ -567,8 +816,8 @@ async function saveCurrentFile(): Promise<void> {
       notifyPreviewEntryChange: true,
       successMessage: () => "Saved",
     });
-  } catch (e) {
-    updateStatus("error", `Save failed: ${e}`);
+  } catch (error) {
+    updateStatus("error", `Save failed: ${error}`);
   }
 }
 
@@ -576,14 +825,13 @@ async function exportPdf(): Promise<void> {
   try {
     const result = await invoke<"Success" | "Cancelled">("export_pdf_dialog");
     if (result !== "Cancelled") updateStatus("success", "PDF exported");
-  } catch (e) {
-    updateStatus("error", `Export failed: ${e}`);
+  } catch (error) {
+    updateStatus("error", `Export failed: ${error}`);
   }
 }
 
-// ─── File Tree Integration ────────────────────────────────────────
 export async function openFileFromTree(path: string): Promise<void> {
-  if (!editor) return;
+  if (!editorView) return;
   await openFileAtPath(path);
 }
 
@@ -599,17 +847,16 @@ export async function jumpToFileOffset(
     await openFileAtPath(path);
   }
 
-  if (!editor) return;
-  const model = editor.getModel();
-  if (!model) return;
-
-  // offset from Rust is a UTF-8 byte offset; Monaco needs a UTF-16 char offset
-  const charOffset = utf8ByteOffsetToMonacoOffset(model, offset);
-  const pos = model.getPositionAt(charOffset);
+  const view = editorView;
+  if (!view) return;
+  const text = view.state.doc.toString();
+  const charOffset = utf8ByteOffsetToCharOffset(text, offset);
   suppressCursorSync++;
-  editor.setPosition(pos);
-  editor.revealPositionInCenter(pos);
-  editor.focus();
+  view.dispatch({
+    selection: { anchor: charOffset },
+    effects: EditorView.scrollIntoView(charOffset, { y: "center" }),
+  });
+  view.focus();
   syncOutlineActiveFromEditor();
   setTimeout(() => {
     suppressCursorSync = Math.max(0, suppressCursorSync - 1);
@@ -621,17 +868,14 @@ export async function revealSourceOffsetInPreview(
   offset: number,
   behavior: ScrollBehavior = "auto",
 ): Promise<void> {
-  if (!editor) return;
-  const model = editor.getModel();
-  if (!model || currentFilePath !== path) return;
-
-  // offset from Rust is a UTF-8 byte offset; Monaco needs a UTF-16 char offset
-  const charOffset = utf8ByteOffsetToMonacoOffset(model, offset);
-  const pos = model.getPositionAt(charOffset);
+  const view = editorView;
+  if (!view || currentFilePath !== path) return;
+  const charOffset = utf8ByteOffsetToCharOffset(view.state.doc.toString(), offset);
+  const pos = offsetToLineColumn(view.state.doc.toString(), charOffset);
   try {
     const positions = await invoke<PagePos[]>("jump_from_cursor", {
       filePath: path,
-      line: pos.lineNumber - 1,
+      line: pos.line - 1,
       character: pos.column - 1,
     });
     const previewPos = pickBestPreviewPosition(positions);
@@ -643,13 +887,6 @@ export async function revealSourceOffsetInPreview(
   }
 }
 
-interface TextRange {
-  startLine: number;
-  startColumn: number;
-  endLine: number;
-  endColumn: number;
-}
-
 function splitLinesPreserveFinalEmpty(text: string): string[] {
   return text.split(/\r\n|\n|\r/);
 }
@@ -658,7 +895,6 @@ function offsetToLineColumn(text: string, offset: number): { line: number; colum
   const clampedOffset = Math.max(0, Math.min(offset, text.length));
   const lines = splitLinesPreserveFinalEmpty(text);
   let remaining = clampedOffset;
-
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index] ?? "";
     if (remaining <= line.length) {
@@ -666,13 +902,9 @@ function offsetToLineColumn(text: string, offset: number): { line: number; colum
     }
     remaining -= line.length;
     if (index < lines.length - 1) {
-      if (remaining === 0) {
-        return { line: index + 1, column: line.length + 1 };
-      }
       remaining -= 1;
     }
   }
-
   const lastLine = lines[lines.length - 1] ?? "";
   return { line: Math.max(1, lines.length), column: lastLine.length + 1 };
 }
@@ -698,7 +930,6 @@ function computeUnsavedChangedTextRanges(savedContent: string, compiledContent: 
   }
 
   if (compiledSuffix <= prefix) return [];
-
   const start = offsetToLineColumn(compiledContent, prefix);
   const end = offsetToLineColumn(compiledContent, compiledSuffix);
   return [{
@@ -716,7 +947,6 @@ async function renderUnsavedInsertHighlights(
 ): Promise<void> {
   removeSyncOverlays("unsaved-add-hl");
   if (!currentFilePath || currentFilePath !== filePath || lastSuccessfulPageCount === 0) return;
-
   const ranges = computeUnsavedChangedTextRanges(savedContent, compiledContent);
   if (ranges.length === 0) return;
 
@@ -735,9 +965,7 @@ async function renderUnsavedInsertHighlights(
           character: Math.max(0, range.endColumn - 1),
         }),
       ]);
-
       if (startPositions.length === 0 || endPositions.length === 0) continue;
-
       const maxLen = Math.max(startPositions.length, endPositions.length);
       for (let idx = 0; idx < maxLen; idx++) {
         const start = startPositions[idx] ?? startPositions[0];
@@ -749,104 +977,22 @@ async function renderUnsavedInsertHighlights(
         });
       }
     } catch {
-      // ignore individual unsaved highlight mapping failures
+      // ignore
     }
   }
-}
-
-// ─── Offset Conversion ────────────────────────────────────────────
-//
-// Rust (Typst) reports source offsets as **UTF-8 byte offsets**.
-// Monaco internally uses **UTF-16 code-unit offsets** (same as JS string indices).
-// For pure-ASCII files these are identical, but CJK characters are 3 UTF-8 bytes
-// and 1 UTF-16 code unit, so without conversion outline navigation lands at the
-// wrong position in files with Chinese content.
-
-/**
- * Convert a UTF-8 byte offset (from Rust/Typst) to a Monaco/JS character offset.
- * Uses cached line start indices so large documents don't rescan the whole text.
- */
-function utf8ByteOffsetToMonacoOffset(model: monaco.editor.ITextModel, byteOffset: number): number {
-  const cache = getOffsetCache(model);
-  const lineIndex = findFloorIndex(cache.lineStartBytes, byteOffset);
-  const lineNumber = lineIndex + 1;
-  const lineText = model.getLineContent(lineNumber);
-  const lineStartChar = cache.lineStartChars[lineIndex] ?? 0;
-  const lineStartByte = cache.lineStartBytes[lineIndex] ?? 0;
-  const lineByteLength = utf8BytesForText(lineText);
-  const localByteOffset = Math.max(0, byteOffset - lineStartByte);
-
-  if (localByteOffset <= lineByteLength) {
-    return lineStartChar + utf8ByteOffsetInTextToCharOffset(lineText, localByteOffset);
-  }
-
-  const eolByteOffset = Math.min(localByteOffset - lineByteLength, cache.eolByteLength);
-  return lineStartChar + lineText.length + utf8ByteOffsetInTextToCharOffset(cache.eol, eolByteOffset);
-}
-
-/**
- * Convert a Monaco/JS character offset to a UTF-8 byte offset (for Rust/Typst).
- */
-function monacoOffsetToUtf8ByteOffset(model: monaco.editor.ITextModel, charOffset: number): number {
-  const cache = getOffsetCache(model);
-  const lineIndex = findFloorIndex(cache.lineStartChars, charOffset);
-  const lineNumber = lineIndex + 1;
-  const lineText = model.getLineContent(lineNumber);
-  const lineStartChar = cache.lineStartChars[lineIndex] ?? 0;
-  const lineStartByte = cache.lineStartBytes[lineIndex] ?? 0;
-  const localCharOffset = Math.max(0, charOffset - lineStartChar);
-
-  if (localCharOffset <= lineText.length) {
-    return lineStartByte + utf8BytesForText(lineText.slice(0, localCharOffset));
-  }
-
-  const eolCharOffset = Math.min(localCharOffset - lineText.length, cache.eolCharLength);
-  return lineStartByte + utf8BytesForText(lineText) + utf8BytesForText(cache.eol.slice(0, eolCharOffset));
-}
-
-function getOffsetCache(model: monaco.editor.ITextModel): NonNullable<typeof offsetCache> {
-  const versionId = model.getVersionId();
-  if (offsetCache?.model === model && offsetCache.versionId === versionId) {
-    return offsetCache;
-  }
-
-  const lineCount = model.getLineCount();
-  const eol = model.getEOL();
-  const eolCharLength = eol.length;
-  const eolByteLength = utf8BytesForText(eol);
-  const lineStartChars = new Array<number>(lineCount);
-  const lineStartBytes = new Array<number>(lineCount);
-  let charCursor = 0;
-  let byteCursor = 0;
-
-  for (let i = 1; i <= lineCount; i++) {
-    const index = i - 1;
-    lineStartChars[index] = charCursor;
-    lineStartBytes[index] = byteCursor;
-    const lineText = model.getLineContent(i);
-    charCursor += lineText.length;
-    byteCursor += utf8BytesForText(lineText);
-    if (i !== lineCount) {
-      charCursor += eolCharLength;
-      byteCursor += eolByteLength;
-    }
-  }
-
-  offsetCache = { model, versionId, lineStartChars, lineStartBytes, eol, eolCharLength, eolByteLength };
-  return offsetCache;
 }
 
 function utf8BytesForText(text: string): number {
   let bytes = 0;
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
+  for (let index = 0; index < text.length; index++) {
+    const code = text.charCodeAt(index);
     if (code < 0x80) {
       bytes += 1;
     } else if (code < 0x800) {
       bytes += 2;
-    } else if (code >= 0xD800 && code < 0xDC00) {
+    } else if (code >= 0xd800 && code < 0xdc00) {
       bytes += 4;
-      i++;
+      index++;
     } else {
       bytes += 3;
     }
@@ -856,64 +1002,48 @@ function utf8BytesForText(text: string): number {
 
 function utf8ByteOffsetInTextToCharOffset(text: string, byteOffset: number): number {
   let bytes = 0;
-  let i = 0;
-  while (i < text.length && bytes < byteOffset) {
-    const code = text.charCodeAt(i);
+  let index = 0;
+  while (index < text.length && bytes < byteOffset) {
+    const code = text.charCodeAt(index);
     if (code < 0x80) {
       bytes += 1;
     } else if (code < 0x800) {
       bytes += 2;
-    } else if (code >= 0xD800 && code < 0xDC00) {
+    } else if (code >= 0xd800 && code < 0xdc00) {
       bytes += 4;
-      i++;
+      index++;
     } else {
       bytes += 3;
     }
-    i++;
+    index++;
   }
-  return i;
+  return index;
 }
 
-function findFloorIndex(values: number[], target: number): number {
-  let low = 0;
-  let high = values.length - 1;
-  let best = 0;
-
-  while (low <= high) {
-    const mid = (low + high) >> 1;
-    if (values[mid] <= target) {
-      best = mid;
-      low = mid + 1;
-    } else {
-      high = mid - 1;
-    }
-  }
-
-  return best;
+function utf8ByteOffsetToCharOffset(text: string, byteOffset: number): number {
+  if (byteOffset <= 0) return 0;
+  return utf8ByteOffsetInTextToCharOffset(text, byteOffset);
 }
 
-// ─── Bidirectional Sync ───────────────────────────────────────────
+function charOffsetToUtf8ByteOffset(text: string, charOffset: number): number {
+  return utf8BytesForText(text.slice(0, Math.max(0, Math.min(charOffset, text.length))));
+}
 
-interface PagePos { page: number; x: number; y: number; }
-
-/** Editor cursor → preview position indicator */
-async function syncCursorToPreview(position: monaco.Position): Promise<void> {
-  const model = editor?.getModel();
-  if (!model) return;
-  if (!currentFilePath) return;
-  // Skip sync if no compiled output exists yet, pages aren't rendered yet, or if the user is actively typing
+async function syncCursorToPreview(head: number): Promise<void> {
+  const view = editorView;
+  if (!view || !currentFilePath) return;
   if (lastSuccessfulPageCount === 0) return;
   if (renderedPageHashes.length === 0) return;
   if (Date.now() - lastEditTime < 400) return;
 
+  const position = offsetToLineColumn(view.state.doc.toString(), head);
   const requestId = ++latestCursorRequestId;
   try {
     const positions = await invoke<PagePos[]>("jump_from_cursor", {
       filePath: currentFilePath,
-      line: position.lineNumber - 1,
+      line: position.line - 1,
       character: position.column - 1,
     });
-    // Discard stale responses
     if (requestId !== latestCursorRequestId) return;
     const previewPos = pickBestPreviewPosition(positions);
     if (previewPos && previewPos.page <= renderedPageHashes.length) {
@@ -925,63 +1055,61 @@ async function syncCursorToPreview(position: monaco.Position): Promise<void> {
         persistent: true,
       });
     }
-  } catch { /* ignore */ }
+  } catch {
+    // ignore
+  }
 }
 
-/** Editor text selection → preview range highlight */
-async function syncSelectionToPreview(sel: monaco.Selection): Promise<void> {
-  const model = editor?.getModel();
-  if (!model) return;
-  if (!currentFilePath) return;
-
-  const startPos = sel.getStartPosition();
-  const endPos   = sel.getEndPosition();
-  if (startPos.equals(endPos)) return;
+async function syncSelectionToPreview(from: number, to: number): Promise<void> {
+  const view = editorView;
+  if (!view || !currentFilePath || from === to) return;
+  const text = view.state.doc.toString();
+  const startPos = offsetToLineColumn(text, from);
+  const endPos = offsetToLineColumn(text, to);
 
   try {
     const [startPositions, endPositions] = await Promise.all([
       invoke<PagePos[]>("jump_from_cursor", {
         filePath: currentFilePath,
-        line: startPos.lineNumber - 1,
+        line: startPos.line - 1,
         character: startPos.column - 1,
       }),
       invoke<PagePos[]>("jump_from_cursor", {
         filePath: currentFilePath,
-        line: endPos.lineNumber - 1,
+        line: endPos.line - 1,
         character: endPos.column - 1,
       }),
     ]);
 
-    if (startPositions.length > 0 && endPositions.length > 0) {
-      removeSyncOverlays("cursor-hl");
-      // Process each position pair. highlightRangeInPreview handles multi-page ranges,
-      // and by passing clearFirst=false for subsequent calls, we accumulate all highlights.
-      const maxLen = Math.max(startPositions.length, endPositions.length);
-      for (let i = 0; i < maxLen; i++) {
-        const start = startPositions[i] ?? startPositions[0];
-        const end = endPositions[i] ?? endPositions[0];
-        highlightRangeInPreview(start, end, { clearFirst: i === 0 });
-      }
+    if (startPositions.length === 0 || endPositions.length === 0) return;
+    removeSyncOverlays("cursor-hl");
+    const maxLen = Math.max(startPositions.length, endPositions.length);
+    for (let index = 0; index < maxLen; index++) {
+      const start = startPositions[index] ?? startPositions[0];
+      const end = endPositions[index] ?? endPositions[0];
+      highlightRangeInPreview(start, end, {
+        clearFirst: index === 0,
+        scroll: false,
+      });
     }
-  } catch { /* ignore */ }
+  } catch {
+    // ignore
+  }
 }
 
-/** Preview click → editor cursor jump */
 async function handlePreviewClick(
-  e: MouseEvent,
+  event: MouseEvent,
   svgEl: SVGSVGElement,
-  pageIndex: number
+  pageIndex: number,
 ): Promise<void> {
-  const pagePoint = clientPointToPagePoint(svgEl, e.clientX, e.clientY);
-
+  const pagePoint = clientPointToPagePoint(svgEl, event.clientX, event.clientY);
   try {
     const result = await invoke<JumpResult>("jump_from_click", {
       page: pageIndex + 1,
       x: pagePoint.x,
       y: pagePoint.y,
     });
-
-    if (result.type === "file" && result.offset != null && result.file && editor) {
+    if (result.type === "file" && result.offset != null && result.file) {
       applySourceHoverDecoration(result.file, result.offset);
       await jumpToFileOffset(result.file, result.offset, false);
       await revealSourceOffsetInPreview(result.file, result.offset, "auto");
@@ -990,37 +1118,36 @@ async function handlePreviewClick(
     } else if (result.type === "position" && result.position) {
       scrollPreviewToPosition(result.position);
     }
-  } catch { /* ignore */ }
+  } catch {
+    // ignore
+  }
 }
 
-async function syncHoverToPreview(position: monaco.Position): Promise<void> {
-  const model = editor?.getModel();
-  if (!model || !currentFilePath) return;
-  // Skip hover sync if no compiled output, pages aren't rendered yet, or if actively typing
+async function syncHoverToPreview(offset: number): Promise<void> {
+  if (!currentFilePath) return;
   if (lastSuccessfulPageCount === 0) return;
   if (renderedPageHashes.length === 0) return;
   if (Date.now() - lastEditTime < 600) return;
 
+  const view = editorView;
+  if (!view) return;
+  const pos = offsetToLineColumn(view.state.doc.toString(), offset);
   try {
     const positions = await invoke<PagePos[]>("jump_from_cursor", {
       filePath: currentFilePath,
-      line: position.lineNumber - 1,
-      character: position.column - 1,
+      line: pos.line - 1,
+      character: pos.column - 1,
     });
     const previewPos = pickBestPreviewPosition(positions);
     if (previewPos && previewPos.page <= renderedPageHashes.length) {
       applyHoverAtPreviewPosition(previewPos);
     }
   } catch {
-    // ignore sync failures
+    // ignore
   }
 }
 
-async function handlePreviewHover(
-  event: MouseEvent,
-  svgEl: SVGSVGElement,
-  pageIndex: number,
-): Promise<void> {
+async function handlePreviewHover(event: MouseEvent, svgEl: SVGSVGElement, pageIndex: number): Promise<void> {
   const pagePoint = clientPointToPagePoint(svgEl, event.clientX, event.clientY);
   const hoverKey = `${pageIndex}:${Math.round(pagePoint.x)}:${Math.round(pagePoint.y)}`;
   if (hoverKey === previewHoverTargetKey) return;
@@ -1034,9 +1161,7 @@ async function handlePreviewHover(
       y: pagePoint.y,
     });
     if (requestId !== previewHoverRequestId) return;
-
     if (result.type === "file" && result.offset != null && result.file) {
-      // Show a subtle hover line at the hovered position (overlay approach, no SVG fill changes)
       highlightHoverInPreview({ page: pageIndex + 1, x: pagePoint.x, y: pagePoint.y });
       applySourceHoverDecoration(result.file, result.offset);
     } else {
@@ -1047,10 +1172,8 @@ async function handlePreviewHover(
   }
 }
 
-// ─── Highlight Helpers ────────────────────────────────────────────
-
 function removeSyncOverlays(cls: string): void {
-  document.querySelectorAll(`.highlight-overlay.${cls}`).forEach(el => el.remove());
+  document.querySelectorAll(`.highlight-overlay.${cls}`).forEach((element) => element.remove());
 }
 
 function highlightCursorInPreview(
@@ -1058,20 +1181,16 @@ function highlightCursorInPreview(
   options: { scroll?: boolean; behavior?: ScrollBehavior; persistent?: boolean } = {},
 ): void {
   removeSyncOverlays("cursor-hl");
-  const pane = getPreviewPane();
-  const svgEl = getPreviewPageSvg(pos.page);
   const panePoint = pagePointToPanePoint(pos);
-  if (!pane || !svgEl || !panePoint) {
-    return;
-  }
+  const svgEl = getPreviewPageSvg(pos.page);
+  if (!panePoint || !svgEl) return;
 
-  const overlay        = document.createElement("div");
-  overlay.className    = "highlight-overlay cursor-hl";
-  overlay.style.left   = `${panePoint.left}px`;
-  overlay.style.top    = `${panePoint.top - 12}px`;
-  overlay.style.width  = `${panePoint.pageWidth}px`;
+  const overlay = document.createElement("div");
+  overlay.className = "highlight-overlay cursor-hl";
+  overlay.style.left = `${panePoint.left}px`;
+  overlay.style.top = `${panePoint.top - 12}px`;
+  overlay.style.width = `${panePoint.pageWidth}px`;
   overlay.style.height = "24px";
-
   getPreviewContent()?.appendChild(overlay);
   if (options.scroll) {
     scrollPreviewToPosition(pos, options.behavior ?? "auto");
@@ -1082,21 +1201,11 @@ function highlightCursorInPreview(
   }
 }
 
-interface PreviewPageMetrics {
-  pageLeft: number;
-  pageTop: number;
-  pageWidth: number;
-  pageHeight: number;
-  x: number;
-  y: number;
-}
-
 function getPreviewPageMetrics(pos: PagePos): PreviewPageMetrics | null {
   const svgEl = getPreviewPageSvg(pos.page);
   const panePoint = pagePointToPanePoint(pos);
   const pageOrigin = pagePointToPanePoint({ page: pos.page, x: 0, y: 0 });
   if (!svgEl || !panePoint || !pageOrigin) return null;
-
   const rect = svgEl.getBoundingClientRect();
   return {
     pageLeft: pageOrigin.left,
@@ -1108,37 +1217,22 @@ function getPreviewPageMetrics(pos: PagePos): PreviewPageMetrics | null {
   };
 }
 
-function appendRangeOverlay(
-  overlayClass: string,
-  left: number,
-  top: number,
-  width: number,
-  height: number,
-): void {
-  const contentEl = getPreviewContent();
-  if (!contentEl) return;
-
+function appendRangeOverlay(overlayClass: string, left: number, top: number, width: number, height: number): void {
+  const content = getPreviewContent();
+  if (!content) return;
   const overlay = document.createElement("div");
   overlay.className = `highlight-overlay ${overlayClass}`;
   overlay.style.left = `${Math.max(0, left)}px`;
   overlay.style.top = `${Math.max(0, top)}px`;
   overlay.style.width = `${Math.max(6, width)}px`;
   overlay.style.height = `${Math.max(16, height)}px`;
-  contentEl.appendChild(overlay);
+  content.appendChild(overlay);
 }
 
-/**
- * Draw a selection-range highlight from `start` to `end`, spanning pages if necessary.
- * Scroll the preview so the start of the selection is visible.
- */
 function highlightRangeInPreview(
   start: PagePos,
   end: PagePos,
-  options: {
-    clearFirst?: boolean;
-    overlayClass?: string;
-    scroll?: boolean;
-  } = {},
+  options: { clearFirst?: boolean; overlayClass?: string; scroll?: boolean } = {},
 ): void {
   const clearFirst = options.clearFirst ?? true;
   const overlayClass = options.overlayClass ?? "selection-hl";
@@ -1153,6 +1247,7 @@ function highlightRangeInPreview(
   const startMetrics = getPreviewPageMetrics(start);
   const endMetrics = getPreviewPageMetrics(end);
   if (!startMetrics || !endMetrics) return;
+
   const linePaddingTop = 12;
   const linePaddingBottom = 8;
   const lineHeight = 20;
@@ -1255,62 +1350,43 @@ function pickBestPreviewPosition(positions: PagePos[]): PagePos | null {
 }
 
 function applyHoverAtPreviewPosition(pos: PagePos): void {
-  // Use the cursor-hl overlay (already persistent) — no separate SVG element coloring needed
   highlightCursorInPreview(pos, { scroll: false, persistent: true });
 }
 
-/**
- * Draw a subtle "hover" overlay at the given page position.
- * Uses the .hover-hl overlay class so it doesn't affect SVG element fill/stroke.
- */
 function highlightHoverInPreview(pos: PagePos): void {
   removeSyncOverlays("hover-hl");
-  const pane = getPreviewPane();
-  const svgEl = getPreviewPageSvg(pos.page);
   const panePoint = pagePointToPanePoint(pos);
-  if (!pane || !svgEl || !panePoint) return;
-
+  const svgEl = getPreviewPageSvg(pos.page);
+  if (!panePoint || !svgEl) return;
   const overlay = document.createElement("div");
   overlay.className = "highlight-overlay hover-hl";
-  overlay.style.left   = `${panePoint.left}px`;
-  overlay.style.top    = `${panePoint.top - 10}px`;
-  overlay.style.width  = `${panePoint.pageWidth}px`;
+  overlay.style.left = `${panePoint.left}px`;
+  overlay.style.top = `${panePoint.top - 10}px`;
+  overlay.style.width = `${panePoint.pageWidth}px`;
   overlay.style.height = "22px";
-
   getPreviewContent()?.appendChild(overlay);
 }
 
 function applySourceHoverDecoration(file: string, offset: number): void {
   sourceHoverTarget = { file, offset };
-  if (!editor || currentFilePath !== file) {
+  const view = editorView;
+  if (!view || currentFilePath !== file) {
     clearSourceHoverDecoration();
     return;
   }
 
-  const model = editor.getModel();
-  if (!model) return;
-
-  // offset from Rust is UTF-8 bytes; convert to Monaco UTF-16 char offset
-  const charStart = utf8ByteOffsetToMonacoOffset(model, offset);
-  const charEnd   = utf8ByteOffsetToMonacoOffset(model, offset + 1);
-  const start = model.getPositionAt(charStart);
-  const end   = model.getPositionAt(charEnd);
-  sourceHoverDecorationIds = editor.deltaDecorations(sourceHoverDecorationIds, [{
-    range: new monaco.Range(
-      start.lineNumber,
-      start.column,
-      end.lineNumber,
-      Math.max(start.column + 1, end.column),
-    ),
-    options: {
-      className: "editor-source-hover",
-      stickiness: monaco.editor.TrackedRangeStickiness.NeverGrowsWhenTypingAtEdges,
-    },
-  }]);
+  const text = view.state.doc.toString();
+  const from = utf8ByteOffsetToCharOffset(text, offset);
+  const to = Math.max(from + 1, utf8ByteOffsetToCharOffset(text, offset + 1));
+  view.dispatch({
+    effects: setSourceHoverEffect.of({ from, to }),
+  });
 }
 
 function clearSourceHoverDecoration(): void {
-  sourceHoverDecorationIds = editor?.deltaDecorations(sourceHoverDecorationIds, []) ?? [];
+  editorView?.dispatch({
+    effects: setSourceHoverEffect.of(null),
+  });
 }
 
 function clearPreviewSourceHover(): void {
@@ -1321,59 +1397,47 @@ function clearPreviewSourceHover(): void {
 }
 
 function syncOutlineActiveFromEditor(): void {
-  const model = editor?.getModel();
-  const pos = editor?.getPosition();
-  if (!model || !pos || !currentFilePath) {
+  const view = editorView;
+  if (!view || !currentFilePath) {
     updateOutlineActiveItem(null, null);
     return;
   }
 
-  // getOffsetAt returns a UTF-16 char offset; convert to UTF-8 byte offset
-  // so it can be compared correctly against Rust/Typst outline item offsets
-  const charOffset = model.getOffsetAt(pos);
-  const byteOffset = monacoOffsetToUtf8ByteOffset(model, charOffset);
+  const head = view.state.selection.main.head;
+  const byteOffset = charOffsetToUtf8ByteOffset(view.state.doc.toString(), head);
   updateOutlineActiveItem(currentFilePath, byteOffset);
 }
 
-// ─── Rendering ────────────────────────────────────────────────────
-export async function renderAllPages(
-  pageCount: number,
-  pageHashes: number[]
-): Promise<void> {
+export async function renderAllPages(pageCount: number, pageHashes: number[]): Promise<void> {
   trimPreviewPages(pageCount);
-
-  // Collect indices of pages that actually changed (hash-based skip)
   const changedPages: number[] = [];
-  for (let i = 0; i < pageCount; i++) {
-    ensurePreviewPageNode(i);
-    if (renderedPageHashes[i] !== pageHashes[i]) changedPages.push(i);
+  for (let index = 0; index < pageCount; index++) {
+    ensurePreviewPageNode(index);
+    if (renderedPageHashes[index] !== pageHashes[index]) changedPages.push(index);
   }
-
-  // Render changed pages in parallel — render_page only reads from the compiled document
-  await Promise.all(
-    changedPages.map((i) => renderSinglePage(i, pageHashes))
-  );
-
+  await Promise.all(changedPages.map((index) => renderSinglePage(index, pageHashes)));
   renderedPageHashes.length = pageCount;
 }
 
-async function renderSinglePage(i: number, pageHashes: number[]): Promise<void> {
-  const capturedHash = pageHashes[i];
-  const pageNode = ensurePreviewPageNode(i);
+async function renderSinglePage(index: number, pageHashes: number[]): Promise<void> {
+  const capturedHash = pageHashes[index];
+  const pageNode = ensurePreviewPageNode(index);
   try {
-    const svg = await invoke<string>("render_page", { page: i });
-    // Discard result if a newer compile has already produced a different hash
-    if (capturedHash !== pageHashes[i]) return;
-    if (!replacePreviewPageSvg(i, svg, {
+    const svg = await invoke<string>("render_page", { page: index });
+    if (capturedHash !== pageHashes[index]) return;
+    if (!replacePreviewPageSvg(index, svg, {
       onClick: handlePreviewClick,
       onHover: handlePreviewHover,
       onLeave: () => clearPreviewSourceHover(),
     })) return;
-    renderedPageHashes[i] = capturedHash;
+    renderedPageHashes[index] = capturedHash;
     pageNode.classList.add("page-updated");
     setTimeout(() => pageNode.classList.remove("page-updated"), 80);
-  } catch { /* ignore individual page render errors */ }
+  } catch {
+    // ignore
+  }
 }
+
 function resetPreviewState(): void {
   latestCompileRequestId++;
   renderedPageHashes = [];
@@ -1386,22 +1450,16 @@ function resetPreviewState(): void {
 }
 
 function createDocument(path: string, content: string): OpenDocument {
-  const uri = monaco.Uri.parse(`file:///${path.replace(/\\/g, "/").replace(/^\/+/, "")}`);
-  const existingModel = monaco.editor.getModel(uri);
-  const model = existingModel ?? monaco.editor.createModel(content, "typst", uri);
-  if (existingModel && existingModel.getValue() !== content) {
-    existingModel.setValue(content);
-  }
-
   const doc: OpenDocument = {
     path,
-    model,
-    viewState: null,
+    state: createEditorState(content),
     savedContent: content,
-    savedVersionId: model.getAlternativeVersionId(),
+    version: 0,
+    savedVersion: 0,
     dirty: false,
+    scrollTop: 0,
+    scrollLeft: 0,
   };
-
   openDocuments.set(path, doc);
   return doc;
 }
@@ -1413,39 +1471,44 @@ function getActiveDocument(): OpenDocument | null {
 function updateActiveDocumentState(): void {
   const doc = getActiveDocument();
   if (!doc) return;
-  // O(1) version counter — avoids full string copy + comparison on every keystroke
   const wasDirty = doc.dirty;
-  doc.dirty = doc.model.getAlternativeVersionId() !== doc.savedVersionId;
-  // Only touch the DOM when dirty state actually flips (first edit, or after save)
+  doc.dirty = doc.version !== doc.savedVersion;
   if (doc.dirty !== wasDirty) renderTabs();
 }
 
 async function switchToDocument(doc: OpenDocument, refreshPreview = true): Promise<void> {
-  if (!editor) return;
+  const view = editorView;
+  if (!view) return;
   showWorkspaceLayout();
 
   const currentDoc = getActiveDocument();
   if (currentDoc && currentDoc.path !== doc.path) {
-    currentDoc.viewState = editor.saveViewState();
+    currentDoc.state = view.state;
+    currentDoc.scrollTop = view.scrollDOM.scrollTop;
+    currentDoc.scrollLeft = view.scrollDOM.scrollLeft;
   }
 
   suppressProgrammaticCompile = true;
-  editor.setModel(doc.model);
+  view.setState(doc.state);
   suppressProgrammaticCompile = false;
 
   setCurrentFilePath(doc.path);
-  if (doc.viewState) {
-    editor.restoreViewState(doc.viewState);
-  }
-  editor.focus();
-  lastOutlineSyncLine = -1; // force outline sync on next cursor event for this document
+  requestAnimationFrame(() => {
+    if (!editorView) return;
+    editorView.scrollDOM.scrollTop = doc.scrollTop;
+    editorView.scrollDOM.scrollLeft = doc.scrollLeft;
+  });
+  view.focus();
+  lastOutlineSyncLine = -1;
   updateActiveDocumentState();
   syncOutlineActiveFromEditor();
+
   if (sourceHoverTarget?.file === doc.path) {
     applySourceHoverDecoration(sourceHoverTarget.file, sourceHoverTarget.offset);
   } else {
     clearSourceHoverDecoration();
   }
+
   if (refreshPreview) {
     resetPreviewState();
     compileOpenDocument(doc);
@@ -1458,26 +1521,21 @@ async function closeCurrentTab(): Promise<void> {
   await closeDocument(doc.path);
 }
 
-/**
- * Close a document and return true if successful, false if cancelled by user.
- * This function is exported for use by FileTree during rename/delete operations.
- */
 async function closeDocument(path: string): Promise<boolean> {
   const doc = openDocuments.get(path);
   if (!doc) return true;
 
   if (doc.dirty && !window.confirm(`"${doc.path.split(/[\\/]/).pop()}" 有未保存修改，确定关闭吗？`)) {
-    return false; // User cancelled
+    return false;
   }
 
   const wasActive = currentFilePath === path;
   const docs = Array.from(openDocuments.values());
   const currentIndex = docs.findIndex((item) => item.path === path);
   openDocuments.delete(path);
-  doc.model.dispose();
 
   if (openDocuments.size === 0) {
-    editor?.setModel(null);
+    editorView?.setState(createEditorState(""));
     setCurrentFilePath(null);
     previewEntryPath = "";
     lastSuccessfulPageCount = 0;
@@ -1503,38 +1561,27 @@ async function closeDocument(path: string): Promise<boolean> {
   return true;
 }
 
-/**
- * Close all documents under a given directory path (including subdirectories).
- * Returns true if all documents were closed successfully, false if any closure was cancelled.
- * This function is exported for use by FileTree during directory rename/delete operations.
- */
 export async function closeDocumentsUnderPath(dirPath: string): Promise<boolean> {
   const sep = dirPath.includes("\\") ? "\\" : "/";
   const normalizedDirPath = dirPath.endsWith(sep) ? dirPath : dirPath + sep;
-
-  // Find all documents under this directory
   const docsToClose: string[] = [];
-  for (const [path, doc] of openDocuments.entries()) {
+
+  for (const [path] of openDocuments.entries()) {
     const normalizedDocPath = path.endsWith(sep) ? path : path + sep;
     if (normalizedDocPath.startsWith(normalizedDirPath)) {
       docsToClose.push(path);
     }
   }
 
-  // Close documents in reverse order (so the currently open one is closed last)
   for (const path of docsToClose.reverse()) {
     const closed = await closeDocument(path);
-    if (!closed) {
-      // User cancelled - abort the operation
-      return false;
-    }
+    if (!closed) return false;
   }
-
   return true;
 }
 
 function compileOpenDocument(doc: OpenDocument): void {
-  const content = doc.model.getValue();
+  const content = doc.state.doc.toString();
   showWorkspaceLayout();
   enqueueCompile({
     command: previewEntryPath ? "compile_current" : "open_file",
@@ -1548,10 +1595,10 @@ function compileOpenDocument(doc: OpenDocument): void {
 }
 
 async function setCurrentDocumentAsPreviewEntry(): Promise<void> {
-  if (!editor || !currentFilePath) return;
+  const view = editorView;
+  if (!view || !currentFilePath) return;
   const activeDoc = getActiveDocument();
-  const content = editor.getValue();
-
+  const content = view.state.doc.toString();
   resetPreviewState();
   showWorkspaceLayout();
   enqueueCompile({
@@ -1566,13 +1613,12 @@ async function setCurrentDocumentAsPreviewEntry(): Promise<void> {
 }
 
 async function clearPreviewEntryPin(): Promise<void> {
-  if (!editor || !currentFilePath) return;
-
+  if (!editorView || !currentFilePath) return;
   try {
     await invoke("clear_preview_entry_pin");
     await compileAndPreview();
-  } catch (e) {
-    updateStatus("error", `Failed to clear preview entry pin: ${e}`);
+  } catch (error) {
+    updateStatus("error", `Failed to clear preview entry pin: ${error}`);
   }
 }
 
@@ -1594,9 +1640,7 @@ function renderTabs(): void {
     if (isPreviewEntry) {
       const star = document.createElement("span");
       star.className = "editor-tab-star";
-      star.innerHTML = `<svg width="11" height="11" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M6 1l1.5 3h3.3l-2.6 2 1 3.3L6 8l-3.2 1.3 1-3.3-2.6-2h3.3L6 1Z" fill="currentColor"/>
-      </svg>`;
+      star.innerHTML = `<svg width="11" height="11" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 1l1.5 3h3.3l-2.6 2 1 3.3L6 8l-3.2 1.3 1-3.3-2.6-2h3.3L6 1Z" fill="currentColor"/></svg>`;
       star.title = "主文件";
       tab.appendChild(star);
     }
@@ -1648,7 +1692,7 @@ function showTabContextMenu(x: number, y: number, path: string): void {
   setMain.addEventListener("click", async () => {
     hideTabContextMenu();
     const targetDoc = openDocuments.get(path);
-    if (!targetDoc || !editor) return;
+    if (!targetDoc || !editorView) return;
     if (currentFilePath !== path) {
       await switchToDocument(targetDoc, false);
     }
@@ -1683,113 +1727,95 @@ function hideTabContextMenu(): void {
   tabContextMenu = null;
 }
 
-// ─── Typst Language ───────────────────────────────────────────────
-function registerTypstLanguage(): void {
-  monaco.languages.register({ id: "typst" });
-
-  monaco.languages.setMonarchTokensProvider("typst", {
-    tokenizer: {
-      root: [
-        [/^\s*={1,6}\s/, "keyword"],
-        [/\/\/.*$/, "comment"],
-        [/\/\*/, "comment", "@comment"],
-        [/\*[^*]+\*/, "strong"],
-        [/_[^_]+_/, "emphasis"],
-        [/#([a-zA-Z_]\w*)/, "keyword"],
-        [/"/, "string", "@string"],
-        [/\d+(\.\d+)?/, "number"],
-        [/[{}()\[\]]/, "@brackets"],
-        [/[@$]/, "keyword"],
-      ],
-      comment: [
-        [/\*\//, "comment", "@pop"],
-        [/./, "comment"],
-      ],
-      string: [
-        [/"/, "string", "@pop"],
-        [/\\./, "string.escape"],
-        [/./, "string"],
-      ],
-    },
-  });
-
-  monaco.languages.registerCompletionItemProvider("typst", {
-    provideCompletionItems: (model, position) => {
-      const word  = model.getWordUntilPosition(position);
-      const range = {
-        startLineNumber: position.lineNumber,
-        endLineNumber:   position.lineNumber,
-        startColumn:     word.startColumn,
-        endColumn:       word.endColumn,
-      };
-      const kw = (label: string, insertText: string): monaco.languages.CompletionItem => ({
-        label, kind: monaco.languages.CompletionItemKind.Keyword, insertText, range,
-      });
-      const fn = (label: string, insertText: string): monaco.languages.CompletionItem => ({
-        label, kind: monaco.languages.CompletionItemKind.Function, insertText, range,
-      });
-      return {
-        suggestions: [
-          kw("set",     "set "),
-          kw("show",    "show "),
-          kw("let",     "let "),
-          kw("if",      "if "),
-          kw("for",     "for  in "),
-          kw("while",   "while "),
-          kw("import",  "import "),
-          kw("include", "include "),
-          fn("page",    "page(width: auto, height: auto)"),
-          fn("text",    "text(size: )"),
-          fn("align",   "align(center)"),
-          fn("image",   'image("")'),
-          fn("lorem",   "lorem(50)"),
-        ],
-      };
-    },
-  });
-}
-
-// ─── Re-exports for FileTree ──────────────────────────────────────
-export { closeDocument };
-
-// ─── UI Helpers ───────────────────────────────────────────────────
-export function updateStatus(type: "success" | "error" | "compiling", message: string): void {
-  const el = document.getElementById("compile-status");
-  if (el) {
-    el.className = `status-chip status ${type}`;
-    el.textContent = message;
+export async function runEditorAction(actionId: string): Promise<void> {
+  switch (actionId) {
+    case "save-file":
+      await saveCurrentFile();
+      break;
+    case "force-compile":
+      await compileAndPreview();
+      break;
+    case "export-pdf":
+      await exportPdf();
+      break;
+    case "open-file":
+      await openFile();
+      break;
+    case "close-file-tab":
+      await closeCurrentTab();
+      break;
+    case "set-preview-entry":
+      await setCurrentDocumentAsPreviewEntry();
+      break;
+    case "clear-preview-entry-pin":
+      await clearPreviewEntryPin();
+      break;
+    default:
+      break;
   }
 }
 
+function savedTheme(): Theme {
+  try {
+    return (localStorage.getItem("typst-theme") ?? "dark") as Theme;
+  } catch {
+    return "dark";
+  }
+}
+
+function savedFontSize(): number {
+  try {
+    return Number.parseInt(localStorage.getItem("typst-font-size") ?? "14", 10);
+  } catch {
+    return 14;
+  }
+}
+
+function savedFontFamilyCss(): string {
+  try {
+    const family = localStorage.getItem("typst-font-family") ?? "";
+    return family ? `'${family}', monospace` : "ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace";
+  } catch {
+    return "ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace";
+  }
+}
+
+export function updateStatus(type: "success" | "error" | "compiling", message: string): void {
+  const element = document.getElementById("compile-status");
+  if (!element) return;
+  element.className = `status-chip status ${type}`;
+  element.textContent = message;
+}
+
 function updateStatusFile(path: string | null): void {
-  const el = document.getElementById("status-file");
-  if (!el) return;
-  el.textContent = path ? path.split(/[\\/]/).pop() || path : "未打开文件";
-  el.setAttribute("title", path ?? "未打开文件");
+  const element = document.getElementById("status-file");
+  if (!element) return;
+  element.textContent = path ? path.split(/[\\/]/).pop() || path : "未打开文件";
+  element.setAttribute("title", path ?? "未打开文件");
 }
 
 function updateCursorStatus(line: number, column: number): void {
-  const el = document.getElementById("status-cursor");
-  if (el) el.textContent = `Ln ${line}, Col ${column}`;
+  const element = document.getElementById("status-cursor");
+  if (element) element.textContent = `Ln ${line}, Col ${column}`;
 }
 
 function updatePageStatus(pageCount: number): void {
-  const el = document.getElementById("status-pages");
-  if (el) el.textContent = `${pageCount} page(s)`;
+  const element = document.getElementById("status-pages");
+  if (element) element.textContent = `${pageCount} page(s)`;
 }
 
 function updateZoomStatus(zoom: number): void {
-  const el = document.getElementById("status-zoom-bar");
-  if (el) el.textContent = `${Math.round(zoom * 100)}%`;
+  const element = document.getElementById("status-zoom-bar");
+  if (element) element.textContent = `${Math.round(zoom * 100)}%`;
 }
 
 function isTransientCompileResult(result: CompileResult): boolean {
   if (result.success || result.errors.length === 0) return false;
-  return result.errors.some((err) =>
-    err.includes("Stale compilation request")
-    || err.includes("Stale compilation result discarded")
-    || err.includes("No pending content available")
-    || err.includes("Lock acquisition failed for pending compilation")
+  return result.errors.some((error) =>
+    error.includes("Stale compilation request")
+    || error.includes("Stale compilation result discarded")
+    || error.includes("No pending content available")
+    || error.includes("Lock acquisition failed for pending compilation"),
   );
 }
 
@@ -1801,21 +1827,29 @@ function showDiagnostics(errors: string[]): void {
   clearDiagnostics();
   const panel = document.createElement("div");
   panel.className = "diagnostics-panel";
-  errors.forEach((err) => {
+  for (const error of errors) {
     const item = document.createElement("div");
     item.className = "diagnostic-item error";
-    item.textContent = err;
+    item.textContent = error;
     item.addEventListener("click", () => {
-      // Jump to the error line if we can parse file:line from the message
-      const match = err.match(/:(\d+):/);
-      if (match && editor) {
-        const line = parseInt(match[1], 10);
-        editor.revealLineInCenter(line);
-        editor.setPosition({ lineNumber: line, column: 1 });
-        editor.focus();
-      }
+      const match = error.match(/^(.*?):(\d+):/);
+      const lineNumber = match ? Number.parseInt(match[2], 10) : null;
+      const file = match?.[1] ?? currentFilePath;
+      if (!lineNumber || !file) return;
+      void openFileAtPath(file).then(() => {
+        const view = editorView;
+        if (!view) return;
+        const line = view.state.doc.line(Math.max(1, Math.min(lineNumber, view.state.doc.lines)));
+        view.dispatch({
+          selection: EditorSelection.cursor(line.from),
+          effects: EditorView.scrollIntoView(line.from, { y: "center" }),
+        });
+        view.focus();
+      });
     });
     panel.appendChild(item);
-  });
+  }
   document.getElementById("editor-pane")?.appendChild(panel);
 }
+
+export { closeDocument };

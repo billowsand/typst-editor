@@ -1,8 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
-type MonacoEditorModule = typeof import("./MonacoEditor");
+type EditorModule = typeof import("./CodeMirrorEditor");
 
-let editorModulePromise: Promise<MonacoEditorModule> | null = null;
+let editorModulePromise: Promise<EditorModule> | null = null;
 let editorContainer: HTMLDivElement | null = null;
 let editorInitPromise: Promise<void> | null = null;
 let pendingTheme: "light" | "dark" | null = null;
@@ -10,12 +10,9 @@ let pendingFont: { family: string; size: number } | null = null;
 const pendingFileChangeCallbacks: Array<(path: string | null) => void> = [];
 const pendingPreviewEntryChangeCallbacks: Array<(path: string | null) => void> = [];
 
-async function loadEditorModule(): Promise<MonacoEditorModule> {
+async function loadEditorModule(): Promise<EditorModule> {
   if (!editorModulePromise) {
-    editorModulePromise = (async () => {
-      await import("../monaco-env");
-      return import("./MonacoEditor");
-    })();
+    editorModulePromise = import("./CodeMirrorEditor");
   }
   return editorModulePromise;
 }
@@ -24,7 +21,7 @@ export function registerEditorContainer(container: HTMLDivElement): void {
   editorContainer = container;
 }
 
-export async function ensureEditorReady(): Promise<MonacoEditorModule> {
+export async function ensureEditorReady(): Promise<EditorModule> {
   if (!editorContainer) {
     throw new Error("Editor container is not registered");
   }
@@ -35,7 +32,7 @@ export async function ensureEditorReady(): Promise<MonacoEditorModule> {
       await mod.initEditor(editorContainer!);
 
       if (pendingTheme) {
-        mod.setMonacoTheme(pendingTheme);
+        mod.setEditorTheme(pendingTheme);
       }
       if (pendingFont) {
         mod.setEditorFont(pendingFont.family, pendingFont.size);
@@ -73,12 +70,12 @@ export function onPreviewEntryChange(cb: (path: string | null) => void): void {
   }
 }
 
-export function setMonacoTheme(theme: "light" | "dark"): void {
+export function setEditorTheme(theme: "light" | "dark"): void {
   pendingTheme = theme;
   if (editorInitPromise) {
     void editorInitPromise.then(async () => {
       const mod = await loadEditorModule();
-      mod.setMonacoTheme(theme);
+      mod.setEditorTheme(theme);
     });
   }
 }
@@ -123,7 +120,7 @@ export async function revealSourceOffsetInPreview(
 
 export async function runEditorAction(actionId: string): Promise<void> {
   const mod = await ensureEditorReady();
-  mod.getEditor()?.getAction(actionId)?.run();
+  await mod.runEditorAction(actionId);
 }
 
 export async function closeDocument(path: string): Promise<boolean> {
