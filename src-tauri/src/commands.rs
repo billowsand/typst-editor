@@ -75,6 +75,11 @@ pub fn set_preview_entry(
     let _guard = state.compile_lock();
     state.open(&file_path, &content)?;
     state.pin_preview_entry(Some(&file_path))?;
+    // NOTE: do NOT call note_compile_request here.
+    // set_preview_entry uses update_file_and_compile (not _with_id), so it
+    // bypasses request deduplication. Calling note_compile_request with a
+    // sentinel like u64::MAX would corrupt current_request_id and cause
+    // subsequent compile_current calls to return stale results.
     let mut result = state.update_file_and_compile(&file_path, &content);
     populate_outline(&state, &mut result);
     Ok(result)

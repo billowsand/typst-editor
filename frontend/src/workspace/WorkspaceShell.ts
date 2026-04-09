@@ -23,9 +23,9 @@ export function initWorkspaceShell(options: WorkspaceShellOptions): void {
         <path d="M32 24v13" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
       </svg>
     </div>
-    <div class="workspace-empty-title">Open a Typst file</div>
-    <div class="workspace-empty-copy">No file is loaded. Open a project file to start editing and previewing.</div>
-    <button type="button" class="workspace-empty-button">Open File</button>
+    <div class="workspace-empty-title">打开 Typst 文件</div>
+    <div class="workspace-empty-copy">尚未加载文件。打开项目文件以开始编辑和预览。</div>
+    <button type="button" class="workspace-empty-button">打开文件</button>
   `;
 
   const button = emptyStateEl.querySelector<HTMLButtonElement>(".workspace-empty-button");

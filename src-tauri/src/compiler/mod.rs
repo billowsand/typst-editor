@@ -16,6 +16,20 @@ use world::{discover_access_root, discover_project_root, TypstWorld};
 /// Mutex to prevent concurrent compilations from racing
 static COMPILE_MUTEX: Mutex<()> = Mutex::new(());
 
+fn import_trace_enabled() -> bool {
+    cfg!(debug_assertions)
+        || matches!(
+            std::env::var("TYPST_EDITOR_TRACE_IMPORTS").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+}
+
+fn trace_import(message: impl AsRef<str>) {
+    if import_trace_enabled() {
+        eprintln!("[typst-editor][compile] {}", message.as_ref());
+    }
+}
+
 /// Shared compiler state managed by Tauri.
 pub struct CompilerState {
     pub(crate) inner: Arc<RwLock<InnerState>>,
@@ -125,6 +139,17 @@ impl CompilerState {
         };
 
         let root = resolve_access_root_for_path(&entry);
+        trace_import(format!(
+            "compile request file={} entry={} root={} pinned_entry={}",
+            abs.display(),
+            entry.display(),
+            root.display(),
+            state
+                .pinned_preview_entry
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<none>".to_string())
+        ));
 
         // Check if any file content actually changed (compare BEFORE updating hashes)
         let content_hash = hash_content(content);
@@ -209,10 +234,17 @@ impl CompilerState {
         let can_reuse_world = state.world.as_ref().is_some_and(|world| {
             world.main_path() == entry.as_path() && world.root() == root.as_path()
         });
+        trace_import(format!(
+            "world reuse={} existing_world={} existing_doc={}",
+            can_reuse_world,
+            state.world.is_some(),
+            state.document.is_some()
+        ));
 
         let mut world = if can_reuse_world {
             match state.world.take() {
                 Some(mut world) => {
+                    trace_import("reusing existing world");
                     world.update_source(&entry_content);
                     world.reset_touched_paths();
                     world
@@ -220,6 +252,7 @@ impl CompilerState {
                 None => unreachable!("world reuse checked above"),
             }
         } else {
+            trace_import("creating new world");
             match TypstWorld::new_with_root(entry.to_string_lossy().as_ref(), &entry_content, &root)
             {
                 Ok(world) => world,
@@ -276,6 +309,11 @@ impl CompilerState {
 
         match result.output {
             Ok(doc) => {
+                trace_import(format!(
+                    "compile success entry={} pages={}",
+                    entry.display(),
+                    doc.pages.len()
+                ));
                 // Keep cached SVG strings only for pages whose structural hash stayed stable.
                 let mut rendered_pages: Vec<Option<String>> = Vec::with_capacity(doc.pages.len());
                 let mut page_hashes: Vec<u64> = Vec::with_capacity(doc.pages.len());
@@ -310,6 +348,11 @@ impl CompilerState {
                 state.route_table.insert(abs, entry);
             }
             Err(errors) => {
+                trace_import(format!(
+                    "compile failure entry={} error_count={}",
+                    entry.display(),
+                    errors.len()
+                ));
                 for error in errors {
                     compile_result
                         .errors

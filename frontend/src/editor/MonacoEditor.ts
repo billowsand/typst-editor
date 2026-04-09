@@ -261,43 +261,43 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
   // ── Keyboard shortcuts ─────────────────────────────────────────
   editor.addAction({
     id: "save-file",
-    label: "Save File",
+    label: "保存文件",
     keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS],
     run: () => saveCurrentFile(),
   });
   editor.addAction({
     id: "force-compile",
-    label: "Force Compile",
+    label: "强制编译",
     keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter],
     run: () => compileAndPreview(),
   });
   editor.addAction({
     id: "export-pdf",
-    label: "Export PDF",
+    label: "导出 PDF",
     keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyE],
     run: () => exportPdf(),
   });
   editor.addAction({
     id: "open-file",
-    label: "Open File",
+    label: "打开文件",
     keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyO],
     run: () => openFile(),
   });
   editor.addAction({
     id: "close-file-tab",
-    label: "Close File Tab",
+    label: "关闭文件标签",
     keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyW],
     run: () => closeCurrentTab(),
   });
   editor.addAction({
     id: "set-preview-entry",
-    label: "Set Preview Entry",
+    label: "设置预览入口",
     keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.Enter],
     run: () => setCurrentDocumentAsPreviewEntry(),
   });
   editor.addAction({
     id: "clear-preview-entry-pin",
-    label: "Clear Preview Entry Pin",
+    label: "清除预览入口固定",
     keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Alt | monaco.KeyCode.Enter],
     run: () => clearPreviewEntryPin(),
   });
@@ -404,7 +404,7 @@ async function runCompileJob(job: CompileJob): Promise<void> {
     if (job.intentId !== latestCompileRequestId) {
       finalizeCompileStatusTimeout();
       removeSyncOverlays("unsaved-add-hl");
-      updateStatus("error", `Error: ${e}`);
+      updateStatus("error", `错误: ${e}`);
       return;
     }
     finalizeCompileStatusTimeout();
@@ -413,7 +413,7 @@ async function runCompileJob(job: CompileJob): Promise<void> {
       updatePageStatus(0);
       clearOutlinePanel();
     }
-    updateStatus("error", `Error: ${e}`);
+    updateStatus("error", `错误: ${e}`);
   }
 }
 
@@ -441,7 +441,7 @@ async function applyCompileResult(job: CompileJob, result: CompileResult): Promi
   }
 
   if (isTransientCompileResult(result)) {
-    updateStatus("compiling", "Syncing preview…");
+    updateStatus("compiling", "正在同步预览…");
     return;
   }
 
@@ -450,7 +450,7 @@ async function applyCompileResult(job: CompileJob, result: CompileResult): Promi
     updatePageStatus(0);
     clearOutlinePanel();
   }
-  updateStatus("error", `${result.errors.length} error(s)`);
+  updateStatus("error", `${result.errors.length} 个错误`);
   showDiagnostics(result.errors);
 }
 
@@ -524,7 +524,7 @@ async function saveCurrentFile(): Promise<void> {
       path = picked;
       activeDoc = getActiveDocument();
     } catch (e) {
-      updateStatus("error", `Save dialog failed: ${e}`);
+      updateStatus("error", `保存对话框失败: ${e}`);
       return;
     }
   }
@@ -538,7 +538,7 @@ async function saveCurrentFile(): Promise<void> {
       activeDoc.dirty = false;
       renderTabs();
     }
-    updateStatus("success", "Saved");
+    updateStatus("success", "已保存");
     enqueueCompile({
       command: "compile_current",
       filePath: path,
@@ -546,19 +546,19 @@ async function saveCurrentFile(): Promise<void> {
       savedContent: content,
       preservePagesOnError: true,
       notifyPreviewEntryChange: true,
-      successMessage: () => "Saved",
+      successMessage: () => "已保存",
     });
   } catch (e) {
-    updateStatus("error", `Save failed: ${e}`);
+    updateStatus("error", `保存失败: ${e}`);
   }
 }
 
 async function exportPdf(): Promise<void> {
   try {
     const result = await invoke<"Success" | "Cancelled">("export_pdf_dialog");
-    if (result !== "Cancelled") updateStatus("success", "PDF exported");
+    if (result !== "Cancelled") updateStatus("success", "PDF 已导出");
   } catch (e) {
-    updateStatus("error", `Export failed: ${e}`);
+    updateStatus("error", `导出失败: ${e}`);
   }
 }
 
@@ -1570,31 +1570,37 @@ function showTabContextMenu(x: number, y: number, path: string): void {
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
 
-  const setMain = document.createElement("button");
-  setMain.type = "button";
-  setMain.className = "tab-context-menu-item";
-  setMain.textContent = path === previewEntryPath ? "当前已是主文件" : "设为主文件";
-  setMain.disabled = path === previewEntryPath;
-  setMain.addEventListener("click", async () => {
-    hideTabContextMenu();
-    const targetDoc = openDocuments.get(path);
-    if (!targetDoc || !editor) return;
-    if (currentFilePath !== path) {
-      await switchToDocument(targetDoc, false);
-    }
-    await setCurrentDocumentAsPreviewEntry();
-  });
+  const isMainFile = path === previewEntryPath;
 
-  const clearMain = document.createElement("button");
-  clearMain.type = "button";
-  clearMain.className = "tab-context-menu-item";
-  clearMain.textContent = "取消主文件固定";
-  clearMain.addEventListener("click", async () => {
-    hideTabContextMenu();
-    await clearPreviewEntryPin();
-  });
+  if (isMainFile) {
+    // File is already the main file - show only "取消主文件固定"
+    const clearMain = document.createElement("button");
+    clearMain.type = "button";
+    clearMain.className = "tab-context-menu-item";
+    clearMain.textContent = "取消主文件固定";
+    clearMain.addEventListener("click", async () => {
+      hideTabContextMenu();
+      await clearPreviewEntryPin();
+    });
+    menu.appendChild(clearMain);
+  } else {
+    // File is not the main file - show only "设为主文件"
+    const setMain = document.createElement("button");
+    setMain.type = "button";
+    setMain.className = "tab-context-menu-item";
+    setMain.textContent = "设为主文件";
+    setMain.addEventListener("click", async () => {
+      hideTabContextMenu();
+      const targetDoc = openDocuments.get(path);
+      if (!targetDoc || !editor) return;
+      if (currentFilePath !== path) {
+        await switchToDocument(targetDoc, false);
+      }
+      await setCurrentDocumentAsPreviewEntry();
+    });
+    menu.appendChild(setMain);
+  }
 
-  menu.append(setMain, clearMain);
   document.body.appendChild(menu);
   tabContextMenu = menu;
 

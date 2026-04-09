@@ -18,6 +18,20 @@ use typst_kit::package::{default_package_cache_path, default_package_path};
 /// Global font cache – searched once, reused forever.
 static FONTS: OnceLock<Fonts> = OnceLock::new();
 
+fn import_trace_enabled() -> bool {
+    cfg!(debug_assertions)
+        || matches!(
+            std::env::var("TYPST_EDITOR_TRACE_IMPORTS").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+}
+
+fn trace_import(message: impl AsRef<str>) {
+    if import_trace_enabled() {
+        eprintln!("[typst-editor][import] {}", message.as_ref());
+    }
+}
+
 /// Initialize (if needed) and return the global font set.
 /// Called by both the compiler and the `list_system_fonts` command.
 pub fn get_or_init_fonts() -> &'static Fonts {
@@ -56,8 +70,7 @@ impl TypstWorld {
     /// `content`   – the text content of that file.
     pub fn new(file_path: &str, content: &str) -> Result<Self, String> {
         let abs = PathBuf::from(file_path);
-        let root = discover_access_root(&abs)
-            .unwrap_or_else(|| PathBuf::from("."));
+        let root = discover_access_root(&abs).unwrap_or_else(|| PathBuf::from("."));
 
         Self::new_with_root_impl(file_path, content, root)
     }
@@ -78,6 +91,14 @@ impl TypstWorld {
         })?;
         let id = FileId::new(None, rel);
         let main_source = Source::new(id, content.to_string());
+
+        trace_import(format!(
+            "create world main={} root={} file_id={:?} vpath={}",
+            abs.display(),
+            root.display(),
+            id,
+            id.vpath().as_rootless_path().display()
+        ));
 
         let fonts = FONTS.get_or_init(|| FontSearcher::new().search());
         let book = LazyHash::new(fonts.book.clone());
@@ -107,6 +128,14 @@ impl TypstWorld {
         let id = self
             .file_id_for_path(&abs)
             .ok_or_else(|| format!("File is outside current project root: {}", file_path))?;
+
+        trace_import(format!(
+            "overlay update path={} abs={} file_id={:?} vpath={}",
+            file_path,
+            abs.display(),
+            id,
+            id.vpath().as_rootless_path().display()
+        ));
 
         if id == self.main_source.id() {
             self.main_source.replace(content);
@@ -179,15 +208,42 @@ impl TypstWorld {
 
     /// Resolve a `FileId` to an absolute path on disk.
     fn resolve_path(&self, id: FileId) -> Result<PathBuf, FileError> {
-        let root = if let Some(spec) = id.package() {
-            resolve_package_root(spec)
-                .ok_or_else(|| FileError::NotFound(PathBuf::from("typst.toml")))?
-        } else {
-            self.root.clone()
-        };
+        let local_path = id
+            .vpath()
+            .resolve(&self.root)
+            .ok_or_else(|| FileError::AccessDenied)?;
+
+        trace_import(format!(
+            "resolve request file_id={:?} package={:?} root={} vpath={} local={}",
+            id,
+            id.package(),
+            self.root.display(),
+            id.vpath().as_rootless_path().display(),
+            local_path.display()
+        ));
+
+        // Prefer resolving within the current world root first. This prevents
+        // ordinary project files from being misrouted into package lookup.
+        if id.package().is_none() || local_path.exists() {
+            trace_import(format!(
+                "resolve local-hit file_id={:?} path={}",
+                id,
+                local_path.display()
+            ));
+            return Ok(local_path);
+        }
+
+        let package_root = resolve_package_root(id.package().unwrap())
+            .ok_or_else(|| FileError::NotFound(local_path.clone()))?;
+
+        trace_import(format!(
+            "resolve package-fallback file_id={:?} package_root={}",
+            id,
+            package_root.display()
+        ));
 
         id.vpath()
-            .resolve(&root)
+            .resolve(&package_root)
             .ok_or_else(|| FileError::AccessDenied)
     }
 
@@ -195,6 +251,7 @@ impl TypstWorld {
     fn read_source(&self, id: FileId) -> Result<Source, FileError> {
         let path = self.resolve_path(id)?;
         self.touched_paths.lock().insert(path.clone());
+        trace_import(format!("read source path={}", path.display()));
         let text = std::fs::read_to_string(&path).map_err(|_| FileError::NotFound(path.clone()))?;
         Ok(Source::new(id, text))
     }
@@ -203,6 +260,7 @@ impl TypstWorld {
     fn read_file(&self, id: FileId) -> Result<Bytes, FileError> {
         let path = self.resolve_path(id)?;
         self.touched_paths.lock().insert(path.clone());
+        trace_import(format!("read file path={}", path.display()));
         let data = std::fs::read(&path).map_err(|_| FileError::NotFound(path.clone()))?;
         Ok(Bytes::new(data))
     }

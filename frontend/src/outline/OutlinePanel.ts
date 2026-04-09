@@ -75,7 +75,7 @@ function renderOutlineState(
 
   const header = document.createElement("div");
   header.className = "outline-header";
-  header.textContent = "Main File Outline";
+  header.textContent = "主文件大纲";
   outlineContainer.appendChild(header);
 
   if (state !== "ready") {
@@ -83,10 +83,10 @@ function renderOutlineState(
     empty.className = "outline-empty";
     empty.textContent =
       state === "loading"
-        ? "Loading outline..."
+        ? "正在加载大纲…"
         : state === "error"
-          ? "Failed to load outline"
-          : "Set a main file to show outline";
+          ? "加载大纲失败"
+          : "设置主文件以显示大纲";
     outlineContainer.appendChild(empty);
     return;
   }
