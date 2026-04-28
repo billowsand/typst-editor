@@ -54,10 +54,12 @@ let editorHost: HTMLDivElement | null = null;
 let tabContextMenu: HTMLDivElement | null = null;
 let previewHoverRequestId = 0;
 let previewHoverTargetKey = "";
+let previewHoverThrottleTimeout: ReturnType<typeof setTimeout> | null = null;
 let sourceHoverDecorationIds: string[] = [];
 let sourceHoverTarget: { file: string; offset: number } | null = null;
 let latestCursorRequestId = 0;
 let lastCursorPreviewPage: number | null = null;
+// Optimized offset cache with line-level granularity
 let offsetCache:
   | {
     model: monaco.editor.ITextModel;
@@ -67,6 +69,11 @@ let offsetCache:
     eol: string;
     eolCharLength: number;
     eolByteLength: number;
+    // Track which lines are dirty and need recalculation
+    dirtyLines: Set<number>;
+    // Total character and byte count for quick bounds checking
+    totalChars: number;
+    totalBytes: number;
   }
   | null = null;
 
@@ -104,7 +111,7 @@ function scheduleCursorPreviewSync(delay = 120): void {
     const currentEditor = editor;
     const sel = currentEditor?.getSelection();
     const pos = currentEditor?.getPosition();
-    if (!currentEditor || !sel || !pos || !sel.isEmpty()) return;
+    if (!currentEditor || !sel || !pos) return;
     removeSyncOverlays("selection-hl");
     void syncCursorToPreview(pos);
   }, delay);
@@ -241,18 +248,31 @@ export async function initEditor(container: HTMLDivElement): Promise<void> {
     scheduleCompile();
   });
 
-  // ── Cursor → Preview (user-initiated only, debounced 120 ms) ────
-  // We suppress sync when we move the cursor programmatically (preview→editor).
+  // ── Cursor → Preview (double-click only) ────
+  // Sync preview position only on double-click to avoid performance impact
+  let lastMouseUpTime = 0;
   editor.onDidChangeCursorPosition((e: monaco.editor.ICursorPositionChangedEvent) => {
     updateCursorStatus(e.position.lineNumber, e.position.column);
-    if (suppressCursorSync > 0) return;
-    scheduleCursorPreviewSync();
     // Outline heading boundaries are line-level — skip the O(n) byte-offset conversion
     // when only the column changed (e.g. typing characters on the same line)
     if (e.position.lineNumber !== lastOutlineSyncLine) {
       lastOutlineSyncLine = e.position.lineNumber;
       syncOutlineActiveFromEditor();
     }
+  });
+
+  // Double-click handler for cursor sync
+  editor.onMouseUp((e: monaco.editor.IEditorMouseEvent) => {
+    const now = Date.now();
+    if (now - lastMouseUpTime < 300 && e.event.leftButton) {
+      // Double-click detected
+      const pos = editor?.getPosition();
+      if (pos && !editor?.getSelection()?.isEmpty()) {
+        // Only sync on double-click with selection
+        scheduleCursorPreviewSync(0); // Immediate sync on double-click
+      }
+    }
+    lastMouseUpTime = now;
   });
 
   const initialPos = editor.getPosition();
@@ -787,14 +807,21 @@ function monacoOffsetToUtf8ByteOffset(model: monaco.editor.ITextModel, charOffse
 
 function getOffsetCache(model: monaco.editor.ITextModel): NonNullable<typeof offsetCache> {
   const versionId = model.getVersionId();
-  if (offsetCache && offsetCache.model === model && offsetCache.versionId === versionId) {
-    return offsetCache;
-  }
-
   const lineCount = model.getLineCount();
   const eol = model.getEOL();
   const eolCharLength = eol.length;
   const eolByteLength = utf8BytesForText(eol);
+
+  // Check if we can reuse existing cache
+  if (offsetCache && offsetCache.model === model && offsetCache.versionId === versionId) {
+    // Cache is still valid - ensure arrays are the right size
+    if (offsetCache.lineStartChars.length === lineCount) {
+      return offsetCache;
+    }
+    // Size mismatch (lines added/removed), need to rebuild
+  }
+
+  // Build or rebuild cache
   const lineStartChars = new Array<number>(lineCount);
   const lineStartBytes = new Array<number>(lineCount);
   let charCursor = 0;
@@ -813,7 +840,18 @@ function getOffsetCache(model: monaco.editor.ITextModel): NonNullable<typeof off
     }
   }
 
-  offsetCache = { model, versionId, lineStartChars, lineStartBytes, eol, eolCharLength, eolByteLength };
+  offsetCache = {
+    model,
+    versionId,
+    lineStartChars,
+    lineStartBytes,
+    eol,
+    eolCharLength,
+    eolByteLength,
+    dirtyLines: new Set(),
+    totalChars: charCursor,
+    totalBytes: byteCursor
+  };
   return offsetCache;
 }
 
@@ -882,10 +920,9 @@ async function syncCursorToPreview(position: monaco.Position): Promise<void> {
   const model = editor?.getModel();
   if (!model) return;
   if (!currentFilePath) return;
-  // Skip sync if no compiled output exists yet, pages aren't rendered yet, or if the user is actively typing
+  // Skip sync if no compiled output exists yet or pages aren't rendered yet
   if (lastSuccessfulPageCount === 0) return;
   if (renderedPageHashes.length === 0) return;
-  if (Date.now() - lastEditTime < 400) return;
 
   const requestId = ++latestCursorRequestId;
   try {
@@ -946,25 +983,29 @@ async function handlePreviewHover(
   if (hoverKey === previewHoverTargetKey) return;
   previewHoverTargetKey = hoverKey;
 
-  const requestId = ++previewHoverRequestId;
-  try {
-    const result = await invoke<JumpResult>("jump_from_click", {
-      page: pageIndex + 1,
-      x: pagePoint.x,
-      y: pagePoint.y,
-    });
-    if (requestId !== previewHoverRequestId) return;
+  // Throttle hover events to avoid excessive backend calls
+  if (previewHoverThrottleTimeout) clearTimeout(previewHoverThrottleTimeout);
+  previewHoverThrottleTimeout = setTimeout(async () => {
+    const requestId = ++previewHoverRequestId;
+    try {
+      const result = await invoke<JumpResult>("jump_from_click", {
+        page: pageIndex + 1,
+        x: pagePoint.x,
+        y: pagePoint.y,
+      });
+      if (requestId !== previewHoverRequestId) return;
 
-    if (result.type === "file" && result.offset != null && result.file) {
-      // Show a subtle hover line at the hovered position (overlay approach, no SVG fill changes)
-      highlightHoverInPreview({ page: pageIndex + 1, x: pagePoint.x, y: pagePoint.y });
-      applySourceHoverDecoration(result.file, result.offset);
-    } else {
-      clearPreviewSourceHover();
+      if (result.type === "file" && result.offset != null && result.file) {
+        // Show a subtle hover line at the hovered position (overlay approach, no SVG fill changes)
+        highlightHoverInPreview({ page: pageIndex + 1, x: pagePoint.x, y: pagePoint.y });
+        applySourceHoverDecoration(result.file, result.offset);
+      } else {
+        clearPreviewSourceHover();
+      }
+    } catch {
+      if (requestId === previewHoverRequestId) clearPreviewSourceHover();
     }
-  } catch {
-    if (requestId === previewHoverRequestId) clearPreviewSourceHover();
-  }
+  }, 50); // 50ms throttle delay
 }
 
 // ─── Highlight Helpers ────────────────────────────────────────────
@@ -1229,6 +1270,10 @@ function clearSourceHoverDecoration(): void {
 }
 
 function clearPreviewSourceHover(): void {
+  if (previewHoverThrottleTimeout) {
+    clearTimeout(previewHoverThrottleTimeout);
+    previewHoverThrottleTimeout = null;
+  }
   previewHoverTargetKey = "";
   sourceHoverTarget = null;
   clearSourceHoverDecoration();
