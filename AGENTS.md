@@ -9,7 +9,13 @@
   - 编辑器：CodeMirror 6
 - 后端：`src-tauri/`
   - 技术栈：Rust + Tauri + Typst
-  - 职责：文件访问、编译、预览 SVG、跳转映射、文件树操作
+  - 职责：Tauri 命令封装、对话框、文件系统操作
+- 编译核心：`crates/typst-core/`
+  - 纯 Rust，无 Tauri 依赖，被 `src-tauri` 和 `gpui-app` 共用
+  - 职责：编译器状态与缓存、Typst World、SVG/位图渲染、跳转映射、大纲、补全/悬停
+- GPUI 原型前端：`gpui-app/`
+  - 技术栈：Rust + gpui-kit（GPUI）
+  - 编辑器：gpui-kit 代码编辑器 + 自定义 Typst 高亮；预览为 `typst-render` 位图
 
 ## 启动与构建
 
@@ -17,6 +23,9 @@
 - 前端构建：`cd frontend && pnpm build`
 - Tauri 开发：`cd src-tauri && cargo tauri dev`
 - Tauri 构建：`cd src-tauri && cargo tauri build`
+
+- GPUI 原型运行：`cd gpui-app && cargo run -- <文件或目录>`
+- typst-core 测试：`cd crates/typst-core && cargo test`
 
 Tauri 前端命令配置在 [src-tauri/tauri.conf.json](/mnt/f/typst-editor/src-tauri/tauri.conf.json)。
 
@@ -53,9 +62,41 @@ Tauri 前端命令配置在 [src-tauri/tauri.conf.json](/mnt/f/typst-editor/src-
 - Tauri 命令实现
   - [src-tauri/src/commands.rs](/mnt/f/typst-editor/src-tauri/src/commands.rs)
 - 编译器状态与缓存
-  - [src-tauri/src/compiler/mod.rs](/mnt/f/typst-editor/src-tauri/src/compiler/mod.rs)
+  - [crates/typst-core/src/compiler.rs](/mnt/f/typst-editor/crates/typst-core/src/compiler.rs)
 - Typst World、项目根发现、字体缓存
-  - [src-tauri/src/compiler/world.rs](/mnt/f/typst-editor/src-tauri/src/compiler/world.rs)
+  - [crates/typst-core/src/world.rs](/mnt/f/typst-editor/crates/typst-core/src/world.rs)
+
+## 编译核心（typst-core）索引
+
+- 模块入口与导出
+  - [crates/typst-core/src/lib.rs](/mnt/f/typst-editor/crates/typst-core/src/lib.rs)
+- 编译器状态、增量编译、页缓存、SVG/位图渲染、结构化诊断
+  - [crates/typst-core/src/compiler.rs](/mnt/f/typst-editor/crates/typst-core/src/compiler.rs)
+  - `CompilerState`、`update_file_and_compile_with_id()`、`render_page_svg()`、`render_page_rgba()`、`page_sizes()`、`DiagnosticInfo`
+- Typst World、项目根发现、字体缓存
+  - [crates/typst-core/src/world.rs](/mnt/f/typst-editor/crates/typst-core/src/world.rs)
+- 跳转映射、大纲、补全、悬停
+  - [crates/typst-core/src/ide.rs](/mnt/f/typst-editor/crates/typst-core/src/ide.rs)
+  - `jump_from_click()`、`jump_from_offset()`、`document_outline()`、`autocomplete()`、`tooltip()`
+- 目录列表、系统字体
+  - [crates/typst-core/src/fs.rs](/mnt/f/typst-editor/crates/typst-core/src/fs.rs)
+- 端到端测试
+  - [crates/typst-core/tests/roundtrip.rs](/mnt/f/typst-editor/crates/typst-core/tests/roundtrip.rs)
+
+## GPUI 原型（gpui-app）索引
+
+- 启动、窗口、命令行参数
+  - [gpui-app/src/main.rs](/mnt/f/typst-editor/gpui-app/src/main.rs)
+- 根视图：文件树 | 编辑器 | 预览、状态栏、快捷键、编译调度、光标同步
+  - [gpui-app/src/app.rs](/mnt/f/typst-editor/gpui-app/src/app.rs)
+  - `TypstEditorApp`、`open_path()`、`schedule_compile()`、`apply_compile_result()`、`schedule_cursor_sync()`、`jump_to()`
+- 预览：可见页位图化、缩放、点击跳源码、光标标记
+  - [gpui-app/src/preview.rs](/mnt/f/typst-editor/gpui-app/src/preview.rs)
+  - `PreviewPanel`、`set_document()`、`schedule_rasterization()`、`on_page_click()`、`set_markers()`
+- Typst 语法高亮（`InputHighlighter`，基于 `typst::syntax`）
+  - [gpui-app/src/highlight.rs](/mnt/f/typst-editor/gpui-app/src/highlight.rs)
+- 补全与悬停（进程内调用 typst-ide）
+  - [gpui-app/src/lsp.rs](/mnt/f/typst-editor/gpui-app/src/lsp.rs)
 
 ## 功能到代码索引
 
@@ -131,7 +172,7 @@ Tauri 前端命令配置在 [src-tauri/tauri.conf.json](/mnt/f/typst-editor/src-
   - [src-tauri/src/commands.rs](/mnt/f/typst-editor/src-tauri/src/commands.rs)
   - `open_file`、`set_preview_entry`、`compile_current`
 - 编译器状态与复用逻辑
-  - [src-tauri/src/compiler/mod.rs](/mnt/f/typst-editor/src-tauri/src/compiler/mod.rs)
+  - [crates/typst-core/src/compiler.rs](/mnt/f/typst-editor/crates/typst-core/src/compiler.rs)
   - `CompilerState::update_file_and_compile_with_id()`
 
 ### 6. 预览页面渲染
@@ -146,7 +187,7 @@ Tauri 前端命令配置在 [src-tauri/tauri.conf.json](/mnt/f/typst-editor/src-
   - [src-tauri/src/commands.rs](/mnt/f/typst-editor/src-tauri/src/commands.rs)
   - `render_page`
 - 编译器缓存 SVG / 页哈希
-  - [src-tauri/src/compiler/mod.rs](/mnt/f/typst-editor/src-tauri/src/compiler/mod.rs)
+  - [crates/typst-core/src/compiler.rs](/mnt/f/typst-editor/crates/typst-core/src/compiler.rs)
   - `render_page_svg()`
 
 ### 7. 编辑器与预览双向定位
@@ -163,9 +204,11 @@ Tauri 前端命令配置在 [src-tauri/tauri.conf.json](/mnt/f/typst-editor/src-
 - 预览点击 -> 源码定位
   - [frontend/src/editor/CodeMirrorEditor.ts](/mnt/f/typst-editor/frontend/src/editor/CodeMirrorEditor.ts)
   - `handlePreviewClick()`、`jumpToFileOffset()`
-- 后端位置映射
+- 后端位置映射（Tauri 命令是薄封装，实现在 typst-core）
   - [src-tauri/src/commands.rs](/mnt/f/typst-editor/src-tauri/src/commands.rs)
   - `jump_from_cursor`、`jump_from_click`
+  - [crates/typst-core/src/ide.rs](/mnt/f/typst-editor/crates/typst-core/src/ide.rs)
+  - `jump_from_cursor()`、`jump_from_offset()`、`jump_from_click()`
 
 ### 8. 新增内容高亮、选择高亮、hover 高亮
 
@@ -215,7 +258,7 @@ Tauri 前端命令配置在 [src-tauri/tauri.conf.json](/mnt/f/typst-editor/src-
   - [src-tauri/src/commands.rs](/mnt/f/typst-editor/src-tauri/src/commands.rs)
   - `get_document_outline`
 - 编译器构建大纲
-  - [src-tauri/src/compiler/mod.rs](/mnt/f/typst-editor/src-tauri/src/compiler/mod.rs)
+  - [crates/typst-core/src/ide.rs](/mnt/f/typst-editor/crates/typst-core/src/ide.rs)
   - `populate_outline()`、`build_document_outline()`
 
 ### 11. 工作区空态与布局显示
@@ -236,21 +279,21 @@ Tauri 前端命令配置在 [src-tauri/tauri.conf.json](/mnt/f/typst-editor/src-
   - [frontend/src/editor/CodeMirrorEditor.ts](/mnt/f/typst-editor/frontend/src/editor/CodeMirrorEditor.ts)
   - `showDiagnostics()`、`clearDiagnostics()`
 - 后端错误格式化
-  - [src-tauri/src/compiler/mod.rs](/mnt/f/typst-editor/src-tauri/src/compiler/mod.rs)
+  - [crates/typst-core/src/compiler.rs](/mnt/f/typst-editor/crates/typst-core/src/compiler.rs)
   - `format_diagnostic()`
 
 ### 13. 项目根、字体与 Typst World
 
 - 项目根发现
-  - [src-tauri/src/compiler/world.rs](/mnt/f/typst-editor/src-tauri/src/compiler/world.rs)
+  - [crates/typst-core/src/world.rs](/mnt/f/typst-editor/crates/typst-core/src/world.rs)
   - `discover_project_root()`
 - 字体缓存与系统字体枚举
-  - [src-tauri/src/compiler/world.rs](/mnt/f/typst-editor/src-tauri/src/compiler/world.rs)
+  - [crates/typst-core/src/world.rs](/mnt/f/typst-editor/crates/typst-core/src/world.rs)
   - `get_or_init_fonts()`
   - [src-tauri/src/commands.rs](/mnt/f/typst-editor/src-tauri/src/commands.rs)
   - `list_system_fonts`
 - Typst 文件解析上下文
-  - [src-tauri/src/compiler/world.rs](/mnt/f/typst-editor/src-tauri/src/compiler/world.rs)
+  - [crates/typst-core/src/world.rs](/mnt/f/typst-editor/crates/typst-core/src/world.rs)
   - `TypstWorld`
 
 ## 调试建议
@@ -263,7 +306,7 @@ Tauri 前端命令配置在 [src-tauri/tauri.conf.json](/mnt/f/typst-editor/src-
   - [frontend/src/editor/CodeMirrorEditor.ts](/mnt/f/typst-editor/frontend/src/editor/CodeMirrorEditor.ts)
   - [src-tauri/src/commands.rs](/mnt/f/typst-editor/src-tauri/src/commands.rs)
 - 编译结果异常、缓存不生效，先看
-  - [src-tauri/src/compiler/mod.rs](/mnt/f/typst-editor/src-tauri/src/compiler/mod.rs)
+  - [crates/typst-core/src/compiler.rs](/mnt/f/typst-editor/crates/typst-core/src/compiler.rs)
 - 资源路径、项目根、导入文件找不到，先看
-  - [src-tauri/src/compiler/world.rs](/mnt/f/typst-editor/src-tauri/src/compiler/world.rs)
+  - [crates/typst-core/src/world.rs](/mnt/f/typst-editor/crates/typst-core/src/world.rs)
 

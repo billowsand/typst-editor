@@ -1,5 +1,3 @@
-pub(crate) mod world;
-
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -8,10 +6,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
+use crate::world::{discover_access_root, discover_project_root, TypstWorld};
 use parking_lot::RwLock;
 use typst::layout::PagedDocument;
 use typst::World;
-use world::{discover_access_root, discover_project_root, TypstWorld};
 
 /// Mutex to prevent concurrent compilations from racing
 static COMPILE_MUTEX: Mutex<()> = Mutex::new(());
@@ -30,7 +28,7 @@ fn trace_import(message: impl AsRef<str>) {
     }
 }
 
-/// Shared compiler state managed by Tauri.
+/// Shared compiler state, owned by the host app (Tauri or GPUI).
 pub struct CompilerState {
     pub(crate) inner: Arc<RwLock<InnerState>>,
 }
@@ -79,6 +77,41 @@ impl CompilerState {
     pub fn note_compile_request(&self, request_id: u64) {
         let mut state = self.inner.write();
         state.current_request_id = state.current_request_id.max(request_id);
+    }
+
+    /// Whether a newer compile request has superseded `request_id`.
+    pub fn is_stale_request(&self, request_id: u64) -> bool {
+        request_id < self.inner.read().current_request_id
+    }
+
+    /// Snapshot of the last compilation, without recompiling.
+    pub fn current_result(&self) -> CompileResult {
+        let state = self.inner.read();
+        let pinned_entry_path = state
+            .pinned_preview_entry
+            .as_ref()
+            .map(|p| p.display().to_string());
+        match &state.document {
+            Some(doc) => CompileResult {
+                success: state.last_compile_ok,
+                page_count: doc.pages.len(),
+                page_hashes: state.page_hashes.clone(),
+                outline: vec![],
+                errors: vec![],
+                warnings: vec![],
+                diagnostics: vec![],
+                duration_ms: 0,
+                entry_path: state
+                    .preview_entry
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                pinned_entry_path,
+            },
+            None => CompileResult {
+                pinned_entry_path,
+                ..CompileResult::error(vec!["No document available".into()])
+            },
+        }
     }
 
     /// Force the preview to use this file as entry.
@@ -222,6 +255,7 @@ impl CompilerState {
                 outline: vec![],
                 errors: vec![],
                 warnings: vec![],
+                diagnostics: vec![],
                 duration_ms: 0,
                 entry_path: Some(entry_path_str),
                 pinned_entry_path: state
@@ -293,6 +327,7 @@ impl CompilerState {
             outline: vec![],
             errors: vec![],
             warnings: vec![],
+            diagnostics: vec![],
             duration_ms: duration.as_millis() as u64,
             entry_path: Some(entry.display().to_string()),
             pinned_entry_path: state
@@ -305,6 +340,9 @@ impl CompilerState {
             compile_result
                 .warnings
                 .push(format_diagnostic(warning, &world));
+            compile_result
+                .diagnostics
+                .extend(diagnostic_info(warning, &world));
         }
 
         match result.output {
@@ -357,6 +395,9 @@ impl CompilerState {
                     compile_result
                         .errors
                         .push(format_diagnostic(&error, &world));
+                    compile_result
+                        .diagnostics
+                        .extend(diagnostic_info(&error, &world));
                 }
                 state.preview_entry = Some(entry);
                 state.world = Some(world);
@@ -398,6 +439,34 @@ impl CompilerState {
             *slot = Some(svg.clone());
         }
         Some(svg)
+    }
+
+    /// Page sizes in pt for the current document.
+    pub fn page_sizes(&self) -> Vec<(f64, f64)> {
+        let state = self.inner.read();
+        state
+            .document
+            .as_ref()
+            .map(|doc| {
+                doc.pages
+                    .iter()
+                    .map(|p| (p.frame.width().to_pt(), p.frame.height().to_pt()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Rasterize a page to premultiplied RGBA8 at `pixel_per_pt`.
+    /// Returns `(width, height, rgba)`.
+    pub fn render_page_rgba(
+        &self,
+        page_index: usize,
+        pixel_per_pt: f32,
+    ) -> Option<(u32, u32, Vec<u8>)> {
+        let doc = self.inner.read().document.clone()?;
+        let page = doc.pages.get(page_index)?;
+        let pixmap = typst_render::render(page, pixel_per_pt);
+        Some((pixmap.width(), pixmap.height(), pixmap.take()))
     }
 
     /// Export the current document as PDF bytes.
@@ -443,6 +512,16 @@ impl CompilerState {
         state.document.as_ref().map(|d| d.pages.len()).unwrap_or(0)
     }
 
+    /// Like [`Self::with_document`], but runs even if the last compile failed.
+    pub fn with_world<F, R>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&TypstWorld, Option<&PagedDocument>) -> R,
+    {
+        let state = self.inner.read();
+        let world = state.world.as_ref()?;
+        Some(f(world, state.document.as_deref()))
+    }
+
     /// Get references for IDE features.
     pub fn with_document<F, R>(&self, f: F) -> Option<R>
     where
@@ -463,13 +542,15 @@ pub struct CompileResult {
     pub outline: Vec<OutlineItem>,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+    /// Errors and warnings with source locations, for editor squiggles.
+    pub diagnostics: Vec<DiagnosticInfo>,
     pub duration_ms: u64,
     pub entry_path: Option<String>,
     pub pinned_entry_path: Option<String>,
 }
 
 impl CompileResult {
-    fn error(errors: Vec<String>) -> Self {
+    pub fn error(errors: Vec<String>) -> Self {
         Self {
             success: false,
             page_count: 0,
@@ -477,11 +558,23 @@ impl CompileResult {
             outline: vec![],
             errors,
             warnings: vec![],
+            diagnostics: vec![],
             duration_ms: 0,
             entry_path: None,
             pinned_entry_path: None,
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiagnosticInfo {
+    /// Absolute path of the file the diagnostic points into.
+    pub file: String,
+    /// Byte range within that file.
+    pub start: usize,
+    pub end: usize,
+    pub message: String,
+    pub is_error: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -583,4 +676,20 @@ pub(crate) fn format_diagnostic(diag: &typst::diag::SourceDiagnostic, world: &dy
     }
     msg.push_str(&diag.message);
     msg
+}
+
+fn diagnostic_info(
+    diag: &typst::diag::SourceDiagnostic,
+    world: &TypstWorld,
+) -> Option<DiagnosticInfo> {
+    let id = diag.span.id()?;
+    let source = world.source(id).ok()?;
+    let range = source.range(diag.span)?;
+    Some(DiagnosticInfo {
+        file: world.resolve_absolute_path(id)?.display().to_string(),
+        start: range.start,
+        end: range.end,
+        message: diag.message.to_string(),
+        is_error: diag.severity == typst::diag::Severity::Error,
+    })
 }

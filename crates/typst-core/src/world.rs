@@ -266,7 +266,7 @@ impl TypstWorld {
     }
 }
 
-pub(crate) fn discover_project_root(path: &Path) -> Option<PathBuf> {
+pub fn discover_project_root(path: &Path) -> Option<PathBuf> {
     let start = if path.is_dir() { path } else { path.parent()? };
     for dir in start.ancestors() {
         if dir.join("typst.toml").is_file() {
@@ -276,7 +276,7 @@ pub(crate) fn discover_project_root(path: &Path) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn discover_access_root(path: &Path) -> Option<PathBuf> {
+pub fn discover_access_root(path: &Path) -> Option<PathBuf> {
     discover_project_root(path).or_else(|| discover_filesystem_root(path))
 }
 

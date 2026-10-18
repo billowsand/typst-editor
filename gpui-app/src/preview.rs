@@ -1,0 +1,311 @@
+//! Preview panel: pages rasterized with `typst-render` and shown as GPU
+//! textures. Only pages near the viewport keep a bitmap; zoom re-rasterizes
+//! at the new pixel density while the old bitmap stays up as a placeholder.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use gpui_kit::component::{ActiveTheme, v_flex};
+use gpui_kit::prelude::FluentBuilder;
+use gpui_kit::*;
+use smallvec::SmallVec;
+use typst_core::CompilerState;
+use typst_core::ide::PositionResult;
+
+/// Pages kept rasterized beyond the visible ones, on each side.
+const KEEP_AROUND: usize = 2;
+/// Gap between pages, logical px.
+const PAGE_GAP: f32 = 16.;
+
+pub enum PreviewEvent {
+    /// The user clicked text in the preview that maps to `file` at `offset`.
+    JumpToSource { file: String, offset: usize },
+}
+
+struct PageSlot {
+    width_pt: f64,
+    height_pt: f64,
+    hash: u64,
+    image: Option<Arc<RenderImage>>,
+    /// `(page hash, pixels per pt)` the current `image` was rendered for.
+    image_key: Option<(u64, u32)>,
+    /// Key of an in-flight rasterization, if any.
+    pending_key: Option<(u64, u32)>,
+}
+
+pub struct PreviewPanel {
+    compiler: Arc<CompilerState>,
+    pages: Vec<PageSlot>,
+    zoom: f32,
+    scroll: ScrollHandle,
+    /// Window-space bounds of each page from the last prepaint.
+    page_bounds: Rc<RefCell<Vec<Bounds<Pixels>>>>,
+    /// Cursor location(s) mirrored from the editor.
+    markers: Vec<PositionResult>,
+    /// Images to release from the GPU atlas on the next frame.
+    retired: Vec<Arc<RenderImage>>,
+}
+
+impl EventEmitter<PreviewEvent> for PreviewPanel {}
+
+impl PreviewPanel {
+    pub fn new(compiler: Arc<CompilerState>) -> Self {
+        Self {
+            compiler,
+            pages: Vec::new(),
+            zoom: 1.0,
+            scroll: ScrollHandle::new(),
+            page_bounds: Rc::new(RefCell::new(Vec::new())),
+            markers: Vec::new(),
+            retired: Vec::new(),
+        }
+    }
+
+    pub fn zoom(&self) -> f32 {
+        self.zoom
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.pages.len()
+    }
+
+    pub fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        self.zoom = zoom.clamp(0.25, 5.0);
+        cx.notify();
+    }
+
+    /// Adopt a fresh compile. Pages whose hash is unchanged keep their bitmap;
+    /// changed pages keep showing the old bitmap until the new one is ready.
+    pub fn set_document(&mut self, sizes: Vec<(f64, f64)>, hashes: Vec<u64>, cx: &mut Context<Self>) {
+        let mut old = std::mem::take(&mut self.pages).into_iter();
+        for ((width_pt, height_pt), hash) in sizes.into_iter().zip(hashes) {
+            let mut slot = old.next().unwrap_or(PageSlot {
+                width_pt,
+                height_pt,
+                hash,
+                image: None,
+                image_key: None,
+                pending_key: None,
+            });
+            if slot.width_pt != width_pt || slot.height_pt != height_pt {
+                // A stretched placeholder looks worse than a blank page.
+                self.retired.extend(slot.image.take());
+                slot.image_key = None;
+            }
+            slot.width_pt = width_pt;
+            slot.height_pt = height_pt;
+            slot.hash = hash;
+            self.pages.push(slot);
+        }
+        self.retired.extend(old.filter_map(|slot| slot.image));
+        self.page_bounds.borrow_mut().truncate(self.pages.len());
+        cx.notify();
+    }
+
+    /// Show cursor markers and scroll the first one into view if needed.
+    pub fn set_markers(&mut self, markers: Vec<PositionResult>, cx: &mut Context<Self>) {
+        if let Some(first) = markers.first() {
+            self.reveal(first);
+        }
+        self.markers = markers;
+        cx.notify();
+    }
+
+    fn reveal(&self, pos: &PositionResult) {
+        let bounds = self.page_bounds.borrow();
+        let Some(page) = pos.page.checked_sub(1).and_then(|ix| bounds.get(ix)) else {
+            return;
+        };
+        let viewport = self.scroll.bounds();
+        let y = page.origin.y + px(pos.y as f32 * self.zoom);
+        let margin = viewport.size.height / 4.;
+        if y > viewport.origin.y + margin && y < viewport.bottom() - margin {
+            return;
+        }
+        // Scroll offsets are negative; move so the marker sits a third down.
+        let offset = self.scroll.offset();
+        let content_y = y - viewport.origin.y - offset.y;
+        let target = (content_y - viewport.size.height / 3.).max(px(0.));
+        self.scroll.set_offset(point(offset.x, -target));
+    }
+
+    fn on_page_click(&mut self, page_ix: usize, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        let Some(bounds) = self.page_bounds.borrow().get(page_ix).copied() else {
+            return;
+        };
+        let local = event.position - bounds.origin;
+        let x = f32::from(local.x) as f64 / self.zoom as f64;
+        let y = f32::from(local.y) as f64 / self.zoom as f64;
+        let Some(jump) = typst_core::ide::jump_from_click(&self.compiler, page_ix + 1, x, y) else {
+            return;
+        };
+        if let (Some(file), Some(offset)) = (jump.file, jump.offset) {
+            cx.emit(PreviewEvent::JumpToSource { file, offset });
+        }
+    }
+
+    /// Pages intersecting the viewport, from the previous frame's layout.
+    fn visible_range(&self) -> std::ops::Range<usize> {
+        let bounds = self.page_bounds.borrow();
+        let viewport = self.scroll.bounds();
+        if bounds.len() != self.pages.len() || viewport.size.height <= px(0.) {
+            return 0..self.pages.len().min(2);
+        }
+        let first = bounds.iter().position(|b| b.bottom() >= viewport.origin.y);
+        let last = bounds.iter().rposition(|b| b.origin.y <= viewport.bottom());
+        match (first, last) {
+            (Some(first), Some(last)) if first <= last => first..last + 1,
+            _ => 0..0,
+        }
+    }
+
+    /// Kick off rasterization for pages near the viewport and evict the rest.
+    fn schedule_rasterization(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for image in self.retired.drain(..) {
+            cx.drop_image(image, Some(window));
+        }
+
+        let visible = self.visible_range();
+        let keep = visible.start.saturating_sub(KEEP_AROUND)
+            ..(visible.end + KEEP_AROUND).min(self.pages.len());
+        // Snap density so tiny layout changes don't trigger re-renders.
+        let pixel_per_pt = (self.zoom * window.scale_factor() * 8.).round() / 8.;
+        let density_key = (pixel_per_pt * 1000.) as u32;
+
+        for (ix, slot) in self.pages.iter_mut().enumerate() {
+            if !keep.contains(&ix) {
+                if let Some(image) = slot.image.take() {
+                    cx.drop_image(image, Some(window));
+                }
+                slot.image_key = None;
+                continue;
+            }
+            let key = (slot.hash, density_key);
+            if slot.image_key == Some(key) || slot.pending_key == Some(key) {
+                continue;
+            }
+            slot.pending_key = Some(key);
+
+            let compiler = self.compiler.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let image = cx
+                    .background_spawn(async move {
+                        let (w, h, mut rgba) = compiler.render_page_rgba(ix, pixel_per_pt)?;
+                        for px in rgba.chunks_exact_mut(4) {
+                            swap_rgba_pa_to_bgra(px);
+                        }
+                        let buffer = image::RgbaImage::from_raw(w, h, rgba)?;
+                        let frames: SmallVec<[image::Frame; 1]> =
+                            SmallVec::from_elem(image::Frame::new(buffer), 1);
+                        Some(Arc::new(RenderImage::new(frames)))
+                    })
+                    .await;
+                this.update_in(cx, |this, window, cx| {
+                    let Some(slot) = this.pages.get_mut(ix) else { return };
+                    if slot.pending_key != Some(key) {
+                        // Superseded by a newer compile or zoom level.
+                        if let Some(image) = image {
+                            cx.drop_image(image, Some(window));
+                        }
+                        return;
+                    }
+                    slot.pending_key = None;
+                    if let Some(image) = image {
+                        if let Some(old) = slot.image.replace(image) {
+                            cx.drop_image(old, Some(window));
+                        }
+                        slot.image_key = Some(key);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    fn render_page(&self, ix: usize, slot: &PageSlot, cx: &mut Context<Self>) -> impl IntoElement {
+        let zoom = self.zoom;
+        let bounds_store = self.page_bounds.clone();
+        let marker_color = cx.theme().primary;
+
+        div()
+            .id(("page", ix))
+            .relative()
+            .flex_none()
+            .w(px(slot.width_pt as f32 * zoom))
+            .h(px(slot.height_pt as f32 * zoom))
+            .bg(white())
+            .shadow_md()
+            .child(
+                canvas(
+                    move |bounds, _, _| {
+                        let mut store = bounds_store.borrow_mut();
+                        if store.len() <= ix {
+                            store.resize(ix + 1, Bounds::default());
+                        }
+                        store[ix] = bounds;
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .when_some(slot.image.clone(), |page, image| {
+                page.child(img(image).absolute().size_full())
+            })
+            .children(
+                self.markers
+                    .iter()
+                    .filter(|m| m.page == ix + 1)
+                    .map(move |m| {
+                        div()
+                            .absolute()
+                            .left(px((m.x as f32 - 1.) * zoom))
+                            .top(px((m.y as f32 - 11.) * zoom))
+                            .w(px(2.5 * zoom))
+                            .h(px(14. * zoom))
+                            .bg(marker_color.opacity(0.8))
+                            .rounded_sm()
+                    }),
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    this.on_page_click(ix, event, cx);
+                }),
+            )
+    }
+}
+
+impl Render for PreviewPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.schedule_rasterization(window, cx);
+
+        let pages: Vec<_> = self
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(ix, slot)| self.render_page(ix, slot, cx).into_any_element())
+            .collect();
+
+        div()
+            .id("preview-scroll")
+            .size_full()
+            .overflow_scroll()
+            .track_scroll(&self.scroll)
+            .bg(cx.theme().muted)
+            // Layout moves on scroll; re-render to rasterize newly visible pages.
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+            .child(
+                v_flex()
+                    .min_w_full()
+                    .items_center()
+                    .gap(px(PAGE_GAP))
+                    .py(px(PAGE_GAP))
+                    .px(px(PAGE_GAP))
+                    .children(pages),
+            )
+    }
+}
