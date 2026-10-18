@@ -153,6 +153,28 @@ pub fn jump_from_offset(
         .unwrap_or_default()
 }
 
+/// Like [`jump_from_offset`], but only when `live_text` is exactly what was
+/// compiled: while the editor is ahead of the last compile (typing, or a
+/// syntax error), offsets would point at the wrong place, so return nothing.
+pub fn jump_from_offset_live(
+    state: &CompilerState,
+    file_path: &str,
+    live_text: &str,
+    offset: usize,
+) -> Vec<PositionResult> {
+    state
+        .with_document(|world, doc| {
+            let Some(source) = world.source_by_path(file_path) else {
+                return Vec::new();
+            };
+            if source.text() != live_text || offset > live_text.len() {
+                return Vec::new();
+            }
+            positions_to_results(typst_ide::jump_from_cursor(doc, &source, offset))
+        })
+        .unwrap_or_default()
+}
+
 // ── Preview -> Editor ───────────────────────────────────────
 
 /// Resolve a click on 1-based `page` at (`x`, `y`) pt to a source location.

@@ -21,6 +21,23 @@ const PAGE_GAP: f32 = 18.;
 pub enum PreviewEvent {
     /// The user clicked text in the preview that maps to `file` at `offset`.
     JumpToSource { file: String, offset: usize },
+    /// The user clicked a link.
+    OpenUrl(String),
+}
+
+/// Largest bitmap side we upload: common GPU texture limit.
+const MAX_TEXTURE_SIDE: f32 = 8192.;
+/// Upper bound on pixels per point, whatever the zoom and screen.
+const MAX_PIXEL_PER_PT: f32 = 4.;
+
+/// Pixels per point for a page: the requested density, capped so the
+/// bitmap stays within the texture limit and a sane memory budget.
+pub fn page_density(requested: f32, width_pt: f64, height_pt: f64) -> f32 {
+    let longest = width_pt.max(height_pt).max(1.) as f32;
+    requested
+        .min(MAX_PIXEL_PER_PT)
+        .min(MAX_TEXTURE_SIDE / longest)
+        .max(0.1)
 }
 
 struct PageSlot {
@@ -160,8 +177,23 @@ impl PreviewPanel {
         let Some(jump) = typst_core::ide::jump_from_click(&self.compiler, page_ix + 1, x, y) else {
             return;
         };
-        if let (Some(file), Some(offset)) = (jump.file, jump.offset) {
-            cx.emit(PreviewEvent::JumpToSource { file, offset });
+        match jump.jump_type.as_str() {
+            "url" => {
+                if let Some(url) = jump.url {
+                    cx.emit(PreviewEvent::OpenUrl(url));
+                }
+            }
+            // A cross-reference: show where it points, in the preview.
+            "position" => {
+                if let Some(pos) = jump.position {
+                    self.set_markers(vec![pos], cx);
+                }
+            }
+            _ => {
+                if let (Some(file), Some(offset)) = (jump.file, jump.offset) {
+                    cx.emit(PreviewEvent::JumpToSource { file, offset });
+                }
+            }
         }
     }
 
@@ -211,8 +243,7 @@ impl PreviewPanel {
         let keep = visible.start.saturating_sub(KEEP_AROUND)
             ..(visible.end + KEEP_AROUND).min(self.pages.len());
         // Snap density so tiny layout changes don't trigger re-renders.
-        let pixel_per_pt = (self.zoom * window.scale_factor() * 8.).round() / 8.;
-        let density_key = (pixel_per_pt * 1000.) as u32;
+        let requested = (self.zoom * window.scale_factor() * 8.).round() / 8.;
 
         for (ix, slot) in self.pages.iter_mut().enumerate() {
             if !keep.contains(&ix) {
@@ -222,7 +253,8 @@ impl PreviewPanel {
                 slot.image_key = None;
                 continue;
             }
-            let key = (slot.hash, density_key);
+            let pixel_per_pt = page_density(requested, slot.width_pt, slot.height_pt);
+            let key = (slot.hash, (pixel_per_pt * 1000.) as u32);
             if slot.image_key == Some(key) || slot.pending_key == Some(key) {
                 continue;
             }
@@ -254,11 +286,13 @@ impl PreviewPanel {
                         return;
                     }
                     slot.pending_key = None;
+                    // Record the attempt even when it failed (the document
+                    // went away), so it is not retried on every frame.
+                    slot.image_key = Some(key);
                     if let Some(image) = image {
                         if let Some(old) = slot.image.replace(image) {
                             cx.drop_image(old, Some(window));
                         }
-                        slot.image_key = Some(key);
                     }
                     cx.notify();
                 })
@@ -374,5 +408,21 @@ impl Render for PreviewPanel {
                     .px(px(PAGE_GAP))
                     .children(pages),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_density;
+
+    #[test]
+    fn density_is_capped_by_texture_size_and_budget() {
+        // A4 at 2x screen and 5x zoom asks for 10 px/pt: capped at 4.
+        assert_eq!(page_density(10., 595., 842.), 4.);
+        // A very long page is limited by the texture side instead.
+        let d = page_density(2., 595., 20000.);
+        assert!(20000. * d <= 8192. + 0.5);
+        // Normal requests pass through.
+        assert_eq!(page_density(1.5, 595., 842.), 1.5);
     }
 }

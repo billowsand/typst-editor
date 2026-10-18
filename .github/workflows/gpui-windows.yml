@@ -1,0 +1,50 @@
+name: GPUI Windows
+
+# Test and package the GPUI front end from a clean checkout. The packaged
+# ZIP (with its checksum) is uploaded as a workflow artifact.
+
+on:
+  push:
+    branches: [main, "feat/**"]
+    paths:
+      - "crates/typst-core/**"
+      - "gpui-app/**"
+      - ".github/workflows/gpui-windows.yml"
+  pull_request:
+    paths:
+      - "crates/typst-core/**"
+      - "gpui-app/**"
+  workflow_dispatch:
+
+jobs:
+  package:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            gpui-app -> target
+
+      - name: Test, build and package
+        shell: pwsh
+        run: pwsh gpui-app/scripts/package-windows.ps1
+
+      - name: Network test (package download)
+        shell: pwsh
+        continue-on-error: true
+        run: cargo test --manifest-path crates/typst-core/Cargo.toml --release --target-dir gpui-app/target -- --ignored
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zijian-windows-x64
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error

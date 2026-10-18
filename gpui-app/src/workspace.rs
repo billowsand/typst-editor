@@ -5,16 +5,24 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::files::DiskVersion;
+
 /// One open document: what is on disk and what is in the editor.
 #[derive(Debug, Clone)]
 pub struct Buffer {
     pub saved: String,
     pub current: String,
+    /// The file's version when it was last read or written by us; a
+    /// different version on disk means someone else changed the file.
+    pub disk: Option<DiskVersion>,
+    /// The user kept the editor's text over an outside edit: unsaved even if
+    /// the text equals what we last saved.
+    pub diverged: bool,
 }
 
 impl Buffer {
     pub fn is_dirty(&self) -> bool {
-        self.current != self.saved
+        self.diverged || self.current != self.saved
     }
 }
 
@@ -114,16 +122,18 @@ impl Workspace {
     pub fn open(
         &mut self,
         path: &str,
-        load: impl FnOnce(&str) -> std::io::Result<String>,
+        load: impl FnOnce(&str) -> std::io::Result<(String, Option<DiskVersion>)>,
     ) -> Result<String, String> {
         let key = normalize(path);
         if !self.buffers.contains_key(&key) {
-            let text = load(&key).map_err(|e| format!("无法读取 {key}：{e}"))?;
+            let (text, disk) = load(&key).map_err(|e| format!("无法读取 {key}：{e}"))?;
             self.buffers.insert(
                 key.clone(),
                 Buffer {
                     saved: text.clone(),
                     current: text,
+                    disk,
+                    diverged: false,
                 },
             );
             self.order.push(key.clone());
@@ -143,10 +153,71 @@ impl Workspace {
         }
     }
 
-    pub fn mark_saved(&mut self, path: &str) {
+    /// `written` reached disk at version `disk`.
+    pub fn mark_saved(&mut self, path: &str, written: &str, disk: Option<DiskVersion>) {
         if let Some(buffer) = self.buffers.get_mut(&normalize(path)) {
-            buffer.saved = buffer.current.clone();
+            buffer.saved = written.to_string();
+            buffer.disk = disk;
+            buffer.diverged = false;
         }
+    }
+
+    /// Replace a buffer with what is now on disk (outside edit accepted).
+    pub fn reload(&mut self, path: &str, text: String, disk: Option<DiskVersion>) {
+        if let Some(buffer) = self.buffers.get_mut(&normalize(path)) {
+            buffer.saved = text.clone();
+            buffer.current = text;
+            buffer.disk = disk;
+            buffer.diverged = false;
+        }
+    }
+
+    /// Keep the editor text but accept the disk version as the new base, so
+    /// the next save overwrites the outside edit deliberately.
+    pub fn keep_mine(&mut self, path: &str, disk: Option<DiskVersion>) {
+        if let Some(buffer) = self.buffers.get_mut(&normalize(path)) {
+            buffer.disk = disk;
+            buffer.diverged = true;
+        }
+    }
+
+    /// Open documents whose file changed on disk since we read or wrote it,
+    /// with the version now on disk (`None`: deleted or moved).
+    pub fn changed_on_disk(&self) -> Vec<(String, Option<DiskVersion>)> {
+        self.order
+            .iter()
+            .filter_map(|p| {
+                let buffer = self.buffers.get(p)?;
+                let now = DiskVersion::of(Path::new(p));
+                (now != buffer.disk).then(|| (p.clone(), now))
+            })
+            .collect()
+    }
+
+    /// A file was renamed or moved: carry its buffer (and tab) along.
+    pub fn rename(&mut self, from: &str, to: &str) -> bool {
+        let (from, to) = (normalize(from), normalize(to));
+        let Some(buffer) = self.buffers.remove(&from) else {
+            return false;
+        };
+        self.buffers.insert(to.clone(), buffer);
+        for p in self.order.iter_mut().filter(|p| **p == from) {
+            *p = to.clone();
+        }
+        if self.active.as_deref() == Some(from.as_str()) {
+            self.active = Some(to);
+        }
+        true
+    }
+
+    /// Open documents at or below `path` (a renamed or deleted folder).
+    pub fn paths_under(&self, path: &str) -> Vec<String> {
+        let base = normalize(path);
+        self.order
+            .iter()
+            .filter(|p| Path::new(p.as_str()).starts_with(&base))
+            .cloned()
+            .collect()
     }
 
     /// Close `path`. Returns the document that should become active when the
@@ -171,8 +242,8 @@ impl Workspace {
 mod tests {
     use super::*;
 
-    fn text(s: &str) -> impl FnOnce(&str) -> std::io::Result<String> + '_ {
-        move |_| Ok(s.to_string())
+    fn text(s: &str) -> impl FnOnce(&str) -> std::io::Result<(String, Option<DiskVersion>)> + '_ {
+        move |_| Ok((s.to_string(), None))
     }
 
     #[test]
@@ -243,8 +314,58 @@ mod tests {
         let mut ws = Workspace::default();
         ws.open("a.typ", text("a")).unwrap();
         ws.set_current("a.typ", "b".into());
-        ws.mark_saved("a.typ");
+        ws.mark_saved("a.typ", "b", None);
         assert!(ws.dirty_paths().is_empty());
+        // Saved text is what was written, even if the editor moved on.
+        ws.set_current("a.typ", "bc".into());
+        ws.mark_saved("a.typ", "b", None);
+        assert_eq!(ws.dirty_paths().len(), 1);
+    }
+
+    #[test]
+    fn renames_carry_buffers_and_tabs() {
+        let mut ws = Workspace::default();
+        ws.open("E:/p/a.typ", text("a")).unwrap();
+        ws.set_current("E:/p/a.typ", "edited".into());
+        assert!(ws.rename("E:/p/a.typ", "E:/p/b.typ"));
+        assert!(ws.is_active("E:/p/b.typ"));
+        assert_eq!(ws.buffer("E:/p/b.typ").unwrap().current, "edited");
+        assert!(ws.buffer("E:/p/a.typ").is_none());
+        assert_eq!(ws.tabs().count(), 1);
+        assert_eq!(ws.paths_under("E:/p"), vec![normalize("E:/p/b.typ")]);
+        assert!(ws.paths_under("E:/q").is_empty());
+    }
+
+    #[test]
+    fn outside_changes_are_detected_and_resolved() {
+        let dir = std::env::temp_dir().join(format!("zj-ws-disk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("doc.typ");
+        std::fs::write(&path, "v1").unwrap();
+        let key = path.display().to_string();
+        let mut ws = Workspace::default();
+        ws.open(&key, |p| crate::files::read_text(Path::new(p)))
+            .unwrap();
+        assert!(ws.changed_on_disk().is_empty());
+
+        std::fs::write(&path, "version two").unwrap();
+        let changed = ws.changed_on_disk();
+        assert_eq!(changed.len(), 1);
+        // Reloading takes the outside text and clears the report.
+        ws.reload(&key, "version two".into(), changed[0].1);
+        assert!(ws.changed_on_disk().is_empty());
+        assert!(ws.dirty_paths().is_empty());
+
+        // Keeping the editor's text instead leaves the buffer unsaved.
+        std::fs::write(&path, "third, from elsewhere").unwrap();
+        ws.keep_mine(&key, crate::files::DiskVersion::of(&path));
+        assert!(ws.changed_on_disk().is_empty());
+        assert_eq!(ws.dirty_paths().len(), 1);
+
+        // A deleted file shows up with no version.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(ws.changed_on_disk(), vec![(normalize(&key), None)]);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

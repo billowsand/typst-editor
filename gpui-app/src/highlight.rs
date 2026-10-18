@@ -2,8 +2,9 @@
 //!
 //! gpui-kit ships no Typst tree-sitter grammar, so we plug in our own
 //! `InputHighlighter` backed by `typst::syntax` — the same parser the
-//! compiler uses. `Source::replace` reparses incrementally, so a keystroke
-//! only re-parses the syntax nodes around the edit.
+//! compiler uses. Edits are applied with `Source::edit`, which reparses only
+//! around the change, and styling walks just the visible part of the tree,
+//! so large documents stay responsive.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -51,8 +52,6 @@ fn token_name(tag: Tag) -> Option<&'static str> {
 
 pub struct TypstHighlighter {
     source: Source,
-    /// Sorted, non-overlapping highlighted byte ranges.
-    spans: Vec<(Range<usize>, &'static str)>,
 }
 
 impl TypstHighlighter {
@@ -60,16 +59,35 @@ impl TypstHighlighter {
         let id = FileId::new(None, VirtualPath::new("editor.typ"));
         Self {
             source: Source::new(id, String::new()),
-            spans: Vec::new(),
         }
     }
 
-    fn reparse(&mut self, text: &Rope) {
+    /// Bring the parse tree up to date with `text`, the document after
+    /// `edit`. Uses the edit when it is consistent with what we have,
+    /// otherwise falls back to a (diffing) full replace.
+    fn apply(&mut self, edit: Option<&InputEdit>, text: &Rope) {
+        if let Some(edit) = edit {
+            let old_len = self.source.text().len();
+            let consistent = edit.start_byte <= edit.old_end_byte
+                && edit.old_end_byte <= old_len
+                && edit.start_byte <= edit.new_end_byte
+                && edit.new_end_byte <= text.len()
+                && old_len - (edit.old_end_byte - edit.start_byte)
+                    + (edit.new_end_byte - edit.start_byte)
+                    == text.len()
+                && self.source.text().is_char_boundary(edit.start_byte)
+                && self.source.text().is_char_boundary(edit.old_end_byte);
+            if consistent {
+                let inserted = text.slice(edit.start_byte..edit.new_end_byte).to_string();
+                self.source
+                    .edit(edit.start_byte..edit.old_end_byte, &inserted);
+                return;
+            }
+        }
         let text = text.to_string();
         if self.source.text() != text {
             self.source.replace(&text);
         }
-        self.spans = compute_spans(&self.source);
     }
 }
 
@@ -80,13 +98,13 @@ impl InputHighlighter for TypstHighlighter {
 
     fn update(
         &mut self,
-        _edit: Option<InputEdit>,
+        edit: Option<InputEdit>,
         text: &Rope,
         _folding: bool,
         _window: &mut Window,
         _cx: &mut Context<EditorState>,
     ) {
-        self.reparse(text);
+        self.apply(edit.as_ref(), text);
     }
 
     fn update_batch(
@@ -96,8 +114,8 @@ impl InputHighlighter for TypstHighlighter {
         _window: &mut Window,
         _cx: &mut Context<EditorState>,
     ) {
-        if let Some((_, text)) = edits.last() {
-            self.reparse(text);
+        for (edit, text) in edits {
+            self.apply(Some(edit), text);
         }
     }
 
@@ -106,15 +124,22 @@ impl InputHighlighter for TypstHighlighter {
         range: &Range<usize>,
         resolver: &dyn HighlightStyleResolver,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
-        let mut out = Vec::new();
+        let mut spans = Vec::new();
+        collect_spans(
+            &LinkedNode::new(self.source.root()),
+            None,
+            range,
+            &mut spans,
+        );
+
+        let mut out = Vec::with_capacity(spans.len() * 2 + 1);
         let mut pos = range.start;
-        let first = self.spans.partition_point(|(r, _)| r.end <= range.start);
-        for (span, name) in &self.spans[first..] {
-            if span.start >= range.end {
-                break;
-            }
-            let start = span.start.max(range.start);
+        for (span, name) in spans {
+            let start = span.start.max(range.start).max(pos);
             let end = span.end.min(range.end);
+            if start >= end {
+                continue;
+            }
             if start > pos {
                 out.push((pos..start, HighlightStyle::default()));
             }
@@ -134,40 +159,51 @@ impl InputHighlighter for TypstHighlighter {
     }
 }
 
-/// Highlight every leaf; markup containers (heading, strong, raw, ...) color
-/// the leaves inside them unless a leaf has a more specific tag.
-pub fn compute_spans(source: &Source) -> Vec<(Range<usize>, &'static str)> {
-    let mut spans = Vec::new();
-    walk(&LinkedNode::new(source.root()), None, &mut spans);
-    spans
-}
-
-fn walk(
+/// Highlighted leaves intersecting `range`, in order. Markup containers
+/// (heading, strong, raw, ...) colour the leaves inside them unless a leaf
+/// has a more specific tag. Subtrees outside `range` are skipped.
+fn collect_spans(
     node: &LinkedNode,
     inherited: Option<&'static str>,
+    range: &Range<usize>,
     out: &mut Vec<(Range<usize>, &'static str)>,
 ) {
+    let node_range = node.range();
+    if node_range.end <= range.start || node_range.start >= range.end {
+        // Zero-width leaves at the boundary carry no text either way.
+        return;
+    }
     let name = typst::syntax::highlight(node)
         .and_then(token_name)
         .or(inherited);
     if node.get().children().len() == 0 {
-        let range = node.range();
         if let Some(name) = name
-            && !range.is_empty()
+            && !node_range.is_empty()
         {
-            // Merge with the previous span when contiguous and same style.
             match out.last_mut() {
-                Some((prev, prev_name)) if prev.end == range.start && *prev_name == name => {
-                    prev.end = range.end;
+                Some((prev, prev_name)) if prev.end == node_range.start && *prev_name == name => {
+                    prev.end = node_range.end;
                 }
-                _ => out.push((range, name)),
+                _ => out.push((node_range, name)),
             }
         }
         return;
     }
     for child in node.children() {
-        walk(&child, name, out);
+        collect_spans(&child, name, range, out);
     }
+}
+
+#[cfg(test)]
+pub fn compute_spans(source: &Source) -> Vec<(Range<usize>, &'static str)> {
+    let mut spans = Vec::new();
+    collect_spans(
+        &LinkedNode::new(source.root()),
+        None,
+        &(0..source.text().len()),
+        &mut spans,
+    );
+    spans
 }
 
 #[cfg(test)]
@@ -198,19 +234,76 @@ mod tests {
         assert!(spans.iter().any(|(t, n)| t == "1" && *n == "number"));
     }
 
+    struct Any;
+    impl HighlightStyleResolver for Any {
+        fn style(&self, _: &str) -> Option<HighlightStyle> {
+            Some(HighlightStyle::default())
+        }
+    }
+
     #[test]
     fn styles_cover_requested_range() {
         let mut h = TypstHighlighter::new();
-        h.reparse(&Rope::from("#let x = 1"));
-        struct Any;
-        impl HighlightStyleResolver for Any {
-            fn style(&self, _: &str) -> Option<HighlightStyle> {
-                Some(HighlightStyle::default())
-            }
-        }
+        h.apply(None, &Rope::from("#let x = 1"));
         let runs = h.styles(&(2..9), &Any);
         assert_eq!(runs.first().unwrap().0.start, 2);
         assert_eq!(runs.last().unwrap().0.end, 9);
         assert!(runs.windows(2).all(|w| w[0].0.end == w[1].0.start));
+    }
+
+    /// Apply `edits` one by one incrementally; the tree must match a fresh
+    /// parse of the final text.
+    #[test]
+    fn incremental_edits_match_a_fresh_parse() {
+        let mut h = TypstHighlighter::new();
+        let mut text = String::from("= 标题\n\n正文 *加粗* 与 $x^2$。\n#let f(x) = x + 1\n");
+        h.apply(None, &Rope::from(text.as_str()));
+        let edits: [(usize, usize, &str); 4] = [
+            (0, 0, "#set page(width: 10cm)\n"),
+            (5, 9, "text"),
+            (2, 2, "中文插入"),
+            (10, 25, ""),
+        ];
+        for (start, old_len, insert) in edits {
+            let start = (0..=start.min(text.len()))
+                .rev()
+                .find(|i| text.is_char_boundary(*i))
+                .unwrap();
+            let end = (start + old_len).min(text.len());
+            let end = (end..=text.len())
+                .find(|i| text.is_char_boundary(*i))
+                .unwrap();
+            text.replace_range(start..end, insert);
+            let edit = InputEdit {
+                start_byte: start,
+                old_end_byte: end,
+                new_end_byte: start + insert.len(),
+                start_position: gpui_kit::base::input::Point::new(0, 0),
+                old_end_position: gpui_kit::base::input::Point::new(0, 0),
+                new_end_position: gpui_kit::base::input::Point::new(0, 0),
+            };
+            h.apply(Some(&edit), &Rope::from(text.as_str()));
+            assert_eq!(h.source.text(), text);
+        }
+        assert_eq!(
+            compute_spans(&h.source),
+            compute_spans(&Source::detached(text.as_str()))
+        );
+    }
+
+    #[test]
+    fn inconsistent_edits_fall_back_to_a_full_replace() {
+        let mut h = TypstHighlighter::new();
+        h.apply(None, &Rope::from("abc"));
+        let bogus = InputEdit {
+            start_byte: 50,
+            old_end_byte: 60,
+            new_end_byte: 70,
+            start_position: gpui_kit::base::input::Point::new(0, 0),
+            old_end_position: gpui_kit::base::input::Point::new(0, 0),
+            new_end_position: gpui_kit::base::input::Point::new(0, 0),
+        };
+        h.apply(Some(&bogus), &Rope::from("= changed"));
+        assert_eq!(h.source.text(), "= changed");
     }
 }

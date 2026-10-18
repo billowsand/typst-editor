@@ -45,6 +45,52 @@ pub(crate) struct InnerState {
     pub page_hashes: Vec<u64>,
     pub last_compile_ok: bool,
     pub current_request_id: u64, // Track current compile request for deduplication
+    /// What the cached `document` was compiled from. The fast path may only
+    /// reuse it when all of these still match.
+    pub doc_key: Option<DocKey>,
+    /// Bumped by every successful compile; identifies a document snapshot.
+    pub revision: u64,
+    /// Bumped by `reset_session`; a compile that started in an older session
+    /// must not store its results.
+    pub session: u64,
+    /// Warnings (and their structured form) of the cached document, returned
+    /// again when the cache is reused so squiggles do not disappear.
+    pub doc_warnings: Vec<String>,
+    pub doc_diagnostics: Vec<DiagnosticInfo>,
+}
+
+/// Identity of a compiled document: its entry, root, the in-memory overlays
+/// it saw and the on-disk files it read.
+#[derive(Clone, PartialEq)]
+pub(crate) struct DocKey {
+    entry: PathBuf,
+    root: PathBuf,
+    overlays: u64,
+    deps: Vec<(PathBuf, Option<FileStamp>)>,
+}
+
+/// Cheap change detector for a file on disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct FileStamp {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl FileStamp {
+    fn of(path: &Path) -> Option<Self> {
+        let meta = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: meta.modified().ok(),
+            len: meta.len(),
+        })
+    }
+}
+
+/// Options for a single compile request.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct CompileOptions {
+    /// Skip the cached document and recompile from scratch (F5).
+    pub force: bool,
 }
 
 impl CompilerState {
@@ -62,6 +108,11 @@ impl CompilerState {
                 page_hashes: Vec::new(),
                 last_compile_ok: false,
                 current_request_id: 0,
+                doc_key: None,
+                revision: 0,
+                session: 0,
+                doc_warnings: Vec::new(),
+                doc_diagnostics: Vec::new(),
             })),
         }
     }
@@ -106,6 +157,7 @@ impl CompilerState {
                     .as_ref()
                     .map(|p| p.display().to_string()),
                 pinned_entry_path,
+                revision: state.revision,
             },
             None => CompileResult {
                 pinned_entry_path,
@@ -146,6 +198,10 @@ impl CompilerState {
         state.page_hashes.clear();
         state.last_compile_ok = false;
         state.current_request_id = 0;
+        state.doc_key = None;
+        state.doc_warnings.clear();
+        state.doc_diagnostics.clear();
+        state.session += 1;
     }
 
     /// Update any file content and compile with request ID tracking for deduplication.
@@ -155,187 +211,123 @@ impl CompilerState {
         file_path: &str,
         content: &str,
     ) -> CompileResult {
+        self.compile_file(file_path, content, CompileOptions::default())
+    }
+
+    /// Update any file content and compile the resolved entry for it.
+    pub fn update_file_and_compile(&self, file_path: &str, content: &str) -> CompileResult {
+        self.compile_file(file_path, content, CompileOptions::default())
+    }
+
+    /// Record `content` as the editor text of `file_path`, then compile the
+    /// entry that file belongs to.
+    ///
+    /// The cached document is reused only when it was compiled from the same
+    /// entry and root, the same in-memory overlays, and dependency files that
+    /// are unchanged on disk. The typst compile itself runs without holding
+    /// the state lock, so readers (preview, IDE queries) never wait for it;
+    /// callers serialize compiles with [`Self::compile_lock`].
+    pub fn compile_file(
+        &self,
+        file_path: &str,
+        content: &str,
+        options: CompileOptions,
+    ) -> CompileResult {
         let abs = match absolutize_editor_path(file_path) {
             Ok(path) => path,
-            Err(err) => {
-                return CompileResult::error(vec![err]);
-            }
-        };
-
-        let mut state = self.inner.write();
-
-        let entry = resolve_entry_for_file(&state, &abs);
-        let previous_entry = state.preview_entry.clone();
-        let previous_entry_content = match load_overlay_or_disk(&state, &entry) {
-            Ok(content) => content,
             Err(err) => return CompileResult::error(vec![err]),
         };
 
-        let root = resolve_access_root_for_path(&entry);
-        trace_import(format!(
-            "compile request file={} entry={} root={} pinned_entry={}",
-            abs.display(),
-            entry.display(),
-            root.display(),
+        // Phase 1: record the overlay, then use the cache or prepare a world.
+        let (world, entry, root, overlays, overlay_paths, session) = {
+            let mut state = self.inner.write();
+            state.overlays.insert(abs.clone(), content.to_string());
             state
-                .pinned_preview_entry
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "<none>".to_string())
-        ));
+                .overlay_hashes
+                .insert(abs.clone(), hash_content(content));
 
-        // Check if any file content actually changed (compare BEFORE updating hashes)
-        let content_hash = hash_content(content);
-        let previous_entry_hash = hash_content(&previous_entry_content);
+            let entry = resolve_entry_for_file(&state, &abs);
+            let root = resolve_access_root_for_path(&entry);
+            let overlays = overlay_fingerprint(&state.overlay_hashes);
+            trace_import(format!(
+                "compile request file={} entry={} root={} force={}",
+                abs.display(),
+                entry.display(),
+                root.display(),
+                options.force
+            ));
 
-        // Save OLD hashes for comparison
-        let old_entry_hash = state.overlay_hashes.get(&entry).copied();
-        let old_overlay_hashes = state.overlay_hashes.clone();
+            let cache_valid = !options.force
+                && state.last_compile_ok
+                && state.document.is_some()
+                && state.doc_key.as_ref().is_some_and(|key| {
+                    key.entry == entry
+                        && key.root == root
+                        && key.overlays == overlays
+                        && key
+                            .deps
+                            .iter()
+                            .all(|(path, stamp)| FileStamp::of(path) == *stamp)
+                });
+            if cache_valid {
+                state.preview_entry = Some(entry.clone());
+                state.route_table.insert(abs, entry);
+                return Self::cached_result(&state);
+            }
 
-        // Update hashes AFTER comparison (so next request can detect future changes)
-        state.overlays.insert(abs.clone(), content.to_string());
-        state.overlay_hashes.insert(abs.clone(), content_hash);
-
-        let entry_content = if entry == abs {
-            content.to_string()
-        } else {
-            match load_overlay_or_disk(&state, &entry) {
+            let entry_content = match load_overlay_or_disk(&state, &entry) {
                 Ok(content) => content,
                 Err(err) => return CompileResult::error(vec![err]),
-            }
-        };
-
-        // Check if ANY overlay file changed (not just the entry file)
-        let mut any_overlay_changed = old_entry_hash != Some(previous_entry_hash);
-
-        // Check for changed overlays
-        for (path, old_hash) in old_overlay_hashes.iter() {
-            if let Some(new_hash) = state.overlay_hashes.get(path) {
-                if old_hash != new_hash {
-                    any_overlay_changed = true;
-                    break;
-                }
-            }
-        }
-
-        // Check for NEW overlays (files that are in state.overlay_hashes but not in old_overlay_hashes)
-        if !any_overlay_changed {
-            for path in state.overlay_hashes.keys() {
-                if !old_overlay_hashes.contains_key(path) {
-                    any_overlay_changed = true;
-                    break;
-                }
-            }
-        }
-
-        if !any_overlay_changed
-            && state.world.is_some()
-            && state.document.is_some()
-            && state.last_compile_ok
-        {
-            // No overlay content changed, reuse previous results
-            let page_count = state.document.as_ref().unwrap().pages.len();
-            let page_hashes = state.page_hashes.clone();
-            let entry_path_str = entry.display().to_string();
-
-            state.preview_entry = Some(entry.clone());
-
-            // Update route table
-            if let Some(world) = &state.world {
-                for dep in world.depended_paths() {
-                    state.route_table.insert(dep, entry.clone());
-                }
-            }
-            state.route_table.insert(abs, entry);
-
-            return CompileResult {
-                success: true,
-                page_count,
-                page_hashes,
-                outline: vec![],
-                errors: vec![],
-                warnings: vec![],
-                diagnostics: vec![],
-                duration_ms: 0,
-                entry_path: Some(entry_path_str),
-                pinned_entry_path: state
-                    .pinned_preview_entry
-                    .as_ref()
-                    .map(|path| path.display().to_string()),
             };
-        }
-
-        let can_reuse_world = state.world.as_ref().is_some_and(|world| {
-            world.main_path() == entry.as_path() && world.root() == root.as_path()
-        });
-        trace_import(format!(
-            "world reuse={} existing_world={} existing_doc={}",
-            can_reuse_world,
-            state.world.is_some(),
-            state.document.is_some()
-        ));
-
-        let mut world = if can_reuse_world {
-            match state.world.take() {
-                Some(mut world) => {
-                    trace_import("reusing existing world");
-                    world.update_source(&entry_content);
-                    world.reset_touched_paths();
-                    world
+            let reusable = state
+                .world
+                .as_ref()
+                .is_some_and(|w| w.main_path() == entry.as_path() && w.root() == root.as_path());
+            let mut world = if reusable {
+                let mut world = state.world.take().expect("checked above");
+                world.update_source(&entry_content);
+                world.reset_touched_paths();
+                world
+            } else {
+                match TypstWorld::new_with_root(
+                    entry.to_string_lossy().as_ref(),
+                    &entry_content,
+                    &root,
+                ) {
+                    Ok(world) => world,
+                    Err(err) => {
+                        return CompileResult::error(vec![format!(
+                            "Failed to create TypstWorld: {err}"
+                        )])
+                    }
                 }
-                None => unreachable!("world reuse checked above"),
-            }
-        } else {
-            trace_import("creating new world");
-            match TypstWorld::new_with_root(entry.to_string_lossy().as_ref(), &entry_content, &root)
-            {
-                Ok(world) => world,
-                Err(err) => {
-                    return CompileResult::error(vec![format!(
-                        "Failed to create TypstWorld: {err}"
-                    )])
+            };
+            // Every overlay inside the root, not just changed ones: a fresh
+            // world has none of them yet. Identical text is skipped cheaply.
+            for (path, overlay) in state.overlays.iter() {
+                if *path == entry || !path_starts_with_root(path, &root) {
+                    continue;
+                }
+                if let Err(err) =
+                    world.update_source_by_path(path.to_string_lossy().as_ref(), overlay)
+                {
+                    return CompileResult::error(vec![err]);
                 }
             }
+            let overlay_paths: Vec<PathBuf> = state.overlays.keys().cloned().collect();
+            (world, entry, root, overlays, overlay_paths, state.session)
         };
 
-        // Only update overlays for files that have changed (compare with OLD hashes)
-        for (path, overlay) in state.overlays.iter() {
-            if *path == entry || !path_starts_with_root(path, &root) {
-                continue;
-            }
-
-            let path_hash = hash_content(overlay);
-            if old_overlay_hashes.get(path) == Some(&path_hash) {
-                // Content unchanged, skip world update
-                continue;
-            }
-
-            if let Err(err) = world.update_source_by_path(path.to_string_lossy().as_ref(), overlay)
-            {
-                return CompileResult::error(vec![err]);
-            }
-        }
-
+        // Phase 2: compile without holding the state lock.
         let start = std::time::Instant::now();
         let result = typst::compile::<PagedDocument>(&world);
         let duration = start.elapsed();
 
         let mut compile_result = CompileResult {
-            success: false,
-            page_count: 0,
-            page_hashes: vec![],
-            outline: vec![],
-            errors: vec![],
-            warnings: vec![],
-            diagnostics: vec![],
             duration_ms: duration.as_millis() as u64,
             entry_path: Some(entry.display().to_string()),
-            pinned_entry_path: state
-                .pinned_preview_entry
-                .as_ref()
-                .map(|path| path.display().to_string()),
+            ..CompileResult::error(vec![])
         };
-
         for warning in &result.warnings {
             compile_result
                 .warnings
@@ -344,79 +336,180 @@ impl CompilerState {
                 .diagnostics
                 .extend(diagnostic_info(warning, &world));
         }
+        let depended_paths = world.depended_paths();
+        // Files read from disk, stamped so the cache notices outside edits.
+        let deps: Vec<(PathBuf, Option<FileStamp>)> = depended_paths
+            .iter()
+            .filter(|path| !overlay_paths.contains(path))
+            .map(|path| (path.clone(), FileStamp::of(path)))
+            .collect();
+        let output = match result.output {
+            Ok(doc) => Some(doc),
+            Err(errors) => {
+                for error in errors.iter() {
+                    compile_result.errors.push(format_diagnostic(error, &world));
+                    compile_result
+                        .diagnostics
+                        .extend(diagnostic_info(error, &world));
+                }
+                None
+            }
+        };
 
-        match result.output {
-            Ok(doc) => {
+        // Phase 3: store, unless the session was reset meanwhile.
+        let mut state = self.inner.write();
+        if state.session != session {
+            return CompileResult::error(vec!["Session was reset during compilation".into()]);
+        }
+        compile_result.pinned_entry_path = state
+            .pinned_preview_entry
+            .as_ref()
+            .map(|path| path.display().to_string());
+        let previous_doc_entry = state.doc_key.as_ref().map(|k| k.entry.clone());
+        state.preview_entry = Some(entry.clone());
+        state.world = Some(world);
+        for dep in depended_paths {
+            state.route_table.insert(dep, entry.clone());
+        }
+        state.route_table.insert(abs, entry.clone());
+
+        match output {
+            Some(doc) => {
                 trace_import(format!(
                     "compile success entry={} pages={}",
                     entry.display(),
                     doc.pages.len()
                 ));
-                // Keep cached SVG strings only for pages whose structural hash stayed stable.
-                let mut rendered_pages: Vec<Option<String>> = Vec::with_capacity(doc.pages.len());
-                let mut page_hashes: Vec<u64> = Vec::with_capacity(doc.pages.len());
-
+                // Keep cached SVG strings only for pages whose hash is stable.
+                let mut rendered_pages = Vec::with_capacity(doc.pages.len());
+                let mut page_hashes = Vec::with_capacity(doc.pages.len());
                 for (i, page) in doc.pages.iter().enumerate() {
                     let new_hash = hash_page(page);
-                    let cached_svg = match (state.rendered_pages.get(i), state.page_hashes.get(i)) {
-                        (Some(old_svg), Some(old_hash)) if *old_hash == new_hash => old_svg.clone(),
+                    let cached = match (state.rendered_pages.get(i), state.page_hashes.get(i)) {
+                        (Some(svg), Some(old)) if *old == new_hash => svg.clone(),
                         _ => None,
                     };
-
-                    rendered_pages.push(cached_svg);
+                    rendered_pages.push(cached);
                     page_hashes.push(new_hash);
                 }
-
-                let depended_paths = world.depended_paths();
-
+                state.revision += 1;
                 compile_result.success = true;
                 compile_result.page_count = doc.pages.len();
                 compile_result.page_hashes = page_hashes.clone();
-
-                state.preview_entry = Some(entry.clone());
-                state.world = Some(world);
+                compile_result.revision = state.revision;
                 state.document = Some(Arc::new(doc));
                 state.rendered_pages = rendered_pages;
                 state.page_hashes = page_hashes;
                 state.last_compile_ok = true;
-
-                for dep in depended_paths {
-                    state.route_table.insert(dep, entry.clone());
-                }
-                state.route_table.insert(abs, entry);
+                state.doc_key = Some(DocKey {
+                    entry,
+                    root,
+                    overlays,
+                    deps,
+                });
+                state.doc_warnings = compile_result.warnings.clone();
+                state.doc_diagnostics = compile_result.diagnostics.clone();
             }
-            Err(errors) => {
+            None => {
                 trace_import(format!(
                     "compile failure entry={} error_count={}",
                     entry.display(),
-                    errors.len()
+                    compile_result.errors.len()
                 ));
-                for error in errors {
-                    compile_result
-                        .errors
-                        .push(format_diagnostic(&error, &world));
-                    compile_result
-                        .diagnostics
-                        .extend(diagnostic_info(&error, &world));
-                }
-                state.preview_entry = Some(entry);
-                state.world = Some(world);
-                if previous_entry.as_ref() != state.preview_entry.as_ref() {
+                // The old document stays on screen only if it is this
+                // entry's; another entry's document must not pass as current.
+                if previous_doc_entry.as_ref() != Some(&entry) {
                     state.document = None;
                     state.rendered_pages.clear();
                     state.page_hashes.clear();
                 }
                 state.last_compile_ok = false;
+                state.doc_key = state
+                    .doc_key
+                    .take()
+                    .filter(|key| key.entry == entry)
+                    .map(|key| DocKey {
+                        // Never valid for the fast path: the source changed.
+                        overlays: key.overlays.wrapping_add(1),
+                        ..key
+                    });
             }
         }
-
         compile_result
     }
 
-    /// Update any file content and compile the resolved entry for it.
-    pub fn update_file_and_compile(&self, file_path: &str, content: &str) -> CompileResult {
-        // Use max ID as sentinel for direct calls (e.g., from open_file/set_preview_entry)
-        self.update_file_and_compile_with_id(u64::MAX, file_path, content)
+    /// The cached document as a compile result (fast path).
+    fn cached_result(state: &InnerState) -> CompileResult {
+        CompileResult {
+            success: true,
+            page_count: state.document.as_ref().map_or(0, |d| d.pages.len()),
+            page_hashes: state.page_hashes.clone(),
+            entry_path: state
+                .preview_entry
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            pinned_entry_path: state
+                .pinned_preview_entry
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            revision: state.revision,
+            warnings: state.doc_warnings.clone(),
+            diagnostics: state.doc_diagnostics.clone(),
+            ..CompileResult::error(vec![])
+        }
+    }
+
+    /// Identifies the current session; changes on every `reset_session`.
+    /// Background work captures it and gives up if it no longer matches.
+    pub fn session_id(&self) -> u64 {
+        self.inner.read().session
+    }
+
+    /// Forget unsaved editor text for `file_path` and use `disk_text`
+    /// instead (the user discarded their edits). Takes effect immediately
+    /// for the next compile; does not compile by itself.
+    pub fn discard_overlay(&self, file_path: &str, disk_text: &str) {
+        let Ok(abs) = absolutize_editor_path(file_path) else {
+            return;
+        };
+        let mut state = self.inner.write();
+        if !state.overlays.contains_key(&abs) {
+            return;
+        }
+        state.overlays.insert(abs.clone(), disk_text.to_string());
+        state
+            .overlay_hashes
+            .insert(abs.clone(), hash_content(disk_text));
+        // A world currently stored has the discarded text: update it too.
+        if let Some(world) = state.world.as_mut() {
+            if world.main_path() == abs.as_path() {
+                world.update_source(disk_text);
+            } else {
+                let _ = world.update_source_by_path(abs.to_string_lossy().as_ref(), disk_text);
+            }
+        }
+        state.doc_key = None;
+    }
+
+    /// Whether a file the current document read from disk has changed
+    /// since it was compiled (an edit made outside the editor).
+    pub fn dependencies_changed(&self) -> bool {
+        let deps = match self.inner.read().doc_key.as_ref() {
+            Some(key) => key.deps.clone(),
+            None => return false,
+        };
+        deps.iter()
+            .any(|(path, stamp)| FileStamp::of(path) != *stamp)
+    }
+
+    /// The entry the cached document was compiled from.
+    pub fn document_entry(&self) -> Option<PathBuf> {
+        self.inner.read().doc_key.as_ref().map(|k| k.entry.clone())
+    }
+
+    /// Revision of the cached document (0 before the first success).
+    pub fn revision(&self) -> u64 {
+        self.inner.read().revision
     }
 
     /// Render a specific page as SVG.
@@ -477,6 +570,14 @@ impl CompilerState {
         }
         if !state.last_compile_ok {
             return Err("Last compilation had errors. Fix errors before exporting.".into());
+        }
+        // Never export a document compiled from a different entry than the
+        // one the preview now shows.
+        let doc_entry = state.doc_key.as_ref().map(|k| &k.entry);
+        if doc_entry.is_none() || doc_entry != state.preview_entry.as_ref() {
+            return Err(
+                "The compiled document does not match the current entry; recompile first.".into(),
+            );
         }
         let doc = state.document.as_ref().unwrap();
         let options = typst_pdf::PdfOptions {
@@ -564,6 +665,8 @@ pub struct CompileResult {
     pub duration_ms: u64,
     pub entry_path: Option<String>,
     pub pinned_entry_path: Option<String>,
+    /// Revision of the document this result describes (0 when none).
+    pub revision: u64,
 }
 
 impl CompileResult {
@@ -579,6 +682,7 @@ impl CompileResult {
             duration_ms: 0,
             entry_path: None,
             pinned_entry_path: None,
+            revision: 0,
         }
     }
 }
@@ -665,6 +769,15 @@ pub(crate) fn hash_page(page: &typst::layout::Page) -> u64 {
 }
 
 /// Hash content for incremental compilation detection
+/// Order-independent fingerprint of all overlay contents.
+fn overlay_fingerprint(hashes: &HashMap<PathBuf, u64>) -> u64 {
+    let mut entries: Vec<_> = hashes.iter().collect();
+    entries.sort();
+    let mut hasher = DefaultHasher::new();
+    entries.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn hash_content(content: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     content.hash(&mut hasher);
