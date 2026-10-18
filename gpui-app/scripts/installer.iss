@@ -15,6 +15,7 @@
 [Setup]
 AppId={{65A338F8-9058-4477-BD7B-E21BA3D8CE04}
 AppName=字笺 · Typst
+AppMutex=Local\ZijianTypstEditorRunning
 AppVersion={#AppVersion}
 AppPublisher=Zijian Contributors
 AppPublisherURL=https://github.com/billowsand/typst-editor

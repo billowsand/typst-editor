@@ -16,4 +16,6 @@ pwsh gpui-app/scripts/package-windows.ps1 -IsccPath 'C:\tools\Inno Setup 6\ISCC.
 
 安装向导的中文翻译固定保存在 `scripts/languages/`，不依赖构建机的额外语言包。
 
+程序启动时创建 `Local\ZijianTypstEditorRunning` 命名互斥体，安装器与卸载器据此要求先关闭正在运行的编辑器，避免删除仍被使用的程序和示例。
+
 当前构建不含代码签名证书。正式对外分发时可在构建流程中接入组织持有的 Authenticode 证书；不要把证书私钥提交到仓库。

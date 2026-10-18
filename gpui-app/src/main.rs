@@ -23,6 +23,8 @@ use crate::settings::Settings;
 
 fn main() {
     logging::init();
+    #[cfg(windows)]
+    mark_running_for_installer();
 
     // Font discovery is slow; warm the shared cache before the first compile.
     std::thread::spawn(|| {
@@ -69,4 +71,22 @@ fn main() {
                 cx.quit();
             }
         });
+}
+
+/// Inno Setup checks this marker before upgrading or uninstalling. Keep it
+/// alive until process termination; multiple editor windows may share it.
+#[cfg(windows)]
+fn mark_running_for_installer() {
+    let name: Vec<u16> = "Local\\ZijianTypstEditorRunning\0".encode_utf16().collect();
+    // SAFETY: name is NUL-terminated and lives through the call. The handle
+    // deliberately remains open until Windows closes it with the process.
+    let handle = unsafe {
+        windows_sys::Win32::System::Threading::CreateMutexW(std::ptr::null(), 0, name.as_ptr())
+    };
+    if handle.is_null() {
+        logging::warn(&format!(
+            "installer running marker failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
 }

@@ -24,6 +24,9 @@ typst-core = { path = "../crates/typst-core" }
 [build-dependencies]
 embed-resource = "3.0.12"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+
 # Typst compile and GPUI paint are both far too slow unoptimized; keep our own
 # crate at -O0 for fast rebuilds but optimize every dependency.
 [profile.dev.package."*"]
