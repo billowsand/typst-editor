@@ -2,10 +2,12 @@ name: GPUI Windows
 
 # Test and package the GPUI front end from a clean checkout. The packaged
 # Installer and ZIP (with checksums) are uploaded as workflow artifacts.
+# Pushing a `gpui-v*` tag additionally publishes them as a GitHub Release.
 
 on:
   push:
     branches: [main, "feat/**"]
+    tags: ["gpui-v*"]
     paths:
       - "crates/typst-core/**"
       - "gpui-app/**"
@@ -54,3 +56,52 @@ jobs:
             dist/*-Setup.exe
             dist/*-Setup.exe.sha256
           if-no-files-found: error
+
+  # Pushing `gpui-v<version>` turns the artifacts of that run into a public
+  # GitHub Release. The tag must match gpui-app/Cargo.toml, otherwise the
+  # published installer would disagree with the crate version.
+  release:
+    if: startsWith(github.ref, 'refs/tags/gpui-v')
+    needs: package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          WORKSPACE: ${{ github.workspace }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' "$WORKSPACE/gpui-app/Cargo.toml" | head -1)
+          echo "Tag ${TAG#gpui-v} vs Cargo.toml ${version}"
+          test "${TAG#gpui-v}" = "$version"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: zijian-windows-x64
+          path: dist
+
+      - name: Verify assets
+        shell: bash
+        run: |
+          shopt -s nullglob
+          missing=0
+          for pattern in 'dist/*.zip' 'dist/*.zip.sha256' 'dist/*-Setup.exe' 'dist/*-Setup.exe.sha256'; do
+            files=($pattern)
+            echo "${pattern}: ${#files[@]} file(s)"
+            [ ${#files[@]} -ge 1 ] || missing=1
+          done
+          [ $missing -eq 0 ] || { echo "missing assets"; exit 1; }
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "字笺 · Typst ${TAG#gpui-v}" \
+            --notes-from-tag \
+            dist/*.zip dist/*.zip.sha256 dist/*-Setup.exe dist/*-Setup.exe.sha256
