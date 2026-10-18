@@ -1,8 +1,9 @@
 //! Root view, dressed as a Smartisan Notes desk: a walnut title bar, a birch
-//! desk holding paper cards (documents, outline), a ruled notepad (editor)
-//! and the typeset pages (preview), and a walnut status strip.
+//! desk holding paper cards (documents or the file tree, and the outline),
+//! a ruled notepad (editor), the typeset pages (preview) and a walnut status
+//! strip.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -12,7 +13,10 @@ use gpui_kit::component::highlighter::{Diagnostic, DiagnosticSeverity};
 use gpui_kit::component::input::{
     Editor, EditorState, Input, InputEvent, InputState, RopeExt, TabSize,
 };
+use gpui_kit::component::list::ListItem;
 use gpui_kit::component::menu::DropdownMenu;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::tree::{TreeItem, TreeState, tree};
 use gpui_kit::component::{Sizable, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
@@ -23,6 +27,7 @@ use crate::lsp::{ActivePath, TypstLsp};
 use crate::preview::{PreviewEvent, PreviewPanel};
 use crate::skin::*;
 use crate::theme::*;
+use crate::workspace::{Workspace, normalize};
 
 actions!(
     typst_editor,
@@ -30,13 +35,21 @@ actions!(
         OpenFile,
         OpenFolder,
         Save,
+        CloseTab,
         ZoomIn,
         ZoomOut,
         ZoomReset,
+        FitWidth,
         Recompile,
         ExportPdf,
         ToggleSidebar,
         ToggleOutline,
+        ToggleCompact,
+        FontBigger,
+        FontSmaller,
+        FontReset,
+        RevealProject,
+        Rescan,
         OpenDemo,
         UndoEdit,
         RedoEdit,
@@ -44,36 +57,46 @@ actions!(
     ]
 );
 
+/// Open a document by path (title and tab dropdowns).
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = typst_editor, no_json)]
+struct OpenDocument {
+    path: String,
+}
+
 /// Debounce between the last keystroke and a compile.
 const COMPILE_DEBOUNCE: Duration = Duration::from_millis(120);
 /// Debounce between cursor movement and the preview marker update.
 const CURSOR_DEBOUNCE: Duration = Duration::from_millis(60);
-/// Directories never scanned for documents.
+/// Directories never scanned.
 const IGNORED_DIRS: &[&str] = &["target", "node_modules"];
+/// Extensions opened in the editor; everything else is revealed on disk.
+const TEXT_EXTS: &[&str] = &[
+    "typ", "bib", "yml", "yaml", "toml", "txt", "csv", "json", "xml", "md", "svg", "tex",
+];
 
-/// Notepad geometry: the tinted margin strip and the writing line pitch.
+/// Notepad geometry: the tinted margin strip, and the top padding the
+/// gpui-kit editor puts above its first line (the rules align to it).
 const MARGIN_W: f32 = 44.;
-const LINE_H: f32 = 30.;
-/// Top padding the gpui-kit editor puts above its first line.
 const EDITOR_TOP_PAD: f32 = 4.;
+const DEFAULT_FONT: f32 = 15.;
+/// Height of a row on lined cards (outline, file tree, dialogs).
+const ROW_H: f32 = 30.;
 
 pub fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("secondary-o", OpenFile, None),
         KeyBinding::new("secondary-shift-o", OpenFolder, None),
         KeyBinding::new("secondary-s", Save, None),
+        KeyBinding::new("secondary-w", CloseTab, None),
         KeyBinding::new("secondary-=", ZoomIn, None),
         KeyBinding::new("secondary--", ZoomOut, None),
         KeyBinding::new("secondary-0", ZoomReset, None),
+        KeyBinding::new("secondary-9", FitWidth, None),
         KeyBinding::new("secondary-b", ToggleSidebar, None),
         KeyBinding::new("secondary-shift-e", ExportPdf, None),
         KeyBinding::new("f5", Recompile, None),
     ]);
-}
-
-struct Buffer {
-    saved: String,
-    current: String,
 }
 
 /// A `.typ` file shown as a note card.
@@ -82,9 +105,62 @@ struct DocCard {
     path: String,
     /// Path relative to the project root, with `/` separators.
     rel: String,
-    /// First heading of the file, else its first line, else its name.
+    /// First heading or comment of the file, else its name.
     title: String,
     modified: Option<SystemTime>,
+}
+
+/// Plain (Send) mirror of a file tree entry, built off the UI thread.
+#[derive(Clone)]
+struct TreeNode {
+    path: String,
+    name: String,
+    children: Option<Vec<TreeNode>>,
+}
+
+impl TreeNode {
+    /// Convert to tree items; with a query, keep only matches and the
+    /// folders leading to them (expanded).
+    fn to_item(&self, depth: usize, query: &str) -> Option<TreeItem> {
+        let matches = query.is_empty() || self.name.to_lowercase().contains(query);
+        match &self.children {
+            Some(children) => {
+                let kids: Vec<_> = children
+                    .iter()
+                    .filter_map(|c| c.to_item(depth + 1, if matches { "" } else { query }))
+                    .collect();
+                if !matches && kids.is_empty() {
+                    return None;
+                }
+                Some(
+                    TreeItem::new(self.path.clone(), self.name.clone())
+                        .expanded(depth == 0 || !query.is_empty())
+                        .children(kids),
+                )
+            }
+            None => matches.then(|| TreeItem::new(self.path.clone(), self.name.clone())),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Nav {
+    /// `.typ` files as note cards.
+    Drafts,
+    /// The whole project as a directory tree.
+    Files,
+}
+
+/// Something waiting on a decision about unsaved edits.
+#[derive(Clone)]
+enum Pending {
+    /// Switch to another project, then optionally open a file in it.
+    Switch {
+        root: PathBuf,
+        open: Option<PathBuf>,
+    },
+    CloseTab(String),
+    CloseWindow,
 }
 
 enum CompileStatus {
@@ -98,14 +174,15 @@ pub struct TypstEditorApp {
     editor: Entity<EditorState>,
     preview: Entity<PreviewPanel>,
     search: Entity<InputState>,
+    tree_state: Entity<TreeState>,
     query: String,
-    project_root: Option<PathBuf>,
+    ws: Workspace,
+    /// Mirror of `ws.active()` shared with the completion provider.
     active_path: ActivePath,
-    buffers: HashMap<String, Buffer>,
     cards: Vec<DocCard>,
+    tree_nodes: Vec<TreeNode>,
     resources: usize,
     starred: HashSet<String>,
-    dirty: bool,
     char_count: usize,
     last_cursor: usize,
     compiling: bool,
@@ -114,10 +191,17 @@ pub struct TypstEditorApp {
     cursor_task: Task<()>,
     notice_task: Task<()>,
     outline: Vec<OutlineItem>,
+    nav: Nav,
     show_sidebar: bool,
-    show_outline: bool,
+    outline_open: bool,
     show_about: bool,
     notice: Option<String>,
+    pending: Option<Pending>,
+    dialog_focus: FocusHandle,
+    tabs_scroll: ScrollHandle,
+    /// Compact code mode: line numbers, tighter lines, no ruling.
+    compact: bool,
+    font_px: f32,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -149,7 +233,8 @@ impl TypstEditorApp {
         });
 
         let preview = cx.new(|_| PreviewPanel::new(compiler.clone()));
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索文稿与标题"));
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索文稿、文件与标题"));
+        let tree_state = cx.new(|cx| TreeState::new(cx));
 
         let _subscriptions = vec![
             cx.subscribe(&editor, |this, _, event: &InputEvent, cx| {
@@ -169,6 +254,7 @@ impl TypstEditorApp {
             cx.subscribe(&search, |this, search, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.query = search.read(cx).value().trim().to_lowercase();
+                    this.refresh_tree(cx);
                     cx.notify();
                 }
             }),
@@ -182,19 +268,26 @@ impl TypstEditorApp {
             ),
         ];
 
+        // Closing the window with unsaved edits asks first.
+        let this = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |window, cx| {
+            this.update(cx, |this, cx| this.on_close_requested(window, cx))
+                .unwrap_or(true)
+        });
+
         Self {
             compiler,
             editor,
             preview,
             search,
+            tree_state,
             query: String::new(),
-            project_root: None,
+            ws: Workspace::default(),
             active_path,
-            buffers: HashMap::new(),
             cards: Vec::new(),
+            tree_nodes: Vec::new(),
             resources: 0,
             starred: HashSet::new(),
-            dirty: false,
             char_count: 0,
             last_cursor: 0,
             compiling: false,
@@ -203,70 +296,132 @@ impl TypstEditorApp {
             cursor_task: Task::ready(()),
             notice_task: Task::ready(()),
             outline: Vec::new(),
+            nav: Nav::Drafts,
             show_sidebar: true,
-            show_outline: true,
+            outline_open: true,
             show_about: false,
             notice: None,
+            pending: None,
+            dialog_focus: cx.focus_handle(),
+            tabs_scroll: ScrollHandle::new(),
+            compact: false,
+            font_px: DEFAULT_FONT,
             _subscriptions,
         }
     }
 
     fn active(&self) -> Option<String> {
-        self.active_path.borrow().clone()
+        self.ws.active().map(str::to_owned)
     }
 
     fn is_active(&self, path: &str) -> bool {
-        self.active()
-            .is_some_and(|active| Path::new(&active) == Path::new(path))
+        self.ws.is_active(path)
     }
 
-    fn is_entry(&self, path: &str) -> bool {
-        self.compiler
-            .preview_entry()
-            .is_some_and(|entry| entry == Path::new(path))
+    fn line_height(&self) -> f32 {
+        (self.font_px * if self.compact { 1.55 } else { 2.0 }).round()
     }
 
-    // ── Opening files ───────────────────────────────────────
+    fn sync_active_path(&self) {
+        *self.active_path.borrow_mut() = self.active();
+    }
 
-    /// Open a `.typ` file or a project folder.
-    pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let path = std::path::absolute(&path).unwrap_or(path);
-        if path.is_dir() {
-            self.set_project_root(path.clone(), cx);
-            if let Some(main) = find_main_file(&path) {
-                self.open_document(main.display().to_string(), window, cx);
-            }
-        } else {
-            if self.project_root.is_none() {
-                let root = typst_core::discover_project_root(&path)
-                    .or_else(|| path.parent().map(Path::to_path_buf));
-                if let Some(root) = root {
-                    self.set_project_root(root, cx);
-                }
-            }
-            self.open_document(path.display().to_string(), window, cx);
+    /// Write the editor's text into the active buffer.
+    fn stash_editor(&mut self, cx: &App) {
+        if let Some(active) = self.active() {
+            let text = self.editor.read(cx).text().to_string();
+            self.ws.set_current(&active, text);
         }
     }
 
-    fn set_project_root(&mut self, root: PathBuf, cx: &mut Context<Self>) {
-        self.compiler.reset_session();
-        self.buffers.clear();
-        self.outline.clear();
-        self.cards.clear();
-        self.project_root = Some(root);
-        self.rescan(cx);
+    // ── Projects and documents ──────────────────────────────
+
+    /// Open a `.typ` file or a project folder (command line, dialogs, demo).
+    pub fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let path = std::path::absolute(&path).unwrap_or(path);
+        let (root, file) = if path.is_dir() {
+            let main = find_main_file(&path);
+            (path, main)
+        } else {
+            let root = typst_core::discover_project_root(&path)
+                .or_else(|| path.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| path.clone());
+            (root, Some(path))
+        };
+
+        // A file inside the open project, or the open project again: no
+        // session reset, just show the file.
+        let same_project = self.ws.is_root(&root)
+            || file
+                .as_ref()
+                .is_some_and(|f| self.ws.root().is_some() && self.ws.contains(f));
+        if same_project {
+            if let Some(file) = file {
+                self.open_document(file.display().to_string(), window, cx);
+            }
+            return;
+        }
+        self.request(Pending::Switch { root, open: file }, window, cx);
     }
 
-    /// Re-read the project's documents for the card list.
+    /// Start a fresh session for `root`. Unsaved edits were resolved by
+    /// the caller; everything tied to the old project is dropped, and work
+    /// still in flight for it is ignored via the workspace generation.
+    fn switch_project(
+        &mut self,
+        root: PathBuf,
+        open: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ws.reset(Some(root));
+        self.sync_active_path();
+        self.compiler.reset_session();
+        self.compile_task = Task::ready(());
+        self.cursor_task = Task::ready(());
+        self.compiling = false;
+        self.status = CompileStatus::Idle;
+        self.outline.clear();
+        self.cards.clear();
+        self.tree_nodes.clear();
+        self.resources = 0;
+        self.char_count = 0;
+        self.preview.update(cx, |preview, cx| {
+            preview.set_document(vec![], vec![], cx);
+            preview.set_markers(vec![], cx);
+        });
+        self.editor.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+            if let Some(set) = state.diagnostics_mut() {
+                set.clear();
+            }
+        });
+        self.rescan(cx);
+        if let Some(file) = open {
+            self.open_document(file.display().to_string(), window, cx);
+        }
+        cx.notify();
+    }
+
+    /// Re-read the project for the cards and the file tree.
     fn rescan(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.project_root.clone() else {
+        let Some(root) = self.ws.root().map(Path::to_path_buf) else {
             return;
         };
+        let generation = self.ws.generation();
         cx.spawn(async move |this, cx| {
-            let (cards, resources) = cx.background_spawn(async move { scan_docs(&root) }).await;
+            let (cards, nodes, resources) = cx
+                .background_spawn(async move { scan_project(&root) })
+                .await;
             this.update(cx, |this, cx| {
+                // A scan for a project that has since been closed.
+                if this.ws.generation() != generation {
+                    return;
+                }
                 this.cards = cards;
+                this.tree_nodes = nodes;
                 this.resources = resources;
+                this.refresh_tree(cx);
                 cx.notify();
             })
             .ok();
@@ -274,51 +429,56 @@ impl TypstEditorApp {
         .detach();
     }
 
+    fn refresh_tree(&mut self, cx: &mut Context<Self>) {
+        let items: Vec<TreeItem> = self
+            .tree_nodes
+            .iter()
+            .filter_map(|n| n.to_item(0, &self.query))
+            .collect();
+        self.tree_state
+            .update(cx, |state, cx| state.set_items(items, cx));
+    }
+
     fn open_document(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active().as_deref() == Some(path.as_str()) {
+        let path = normalize(&path);
+        if self.is_active(&path) && self.ws.buffer(&path).is_some() {
             return;
         }
-        // Keep unsaved edits of the document we are leaving.
-        if let Some(previous) = self.active() {
-            let text = self.editor.read(cx).text().to_string();
-            if let Some(buffer) = self.buffers.get_mut(&previous) {
-                buffer.current = text;
-            }
+        self.stash_editor(cx);
+        if let Err(err) = self.ws.open(&path, |p| std::fs::read_to_string(p)) {
+            self.show_notice(err, cx);
+            return;
         }
-
-        if !self.buffers.contains_key(&path) {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    self.buffers.insert(
-                        path.clone(),
-                        Buffer {
-                            saved: text.clone(),
-                            current: text,
-                        },
-                    );
-                }
-                Err(err) => {
-                    self.show_notice(format!("无法读取 {path}: {err}"), cx);
-                    return;
-                }
-            }
-        }
-        let buffer = &self.buffers[&path];
-        let text = buffer.current.clone();
-        self.dirty = buffer.current != buffer.saved;
+        self.sync_active_path();
+        let text = self
+            .ws
+            .active_buffer()
+            .map(|b| b.current.clone())
+            .unwrap_or_default();
         self.char_count = count_chars(&text);
-
-        *self.active_path.borrow_mut() = Some(path.clone());
         self.last_cursor = 0;
+        let typst = is_typst(&path);
         self.editor.update(cx, |state, cx| {
-            state.set_value(text, window, cx);
+            state.set_highlighter(if typst { highlight::LANGUAGE } else { "text" }, cx);
+            state.set_value(text.clone(), window, cx);
+            if let Some(set) = state.diagnostics_mut() {
+                set.clear();
+            }
             state.focus(window, cx);
         });
+        if let Some(ix) = self.ws.tab_index(&path) {
+            self.tabs_scroll.scroll_to_item(ix);
+        }
 
-        // The first document opened becomes the preview entry; later ones
-        // route to whichever entry imports them.
-        let make_entry = self.compiler.preview_entry().is_none();
-        self.schedule_compile(Duration::ZERO, make_entry, cx);
+        if typst {
+            // The first document opened becomes the preview entry; later
+            // ones route to whichever entry imports them.
+            let make_entry = self.compiler.preview_entry().is_none();
+            self.schedule_compile(Duration::ZERO, make_entry, cx);
+        } else if self.compiler.entry_for(&path).is_some() {
+            // A bibliography or data file a document reads: recompile it.
+            self.schedule_compile(Duration::ZERO, false, cx);
+        }
         cx.notify();
     }
 
@@ -338,22 +498,74 @@ impl TypstEditorApp {
         });
     }
 
-    /// Pin `path` as the document the preview compiles (the card's pushpin).
-    fn pin_entry(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let text = match self.buffers.get(&path) {
+    /// Click on a file tree row.
+    fn open_from_tree(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let ext = Path::new(&path)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if TEXT_EXTS.contains(&ext.as_str()) {
+            self.open_document(path, window, cx);
+        } else {
+            reveal_in_file_manager(Path::new(&path));
+            self.show_notice("已在资源管理器中显示此文件", cx);
+        }
+    }
+
+    /// Pin `path` as the preview entry, or unpin it when it already is.
+    /// Runs off the UI thread: it waits for the compile lock.
+    fn toggle_pin(&mut self, path: String, cx: &mut Context<Self>) {
+        let path = normalize(&path);
+        let unpin = self
+            .compiler
+            .pinned_entry()
+            .is_some_and(|p| normalize(&p.display().to_string()) == path);
+        let text = match self.ws.buffer(&path) {
             Some(buffer) => buffer.current.clone(),
             None => std::fs::read_to_string(&path).unwrap_or_default(),
         };
         let compiler = self.compiler.clone();
-        let pinned = {
-            let _guard = compiler.compile_lock();
-            compiler.open(&path, &text).is_ok() && compiler.pin_preview_entry(Some(&path)).is_ok()
-        };
-        if pinned {
-            self.open_document(path, window, cx);
-            self.schedule_compile(Duration::ZERO, false, cx);
-            self.show_notice("已将此文稿设为预览主文件", cx);
-        }
+        let generation = self.ws.generation();
+        self.compiling = true;
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_spawn(async move {
+                    let _guard = compiler.compile_lock();
+                    if unpin {
+                        compiler.pin_preview_entry(None)
+                    } else {
+                        compiler
+                            .open(&path, &text)
+                            .and_then(|_| compiler.pin_preview_entry(Some(&path)))
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.ws.generation() != generation {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        this.show_notice(
+                            if unpin {
+                                "已取消固定，预览将自动选择入口"
+                            } else {
+                                "已固定为预览主文件"
+                            },
+                            cx,
+                        );
+                        this.schedule_compile(Duration::ZERO, false, cx);
+                    }
+                    Err(err) => {
+                        this.compiling = false;
+                        this.show_notice(format!("无法设为主文件：{err}"), cx);
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn on_open_file(&mut self, _: &OpenFile, window: &mut Window, cx: &mut Context<Self>) {
@@ -380,18 +592,128 @@ impl TypstEditorApp {
         });
         cx.spawn_in(window, async move |this, cx| {
             let path = paths.await.ok()?.ok()??.into_iter().next()?;
-            this.update_in(cx, |this, window, cx| {
-                if directories {
-                    // Opening a folder starts a fresh session.
-                    *this.active_path.borrow_mut() = None;
-                } else {
-                    this.project_root = None;
-                }
-                this.open_path(path, window, cx);
-            })
-            .ok()
+            this.update_in(cx, |this, window, cx| this.open_path(path, window, cx))
+                .ok()
         })
         .detach();
+    }
+
+    // ── Unsaved edits ───────────────────────────────────────
+
+    /// Run `action`, asking first if it would discard unsaved edits.
+    fn request(&mut self, action: Pending, window: &mut Window, cx: &mut Context<Self>) {
+        self.stash_editor(cx);
+        if self.affected_dirty(&action).is_empty() {
+            self.perform(action, false, window, cx);
+        } else {
+            self.pending = Some(action);
+            self.dialog_focus.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn affected_dirty(&self, action: &Pending) -> Vec<String> {
+        match action {
+            Pending::CloseTab(path) => self
+                .ws
+                .buffer(path)
+                .filter(|b| b.is_dirty())
+                .map(|_| vec![normalize(path)])
+                .unwrap_or_default(),
+            Pending::Switch { .. } | Pending::CloseWindow => self.ws.dirty_paths(),
+        }
+    }
+
+    fn perform(
+        &mut self,
+        action: Pending,
+        discarded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            Pending::Switch { root, open } => self.switch_project(root, open, window, cx),
+            Pending::CloseTab(path) => self.close_tab_now(path, discarded, window, cx),
+            Pending::CloseWindow => window.remove_window(),
+        }
+    }
+
+    /// The unsaved-edits dialog's answer: save first, discard, or cancel.
+    fn resolve_pending(&mut self, save: Option<bool>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(action) = self.pending.take() else {
+            return;
+        };
+        match save {
+            None => {}
+            Some(true) => {
+                let paths = self.affected_dirty(&action);
+                if self.save_paths(&paths, cx) {
+                    self.perform(action, false, window, cx);
+                } else {
+                    // Keep the edits; the notice says what failed.
+                    self.pending = None;
+                }
+            }
+            Some(false) => self.perform(action, true, window, cx),
+        }
+        cx.notify();
+    }
+
+    fn on_close_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.stash_editor(cx);
+        if self.ws.dirty_paths().is_empty() {
+            return true;
+        }
+        self.pending = Some(Pending::CloseWindow);
+        self.dialog_focus.focus(window, cx);
+        cx.notify();
+        false
+    }
+
+    fn on_close_tab(&mut self, _: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active) = self.active() {
+            self.request(Pending::CloseTab(active), window, cx);
+        }
+    }
+
+    fn close_tab_now(
+        &mut self,
+        path: String,
+        discarded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = self.ws.close(&path);
+        if discarded {
+            // The compiler still holds the discarded text; put it back to
+            // what is on disk so the preview stops showing it.
+            self.revert_overlay(path.clone(), cx);
+        }
+        if self.active().is_none() {
+            self.sync_active_path();
+            match next {
+                Some(next) => self.open_document(next, window, cx),
+                None => {
+                    self.char_count = 0;
+                    self.cursor_task = Task::ready(());
+                    self.editor
+                        .update(cx, |state, cx| state.set_value("", window, cx));
+                    self.preview
+                        .update(cx, |preview, cx| preview.set_markers(vec![], cx));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn revert_overlay(&mut self, path: String, cx: &mut Context<Self>) {
+        if !is_typst(&path) && self.compiler.entry_for(&path).is_none() {
+            return;
+        }
+        let Ok(disk) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        self.run_compile(path, disk, Duration::ZERO, false, cx);
     }
 
     // ── Editing, saving ─────────────────────────────────────
@@ -399,34 +721,42 @@ impl TypstEditorApp {
     fn on_text_changed(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.active() else { return };
         let text = self.editor.read(cx).text().to_string();
-        let Some(buffer) = self.buffers.get_mut(&path) else {
-            return;
-        };
-        if buffer.current == text {
+        let count = count_chars(&text);
+        if !self.ws.set_current(&path, text) {
             return;
         }
-        self.char_count = count_chars(&text);
-        buffer.current = text;
-        self.dirty = buffer.current != buffer.saved;
-        self.schedule_compile(COMPILE_DEBOUNCE, false, cx);
+        self.char_count = count;
+        if is_typst(&path) || self.compiler.entry_for(&path).is_some() {
+            self.schedule_compile(COMPILE_DEBOUNCE, false, cx);
+        }
         cx.notify();
     }
 
-    fn on_save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(path) = self.active() else { return };
-        let text = self.editor.read(cx).text().to_string();
-        match std::fs::write(&path, &text) {
-            Ok(()) => {
-                if let Some(buffer) = self.buffers.get_mut(&path) {
-                    buffer.saved = text.clone();
-                    buffer.current = text;
+    /// Write buffers to disk. Returns whether all succeeded.
+    fn save_paths(&mut self, paths: &[String], cx: &mut Context<Self>) -> bool {
+        self.stash_editor(cx);
+        let mut ok = true;
+        for path in paths {
+            let Some(text) = self.ws.buffer(path).map(|b| b.current.clone()) else {
+                continue;
+            };
+            match std::fs::write(path, &text) {
+                Ok(()) => self.ws.mark_saved(path),
+                Err(err) => {
+                    ok = false;
+                    self.show_notice(format!("保存失败：{err}"), cx);
                 }
-                self.dirty = false;
-                self.rescan(cx);
             }
-            Err(err) => self.show_notice(format!("保存失败：{err}"), cx),
         }
+        self.rescan(cx);
         cx.notify();
+        ok
+    }
+
+    fn on_save(&mut self, _: &Save, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(active) = self.active() {
+            self.save_paths(&[active], cx);
+        }
     }
 
     fn show_notice(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
@@ -446,12 +776,25 @@ impl TypstEditorApp {
 
     // ── Compile ─────────────────────────────────────────────
 
-    /// Compile the active document after `delay`. Replacing the task cancels
-    /// a compile that has not started yet, so only the latest text wins.
+    /// Compile the active document after `delay`.
     fn schedule_compile(&mut self, delay: Duration, make_entry: bool, cx: &mut Context<Self>) {
         let Some(path) = self.active() else { return };
         let text = self.editor.read(cx).text().to_string();
+        self.run_compile(path, text, delay, make_entry, cx);
+    }
+
+    /// Compile `path` with `text`. Replacing the task cancels a compile that
+    /// has not started; results for an older session are dropped.
+    fn run_compile(
+        &mut self,
+        path: String,
+        text: String,
+        delay: Duration,
+        make_entry: bool,
+        cx: &mut Context<Self>,
+    ) {
         let compiler = self.compiler.clone();
+        let generation = self.ws.generation();
         self.compiling = true;
 
         self.compile_task = cx.spawn(async move |this, cx| {
@@ -472,8 +815,12 @@ impl TypstEditorApp {
                     (result, sizes)
                 })
                 .await;
-            this.update(cx, |this, cx| this.apply_compile_result(result, sizes, cx))
-                .ok();
+            this.update(cx, |this, cx| {
+                if this.ws.generation() == generation {
+                    this.apply_compile_result(result, sizes, cx);
+                }
+            })
+            .ok();
         });
     }
 
@@ -510,7 +857,7 @@ impl TypstEditorApp {
             let diagnostics: Vec<_> = result
                 .diagnostics
                 .iter()
-                .filter(|d| Path::new(&d.file) == Path::new(&active))
+                .filter(|d| normalize(&d.file) == active)
                 .map(|d| {
                     let start = rope.offset_to_position(d.start.min(rope.len()));
                     let end = rope.offset_to_position(d.end.min(rope.len()));
@@ -551,7 +898,7 @@ impl TypstEditorApp {
         });
     }
 
-    // ── Zoom, export, demo ──────────────────────────────────
+    // ── View settings, export, demo ─────────────────────────
 
     fn zoom_by(&mut self, factor: Option<f32>, cx: &mut Context<Self>) {
         self.preview.update(cx, |preview, cx| {
@@ -561,21 +908,28 @@ impl TypstEditorApp {
         cx.notify();
     }
 
+    fn set_compact(&mut self, compact: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.compact = compact;
+        self.editor
+            .update(cx, |state, cx| state.set_line_number(compact, window, cx));
+        cx.notify();
+    }
+
     fn on_export_pdf(&mut self, _: &ExportPdf, window: &mut Window, cx: &mut Context<Self>) {
         if self.compiling {
             self.show_notice("正在编译，请稍后导出", cx);
             return;
         }
         let Some(entry) = self.compiler.preview_entry() else {
+            self.show_notice("还没有可导出的文档", cx);
             return;
         };
         let path = PathBuf::from(entry);
         let name = path
             .with_extension("pdf")
             .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "document.pdf".into());
         let picker = cx.prompt_for_new_path(path.parent().unwrap_or(Path::new(".")), Some(&name));
         let compiler = self.compiler.clone();
         cx.spawn_in(window, async move |this, cx| {
@@ -606,7 +960,6 @@ impl TypstEditorApp {
     }
 
     fn open_demo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.project_root = None;
         self.open_path(
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples"),
             window,
@@ -614,13 +967,21 @@ impl TypstEditorApp {
         );
     }
 
+    fn toggle_star(&mut self, path: String, cx: &mut Context<Self>) {
+        let path = normalize(&path);
+        if !self.starred.remove(&path) {
+            self.starred.insert(path);
+        }
+        cx.notify();
+    }
+
     // ── Title bar ───────────────────────────────────────────
 
     /// Like Smartisan's folder title ("全部便签"): the project folder; the
     /// dropdown beside it switches between its documents.
     fn title_text(&self) -> String {
-        self.project_root
-            .as_ref()
+        self.ws
+            .root()
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "字笺".into())
@@ -634,6 +995,8 @@ impl TypstEditorApp {
                 .h(px(28.))
                 .child(div().text_size(px(13.)).child(embossed(label)))
         };
+        let compact = self.compact;
+        let outline_open = self.outline_open;
         h_flex()
             .gap_0p5()
             .child(menu("menu-file", "文件").dropdown_menu(|m, _, _| {
@@ -641,22 +1004,33 @@ impl TypstEditorApp {
                     .menu("打开文件夹…", Box::new(OpenFolder))
                     .separator()
                     .menu("保存", Box::new(Save))
+                    .menu("关闭当前文稿", Box::new(CloseTab))
+                    .separator()
                     .menu("导出 PDF…", Box::new(ExportPdf))
             }))
             .child(menu("menu-edit", "编辑").dropdown_menu(|m, _, _| {
                 m.menu("撤销", Box::new(UndoEdit))
                     .menu("重做", Box::new(RedoEdit))
             }))
-            .child(menu("menu-view", "视图").dropdown_menu(|m, _, _| {
+            .child(menu("menu-view", "视图").dropdown_menu(move |m, _, _| {
                 m.menu("显示 / 隐藏文稿栏", Box::new(ToggleSidebar))
-                    .menu("显示 / 隐藏目录卡", Box::new(ToggleOutline))
+                    .menu_with_check("目录卡", outline_open, Box::new(ToggleOutline))
                     .separator()
+                    .menu_with_check("紧凑代码模式（行号）", compact, Box::new(ToggleCompact))
+                    .menu("增大字号", Box::new(FontBigger))
+                    .menu("减小字号", Box::new(FontSmaller))
+                    .menu("默认字号", Box::new(FontReset))
+                    .separator()
+                    .menu("预览适合宽度", Box::new(FitWidth))
+                    .menu("预览实际大小", Box::new(ZoomReset))
                     .menu("放大预览", Box::new(ZoomIn))
                     .menu("缩小预览", Box::new(ZoomOut))
-                    .menu("实际大小", Box::new(ZoomReset))
             }))
             .child(menu("menu-doc", "文档").dropdown_menu(|m, _, _| {
                 m.menu("重新编译", Box::new(Recompile))
+                    .menu("重新扫描项目", Box::new(Rescan))
+                    .menu("在资源管理器中显示项目", Box::new(RevealProject))
+                    .separator()
                     .menu("打开排版示例", Box::new(OpenDemo))
             }))
             .child(
@@ -680,6 +1054,8 @@ impl TypstEditorApp {
                     .gap_2()
                     .child(
                         div()
+                            .max_w(px(360.))
+                            .overflow_hidden()
                             .text_size(px(19.))
                             .font_weight(FontWeight::BOLD)
                             .child(embossed(self.title_text())),
@@ -710,7 +1086,11 @@ impl TypstEditorApp {
                 for (path, label) in &docs {
                     m = m.menu(label.clone(), Box::new(OpenDocument { path: path.clone() }));
                 }
-                m.separator().menu("打开文件…", Box::new(OpenFile))
+                if !docs.is_empty() {
+                    m = m.separator();
+                }
+                m.menu("打开文件夹…", Box::new(OpenFolder))
+                    .menu("打开文件…", Box::new(OpenFile))
             })
     }
 
@@ -824,7 +1204,7 @@ impl TypstEditorApp {
         )
     }
 
-    // ── Sidebar: search, document cards, outline card ───────
+    // ── Sidebar ─────────────────────────────────────────────
 
     fn render_search(&self) -> impl IntoElement {
         inset_pill()
@@ -841,25 +1221,104 @@ impl TypstEditorApp {
                     Input::new(&self.search)
                         .appearance(false)
                         .small()
+                        .cleanable(true)
                         .text_size(px(13.)),
                 ),
             )
     }
 
-    fn render_card(&self, card: &DocCard, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
-        let active = self.is_active(&card.path);
-        let entry = self.is_entry(&card.path);
-        let starred = self.starred.contains(&card.path);
-        let dirty = self
-            .buffers
-            .get(&card.path)
-            .is_some_and(|b| b.current != b.saved);
-        let path = card.path.clone();
-        let pin_path = card.path.clone();
-        let star_path = card.path.clone();
+    /// 文稿 | 文件: a recessed track with a raised paper knob.
+    fn render_nav_switch(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let segment = |id: &'static str, nav: Nav, glyph: &'static str, label: &'static str| {
+            let on = self.nav == nav;
+            h_flex()
+                .id(id)
+                .flex_1()
+                .h_full()
+                .justify_center()
+                .gap_1p5()
+                .rounded(px(5.))
+                .cursor_pointer()
+                .text_size(px(12.5))
+                .when(on, |s| {
+                    s.bg(linear_gradient(
+                        180.,
+                        linear_color_stop(rgb(0xfffdf8), 0.),
+                        linear_color_stop(rgb(0xf3ecdf), 1.),
+                    ))
+                    .border_1()
+                    .border_color(rgb(0xd6c8b2))
+                    .shadow(vec![
+                        shadow(0., 1., 1.5, 0., 0x5a3c1e40),
+                        inset(0., 1., 0., 0xffffffcc),
+                    ])
+                    .text_color(rgb(INK))
+                    .font_weight(FontWeight::SEMIBOLD)
+                })
+                .when(!on, |s| {
+                    s.text_color(rgb(INK_SOFT))
+                        .hover(|s| s.bg(rgba(0xffffff40)))
+                })
+                .child(paper_glyph(
+                    glyph,
+                    13.,
+                    if on { INK_SOFT } else { 0xa89a88 },
+                ))
+                .child(label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.nav = nav;
+                    cx.notify();
+                }))
+        };
+        h_flex()
+            .flex_none()
+            .h(px(32.))
+            .mx(px(14.))
+            .mt(px(10.))
+            .p(px(2.))
+            .gap(px(2.))
+            .rounded(px(7.))
+            .bg(rgba(0x8a6a402e))
+            .shadow(vec![
+                inset(0., 1., 2.5, 0x5a3c1e40),
+                shadow(0., 1., 0., 0., 0xffffff80),
+            ])
+            .child(segment("nav-drafts", Nav::Drafts, "files", "文稿"))
+            .child(segment("nav-files", Nav::Files, "folder", "文件"))
+    }
 
+    /// Binding strip down the left edge of a card, with its double edge.
+    fn binding_strip(tint: u32) -> Div {
         div()
-            .id(("card", ix))
+            .absolute()
+            .top_0()
+            .left_0()
+            .h_full()
+            .w(px(26.))
+            .bg(rgb(tint))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right(px(1.))
+                    .h_full()
+                    .w(px(1.))
+                    .bg(rgb(0xebe2d4)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .h_full()
+                    .w(px(1.))
+                    .bg(rgba(0xffffffcc)),
+            )
+    }
+
+    fn card_frame(id: impl Into<ElementId>, lifted: bool) -> Stateful<Div> {
+        div()
+            .id(id.into())
             .relative()
             .flex_none()
             .ml(px(10.))
@@ -872,45 +1331,40 @@ impl TypstEditorApp {
             ))
             .border_1()
             .border_color(rgba(0xb4966c40))
-            .shadow(if active {
+            .shadow(if lifted {
                 lifted_shadow()
             } else {
                 paper_shadow()
             })
+    }
+
+    fn render_card(&self, card: &DocCard, ix: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let active = self.is_active(&card.path);
+        let pinned = self
+            .compiler
+            .pinned_entry()
+            .is_some_and(|p| normalize(&p.display().to_string()) == card.path);
+        let auto_entry = !pinned
+            && self
+                .compiler
+                .preview_entry()
+                .is_some_and(|p| normalize(&p.display().to_string()) == card.path);
+        let starred = self.starred.contains(&card.path);
+        let dirty = self.ws.buffer(&card.path).is_some_and(|b| b.is_dirty());
+        let path = card.path.clone();
+        let pin_path = card.path.clone();
+        let star_path = card.path.clone();
+        let icon_well = |d: Stateful<Div>| d.p_0p5().rounded_sm().hover(|d| d.bg(rgba(0x8a6a4014)));
+
+        Self::card_frame(("card", ix), active)
             .cursor_pointer()
+            .hover(|d| d.shadow(lifted_shadow()))
             .on_click(
                 cx.listener(move |this, _, window, cx| {
                     this.open_document(path.clone(), window, cx)
                 }),
             )
-            // Binding strip with its double edge.
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .h_full()
-                    .w(px(26.))
-                    .bg(rgb(if active { 0xf3e6cd } else { BAND }))
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right(px(1.))
-                            .h_full()
-                            .w(px(1.))
-                            .bg(rgb(0xebe2d4)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .h_full()
-                            .w(px(1.))
-                            .bg(rgba(0xffffffcc)),
-                    ),
-            )
+            .child(Self::binding_strip(if active { 0xf3e6cd } else { BAND }))
             .child(
                 v_flex()
                     .relative()
@@ -934,35 +1388,48 @@ impl TypstEditorApp {
                                         None => "刚刚".into(),
                                     }),
                             )
+                            .when(auto_entry, |row| {
+                                row.child(
+                                    div()
+                                        .px_1()
+                                        .rounded_sm()
+                                        .border_1()
+                                        .border_color(rgba(0xb98c5780))
+                                        .text_size(px(10.))
+                                        .text_color(rgb(0xa8763f))
+                                        .child("入口"),
+                                )
+                            })
                             .child(
-                                div()
-                                    .id(("pin", ix))
-                                    .p_0p5()
-                                    .rounded_sm()
-                                    .hover(|d| d.bg(rgba(0x8a6a4014)))
-                                    .tooltip(|w, cx| {
-                                        gpui_kit::component::tooltip::Tooltip::new("设为预览主文件")
-                                            .build(w, cx)
+                                icon_well(div().id(("pin", ix)))
+                                    .tooltip(move |w, cx| {
+                                        Tooltip::new(if pinned {
+                                            "取消固定（恢复自动选择入口）"
+                                        } else {
+                                            "固定为预览主文件"
+                                        })
+                                        .build(w, cx)
                                     })
-                                    .child(skin(if entry { "pin_on" } else { "pin" }, 16., 16.))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                    .child(skin(if pinned { "pin_on" } else { "pin" }, 16., 16.))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        this.pin_entry(pin_path.clone(), window, cx);
+                                        this.toggle_pin(pin_path.clone(), cx);
                                     })),
                             )
                             .child(
-                                div()
-                                    .id(("star", ix))
-                                    .p_0p5()
-                                    .rounded_sm()
-                                    .hover(|d| d.bg(rgba(0x8a6a4014)))
+                                icon_well(div().id(("star", ix)))
+                                    .tooltip(move |w, cx| {
+                                        Tooltip::new(if starred {
+                                            "取消置顶"
+                                        } else {
+                                            "置顶"
+                                        })
+                                        .build(w, cx)
+                                    })
                                     .child(skin(if starred { "star_on" } else { "star" }, 16., 16.))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
-                                        if !this.starred.remove(&star_path) {
-                                            this.starred.insert(star_path.clone());
-                                        }
-                                        cx.notify();
+                                        this.toggle_star(star_path.clone(), cx);
                                     })),
                             ),
                     )
@@ -996,8 +1463,8 @@ impl TypstEditorApp {
                                     .overflow_hidden()
                                     .whitespace_nowrap()
                                     .text_ellipsis()
-                                    .text_size(px(11.5))
-                                    .text_color(rgb(FAINT))
+                                    .text_size(px(12.))
+                                    .text_color(rgb(PATH_INK))
                                     .child(card.rel.clone()),
                             ),
                     ),
@@ -1020,8 +1487,252 @@ impl TypstEditorApp {
             })
     }
 
+    fn render_drafts(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let query = &self.query;
+        let mut cards: Vec<&DocCard> = self
+            .cards
+            .iter()
+            .filter(|c| {
+                query.is_empty()
+                    || c.title.to_lowercase().contains(query)
+                    || c.rel.to_lowercase().contains(query)
+            })
+            .collect();
+        // Starred first, then the order on disk.
+        cards.sort_by_key(|c| !self.starred.contains(&c.path));
+
+        let mut list = v_flex()
+            .id("doc-cards")
+            .size_full()
+            .overflow_y_scroll()
+            .pt(px(8.))
+            .pb(px(14.))
+            .pl(px(8.))
+            .pr(px(12.))
+            .gap(px(10.))
+            .child(
+                h_flex()
+                    .pl(px(12.))
+                    .text_size(px(12.))
+                    .justify_between()
+                    .child(letterpress(format!("文稿 · {}", cards.len()), WOOD_INK))
+                    .when(self.resources > 0, |row| {
+                        row.child(
+                            div()
+                                .id("resources-hint")
+                                .cursor_pointer()
+                                .child(letterpress(
+                                    format!("另有 {} 个资源 ›", self.resources),
+                                    WOOD_INK,
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.nav = Nav::Files;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            );
+        if cards.is_empty() {
+            list = list.child(
+                div()
+                    .pl(px(12.))
+                    .pt_4()
+                    .text_size(px(12.5))
+                    .child(letterpress(
+                        if self.cards.is_empty() {
+                            "这个文件夹里还没有 .typ 文稿"
+                        } else {
+                            "没有匹配的文稿"
+                        },
+                        WOOD_INK,
+                    )),
+            );
+        }
+        for (ix, card) in cards.into_iter().enumerate() {
+            list = list.child(self.render_card(card, ix, cx));
+        }
+        list
+    }
+
+    fn render_files(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.entity();
+        let active = self.active();
+        let tree_view = tree(
+            &self.tree_state,
+            move |ix, entry, _selected, _window, _cx| {
+                let item = entry.item();
+                let path = item.id.to_string();
+                let folder = entry.is_folder();
+                let ext = Path::new(&path)
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                let (icon, tint) = if folder {
+                    (
+                        if entry.is_expanded() {
+                            "skin/g_folder_open.svg"
+                        } else {
+                            "skin/g_folder.svg"
+                        },
+                        0xb08850,
+                    )
+                } else {
+                    match ext.as_str() {
+                        "typ" => ("skin/g_doc.svg", INK_SOFT),
+                        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" => {
+                            ("skin/g_image.svg", 0x6f8a8c)
+                        }
+                        "bib" => ("skin/g_book.svg", 0x8a6a9c),
+                        "toml" | "yml" | "yaml" | "json" | "csv" | "xml" => {
+                            ("skin/g_braces.svg", 0x7a8a50)
+                        }
+                        _ => ("skin/g_file.svg", 0xa89a88),
+                    }
+                };
+                let is_active = active.as_deref() == Some(normalize(&path).as_str());
+                let view = view.clone();
+                ListItem::new(ix)
+                    .h(px(ROW_H))
+                    .px_2()
+                    .pl(px(14.) * entry.depth() + px(8.))
+                    .rounded(px(0.))
+                    .border_b_1()
+                    .border_color(rgb(RULE))
+                    .when(is_active, |row| row.bg(rgba(0xe9cf9f40)))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(svg().path(icon).size(px(14.)).text_color(rgb(tint)))
+                            .child(
+                                div()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(13.))
+                                    .text_color(rgb(if is_active { 0x8a3f22 } else { INK }))
+                                    .when(is_active, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                    .child(item.label.clone()),
+                            ),
+                    )
+                    .on_click(move |_, window, cx| {
+                        if !folder {
+                            view.update(cx, |this, cx| {
+                                this.open_from_tree(path.clone(), window, cx)
+                            });
+                        }
+                    })
+            },
+        );
+
+        // The card stretches across the column; `size_full` plus its side
+        // margins would overflow it.
+        v_flex()
+            .size_full()
+            .pt(px(8.))
+            .pb(px(14.))
+            .pl(px(8.))
+            .pr(px(12.))
+            .child(
+                Self::card_frame("files-card", false)
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(Self::binding_strip(BAND))
+                    .child(
+                        v_flex()
+                            .relative()
+                            .size_full()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(
+                                h_flex()
+                                    .h(px(30.))
+                                    .flex_none()
+                                    .pl(px(36.))
+                                    .pr(px(10.))
+                                    .gap_2()
+                                    .child(paper_glyph("folder", 14., 0xb5aa9c))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .overflow_hidden()
+                                            .whitespace_nowrap()
+                                            .text_ellipsis()
+                                            .text_size(px(12.5))
+                                            .text_color(rgb(FAINT))
+                                            .child(self.title_text()),
+                                    ),
+                            )
+                            .child(div().pl(px(26.)).child(paper_divider()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .pl(px(28.))
+                                    .pr(px(4.))
+                                    .child(tree_view.size_full()),
+                            ),
+                    )
+                    .child(
+                        skin("paperclip", 36., 18.)
+                            .absolute()
+                            .left(px(-15.))
+                            .top(px(12.)),
+                    ),
+            )
+    }
+
     fn render_outline_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut rows = v_flex().pl(px(36.)).pr(px(10.));
+        let open = self.outline_open;
+        let header = h_flex()
+            .id("outline-header")
+            .h(px(30.))
+            .flex_none()
+            .pl(px(36.))
+            .pr(px(10.))
+            .gap_2()
+            .cursor_pointer()
+            .child(paper_glyph("outline", 14., 0xb5aa9c))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(12.5))
+                    .text_color(rgb(FAINT))
+                    .child("目录"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .text_color(rgb(FAINT))
+                    .child(format!("{} 个标题", self.outline.len())),
+            )
+            .child(
+                svg()
+                    .path(if open {
+                        "skin/g_chevron_down.svg"
+                    } else {
+                        "skin/g_chevron_up.svg"
+                    })
+                    .size(px(13.))
+                    .text_color(rgb(0xa89a88)),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.outline_open = !this.outline_open;
+                cx.notify();
+            }));
+
+        let mut card = Self::card_frame("outline-card", false)
+            .child(Self::binding_strip(BAND))
+            .child(
+                skin("paperclip", 36., 18.)
+                    .absolute()
+                    .left(px(-15.))
+                    .top(px(7.)),
+            );
+        if !open {
+            return card.child(div().relative().child(header));
+        }
+
         let matches =
             |title: &str| self.query.is_empty() || title.to_lowercase().contains(&self.query);
         let visible: Vec<_> = self
@@ -1030,10 +1741,18 @@ impl TypstEditorApp {
             .enumerate()
             .filter(|(_, item)| matches(&item.title))
             .collect();
+        let mut rows = v_flex()
+            .id("outline-rows")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .pl(px(36.))
+            .pr(px(10.))
+            .pb_2();
         if visible.is_empty() {
             rows = rows.child(
                 div()
-                    .h(px(LINE_H))
+                    .h(px(ROW_H))
                     .flex()
                     .items_center()
                     .text_size(px(12.5))
@@ -1059,7 +1778,8 @@ impl TypstEditorApp {
             rows = rows.child(
                 h_flex()
                     .id(("outline", ix))
-                    .h(px(LINE_H))
+                    .flex_none()
+                    .h(px(ROW_H))
                     .pl(px(indent))
                     .gap_2()
                     .border_b_1()
@@ -1091,144 +1811,108 @@ impl TypstEditorApp {
                     })),
             );
         }
-
-        div()
-            .relative()
-            .flex_none()
-            .ml(px(10.))
-            .mr(px(2.))
-            .rounded(px(2.))
-            .bg(rgb(CARD))
-            .border_1()
-            .border_color(rgba(0xb4966c40))
-            .shadow(paper_shadow())
-            .pb_2()
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .h_full()
-                    .w(px(26.))
-                    .bg(rgb(BAND))
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right(px(1.))
-                            .h_full()
-                            .w(px(1.))
-                            .bg(rgb(0xebe2d4)),
-                    )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .right_0()
-                            .h_full()
-                            .w(px(1.))
-                            .bg(rgba(0xffffffcc)),
-                    ),
-            )
-            .child(
-                h_flex()
-                    .relative()
-                    .h(px(30.))
-                    .pl(px(36.))
-                    .pr(px(10.))
-                    .gap_2()
-                    .child(paper_glyph("outline", 14., 0xb5aa9c))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(12.5))
-                            .text_color(rgb(FAINT))
-                            .child("目录"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(rgb(FAINT))
-                            .child(format!("{} 个标题", self.outline.len())),
-                    ),
-            )
-            .child(div().relative().pl(px(26.)).child(paper_divider()))
-            .child(rows.relative())
-            .child(
-                skin("paperclip", 36., 18.)
-                    .absolute()
-                    .left(px(-15.))
-                    .top(px(12.)),
-            )
+        card = card.flex_1().min_h_0().child(
+            v_flex()
+                .relative()
+                .size_full()
+                .child(header)
+                .child(div().pl(px(26.)).child(paper_divider()))
+                .child(rows),
+        );
+        card
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let matches = |c: &&DocCard| {
-            self.query.is_empty()
-                || c.title.to_lowercase().contains(&self.query)
-                || c.rel.to_lowercase().contains(&self.query)
+        let list: AnyElement = match self.nav {
+            Nav::Drafts => self.render_drafts(cx).into_any_element(),
+            Nav::Files => self.render_files(cx).into_any_element(),
         };
-        let mut cards: Vec<&DocCard> = self.cards.iter().filter(matches).collect();
-        // Starred first, then the order on disk.
-        cards.sort_by_key(|c| !self.starred.contains(&c.path));
-
-        let mut list = v_flex()
-            .id("doc-cards")
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .pt(px(10.))
-            .pb(px(16.))
+        let outline = v_flex()
+            .size_full()
+            .pt(px(4.))
+            .pb(px(14.))
             .pl(px(8.))
             .pr(px(12.))
-            .gap(px(10.))
-            .child(
-                h_flex()
-                    .pl(px(12.))
-                    .text_size(px(12.))
-                    .justify_between()
-                    .child(letterpress(format!("文稿 · {}", cards.len()), WOOD_INK))
-                    .when(self.resources > 0, |row| {
-                        row.child(letterpress(
-                            format!("另有 {} 个资源", self.resources),
-                            WOOD_INK,
-                        ))
-                    }),
-            );
-        for (ix, card) in cards.into_iter().enumerate() {
-            list = list.child(self.render_card(card, ix, cx));
-        }
-        if self.show_outline {
-            list = list
-                .child(div().h(px(4.)))
-                .child(self.render_outline_card(cx));
-        }
+            .child(self.render_outline_card(cx));
 
-        v_flex().size_full().child(self.render_search()).child(list)
+        let body: AnyElement = if self.outline_open {
+            // Files and outline scroll on their own; drag between them.
+            gpui_kit::base::v_resizable("sidebar-split")
+                .child(
+                    gpui_kit::base::resizable_panel()
+                        .size_range(px(140.)..px(3000.))
+                        .child(list),
+                )
+                .child(
+                    gpui_kit::base::resizable_panel()
+                        .size(px(300.))
+                        .size_range(px(120.)..px(3000.))
+                        .child(outline),
+                )
+                .into_any_element()
+        } else {
+            v_flex()
+                .size_full()
+                .child(div().flex_1().min_h_0().child(list))
+                .child(
+                    div()
+                        .flex_none()
+                        .pl(px(8.))
+                        .pr(px(12.))
+                        .pb(px(14.))
+                        .child(self.render_outline_card(cx)),
+                )
+                .into_any_element()
+        };
+
+        v_flex()
+            .size_full()
+            .child(self.render_search())
+            .child(self.render_nav_switch(cx))
+            .child(div().flex_1().min_h_0().child(body))
     }
 
     // ── Notepad: index tabs, sheet header, ruled paper ──────
 
     fn render_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut paths: Vec<_> = self.buffers.keys().cloned().collect();
-        paths.sort();
-        let mut tabs = h_flex().h(px(30.)).pl(px(18.)).gap(px(3.)).items_end();
-        for (ix, path) in paths.into_iter().enumerate() {
+        let tabs: Vec<(String, bool)> = self
+            .ws
+            .tabs()
+            .map(|(p, b)| (p.to_owned(), b.is_dirty()))
+            .collect();
+        let menu_items: Vec<(String, String)> = tabs
+            .iter()
+            .map(|(p, dirty)| {
+                let name = file_name(p);
+                (p.clone(), if *dirty { format!("● {name}") } else { name })
+            })
+            .collect();
+
+        let mut strip = h_flex()
+            .id("tab-strip")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .items_end()
+            .gap(px(3.))
+            .overflow_x_scroll()
+            .track_scroll(&self.tabs_scroll);
+        for (ix, (path, dirty)) in tabs.into_iter().enumerate() {
             let selected = self.is_active(&path);
-            let buffer = &self.buffers[&path];
-            let name = Path::new(&path)
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned();
-            let dirty = buffer.current != buffer.saved;
-            tabs = tabs.child(
+            let group: SharedString = format!("tab-{ix}").into();
+            let open_path = path.clone();
+            let close_path = path.clone();
+            strip = strip.child(
                 h_flex()
                     .id(("tab", ix))
+                    .group(group.clone())
                     .relative()
+                    .flex_none()
+                    .max_w(px(200.))
                     .h(px(if selected { 30. } else { 26. }))
-                    .px(px(14.))
-                    .gap_1p5()
+                    .pl(px(12.))
+                    .pr(px(6.))
+                    .gap_1()
                     .rounded_t(px(6.))
                     .border_1()
                     .border_b_0()
@@ -1240,42 +1924,116 @@ impl TypstEditorApp {
                     })
                     .when(!selected, |t| {
                         t.shadow(vec![inset(0., -2., 3., 0x5a3c1e1a)])
+                            .hover(|t| t.bg(rgb(0xf3ebdd)))
                     })
-                    .text_size(px(12.5))
-                    .text_color(rgb(if selected { INK } else { INK_SOFT }))
-                    .when(selected, |t| t.font_weight(FontWeight::SEMIBOLD))
                     .cursor_pointer()
-                    .when(dirty, |t| {
-                        t.child(div().size(px(6.)).rounded_full().bg(rgb(0xc8763a)))
+                    .tooltip({
+                        let path = path.clone();
+                        move |w, cx| Tooltip::new(path.clone()).build(w, cx)
                     })
-                    .child(name)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(12.5))
+                            .text_color(rgb(if selected { INK } else { INK_SOFT }))
+                            .when(selected, |t| t.font_weight(FontWeight::SEMIBOLD))
+                            .child(file_name(&path)),
+                    )
+                    // Close button; an unsaved tab shows an ink dot until hovered.
+                    .child(
+                        div()
+                            .id(("tab-close", ix))
+                            .relative()
+                            .flex_none()
+                            .size(px(18.))
+                            .rounded(px(3.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .hover(|d| d.bg(rgba(0x8a6a4026)))
+                            .when(dirty, |d| {
+                                d.child(
+                                    div()
+                                        .size(px(7.))
+                                        .rounded_full()
+                                        .bg(rgb(0xc8763a))
+                                        .group_hover(group.clone(), |s| s.invisible()),
+                                )
+                            })
+                            .child(
+                                svg()
+                                    .path("skin/g_close.svg")
+                                    .absolute()
+                                    .top(px(3.))
+                                    .left(px(3.))
+                                    .size(px(12.))
+                                    .text_color(rgb(INK_SOFT))
+                                    .when(dirty || !selected, |s| s.invisible())
+                                    .group_hover(group, |s| s.visible()),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.request(Pending::CloseTab(close_path.clone()), window, cx);
+                            })),
+                    )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_document(path.clone(), window, cx)
+                        this.open_document(open_path.clone(), window, cx)
                     })),
             );
         }
-        tabs
+
+        h_flex()
+            .h(px(30.))
+            .flex_none()
+            .pl(px(18.))
+            .pr(px(6.))
+            .gap_1()
+            .child(strip)
+            .when(menu_items.len() > 1, |row| {
+                row.child(
+                    bar_button("tab-overflow", cx)
+                        .compact()
+                        .size(px(24.))
+                        .tooltip("所有打开的文稿")
+                        .child(paper_glyph("triangle", 12., 0x9c8f7e))
+                        .dropdown_menu(move |mut m, _, _| {
+                            for (path, label) in &menu_items {
+                                m = m.menu(
+                                    label.clone(),
+                                    Box::new(OpenDocument { path: path.clone() }),
+                                );
+                            }
+                            m
+                        }),
+                )
+            })
     }
 
-    fn render_sheet_header(&self) -> impl IntoElement {
-        let project = self
-            .project_root
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "全部文稿".into());
-        let modified = self.active().and_then(|path| {
+    fn render_sheet_header(&self, cx: &App) -> impl IntoElement {
+        let project = self.title_text();
+        let active = self.active();
+        let dirty = self.ws.active_buffer().is_some_and(|b| b.is_dirty());
+        let modified = active.as_ref().and_then(|path| {
             self.cards
                 .iter()
-                .find(|c| Path::new(&c.path) == Path::new(&path))
+                .find(|c| c.path == *path)
                 .and_then(|c| c.modified)
+                .or_else(|| std::fs::metadata(path).and_then(|m| m.modified()).ok())
         });
-        let stamp = if self.dirty {
+        let stamp = if dirty {
             "尚未保存".to_string()
         } else {
             modified.map(full_time).unwrap_or_default()
         };
-        let starred = self.active().is_some_and(|p| self.starred.contains(&p));
+        let starred = active.as_ref().is_some_and(|p| self.starred.contains(p));
+        let ext = active
+            .as_deref()
+            .and_then(|p| Path::new(p).extension())
+            .map(|e| e.to_string_lossy().to_uppercase())
+            .unwrap_or_else(|| "TYP".into());
 
         h_flex()
             .h(px(46.))
@@ -1283,67 +2041,123 @@ impl TypstEditorApp {
             .pl(px(MARGIN_W + 14.))
             .pr(px(14.))
             .gap_3()
+            // The project well is a real menu, like Smartisan's folder picker.
             .child(
-                inset_well()
-                    .id("folder-well")
+                bar_button("project-well", cx)
+                    .compact()
                     .h(px(28.))
                     .px_2()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .cursor_pointer()
-                    .child(paper_glyph("files", 14., 0x9c8f7e))
+                    .bg(linear_gradient(
+                        180.,
+                        linear_color_stop(rgb(0xe6dfd3), 0.),
+                        linear_color_stop(rgb(0xf1ebe1), 1.),
+                    ))
+                    .border_1()
+                    .border_color(rgb(0xddd3c5))
+                    .rounded(px(4.))
+                    .shadow(vec![
+                        inset(0., 1., 2., 0x6a4a2a33),
+                        shadow(0., 1., 0., 0., 0xffffffcc),
+                    ])
                     .child(
-                        div()
-                            .max_w(px(160.))
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_size(px(12.))
-                            .text_color(rgb(INK_SOFT))
-                            .child(project),
+                        h_flex()
+                            .gap_1p5()
+                            .child(paper_glyph("files", 14., 0x9c8f7e))
+                            .child(
+                                div()
+                                    .max_w(px(160.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(INK_SOFT))
+                                    .child(project),
+                            )
+                            .child(paper_glyph("triangle", 12., 0xb5aa9c)),
                     )
-                    .child(paper_glyph("triangle", 12., 0xb5aa9c))
-                    .on_click(|_, w, cx| w.dispatch_action(Box::new(ToggleSidebar), cx)),
+                    .dropdown_menu(|m, _, _| {
+                        m.menu("打开文件夹…", Box::new(OpenFolder))
+                            .menu("打开文件…", Box::new(OpenFile))
+                            .separator()
+                            .menu("在资源管理器中显示项目", Box::new(RevealProject))
+                            .menu("重新扫描项目", Box::new(Rescan))
+                    }),
             )
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
                     .text_size(px(12.5))
-                    .text_color(rgb(0xb9afa5))
-                    .child(format!("{stamp}  |  {}", self.char_count)),
+                    .text_color(rgb(0xb0a598))
+                    .when(active.is_some(), |d| {
+                        d.child(format!("{stamp}  |  {} 字", self.char_count))
+                    }),
             )
-            .child(skin(if starred { "star_on" } else { "star" }, 18., 18.))
-            .child(
-                h_flex()
-                    .gap_1()
-                    .px(px(6.))
-                    .h(px(20.))
-                    .rounded(px(3.))
-                    .border_1()
-                    .border_color(rgb(AMBER))
-                    .bg(linear_gradient(
-                        180.,
-                        linear_color_stop(rgb(0xf7e6c6), 0.),
-                        linear_color_stop(rgb(0xead3ab), 1.),
-                    ))
-                    .shadow(vec![shadow(0., 1., 0., 0., 0xffffffcc)])
-                    .text_size(px(10.5))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0xa8763f))
-                    .child("TYP"),
-            )
+            .when(active.is_some(), |header| {
+                header
+                    .child(
+                        div()
+                            .id("sheet-star")
+                            .p_0p5()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgba(0x8a6a4014)))
+                            .tooltip(move |w, cx| {
+                                Tooltip::new(if starred {
+                                    "取消置顶"
+                                } else {
+                                    "置顶此文稿"
+                                })
+                                .build(w, cx)
+                            })
+                            .child(skin(if starred { "star_on" } else { "star" }, 18., 18.))
+                            .when_some(active.clone(), |star, path| {
+                                star.on_click(move |_, window, cx| {
+                                    window.dispatch_action(
+                                        Box::new(ToggleStarActive { path: path.clone() }),
+                                        cx,
+                                    )
+                                })
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .px(px(6.))
+                            .h(px(20.))
+                            .rounded(px(3.))
+                            .border_1()
+                            .border_color(rgb(AMBER))
+                            .bg(linear_gradient(
+                                180.,
+                                linear_color_stop(rgb(0xf7e6c6), 0.),
+                                linear_color_stop(rgb(0xead3ab), 1.),
+                            ))
+                            .shadow(vec![shadow(0., 1., 0., 0., 0xffffffcc)])
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(0xa8763f))
+                            .child(ext),
+                    )
+            })
     }
 
     /// Margin strip, its double edge and the writing rules, kept in step
-    /// with the editor's scroll position.
+    /// with the editor's scroll position. Compact mode is plain paper.
     fn render_ruled_paper(&self) -> impl IntoElement {
         let editor = self.editor.clone();
+        let compact = self.compact;
+        let fallback_line = self.line_height();
         canvas(
             |_, _, _| {},
             move |bounds, _, window, cx| {
+                if compact {
+                    return;
+                }
                 let state = editor.read(cx);
-                let line_h = f32::from(state.line_height().unwrap_or(px(LINE_H)));
+                let line_h = f32::from(state.line_height().unwrap_or(px(fallback_line)));
                 let scroll_y = f32::from(state.scroll_offset().y);
                 let top = bounds.origin.y;
                 let left = bounds.origin.x;
@@ -1396,6 +2210,8 @@ impl TypstEditorApp {
                 .border_color(rgba(0xb4966c40))
                 .shadow(paper_shadow())
         };
+        let mono = fonts(cx).mono.clone();
+        let empty = self.active().is_none();
 
         v_flex()
             .size_full()
@@ -1415,7 +2231,7 @@ impl TypstEditorApp {
                             .relative()
                             .size_full()
                             .rounded(px(3.))
-                            .rounded_tl(px(0.))
+                            .when(!empty, |s| s.rounded_tl(px(0.)))
                             .overflow_hidden()
                             .bg(rgb(PAPER))
                             .border_1()
@@ -1437,7 +2253,7 @@ impl TypstEditorApp {
                                         linear_color_stop(rgba(0xfffdf8e6), 0.),
                                         linear_color_stop(rgba(0xfdfaf2cc), 1.),
                                     ))
-                                    .child(self.render_sheet_header()),
+                                    .child(self.render_sheet_header(cx)),
                             )
                             .child(div().relative().child(paper_divider()))
                             .child(
@@ -1446,17 +2262,43 @@ impl TypstEditorApp {
                                     .flex_1()
                                     .min_h_0()
                                     .child(self.render_ruled_paper())
-                                    .child(
-                                        div().size_full().pl(px(MARGIN_W - 2.)).child(
-                                            Editor::new(&self.editor)
-                                                .bordered(false)
-                                                .p_0()
+                                    .when(!empty, |area| {
+                                        area.child(
+                                            div()
                                                 .size_full()
-                                                .font_family(MONO)
-                                                .text_size(px(15.))
-                                                .line_height(px(LINE_H)),
-                                        ),
-                                    ),
+                                                .pl(px(if self.compact {
+                                                    4.
+                                                } else {
+                                                    MARGIN_W - 2.
+                                                }))
+                                                .child(
+                                                    Editor::new(&self.editor)
+                                                        .bordered(false)
+                                                        .p_0()
+                                                        .size_full()
+                                                        .font_family(mono)
+                                                        .text_size(px(self.font_px))
+                                                        .line_height(px(self.line_height())),
+                                                ),
+                                        )
+                                    })
+                                    .when(empty, |area| {
+                                        area.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .left_0()
+                                                .size_full()
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_size(px(14.))
+                                                .child(letterpress(
+                                                    "从左侧选一份文稿，或按 Ctrl+O 打开文件",
+                                                    0xb0a598,
+                                                )),
+                                        )
+                                    }),
                             ),
                     ),
             )
@@ -1465,21 +2307,25 @@ impl TypstEditorApp {
     // ── Preview column, status strip, overlays ──────────────
 
     fn render_preview(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let zoom = (self.preview.read(cx).zoom() * 100.).round() as i32;
-        let zoom_button = |id: &'static str, glyph: &'static str, action: Box<dyn Action>| {
-            div()
-                .id(id)
-                .size(px(26.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(4.))
-                .cursor_pointer()
-                .hover(|d| d.bg(rgba(0x8a6a401a)))
-                .active(|d| d.bg(rgba(0x8a6a402e)))
-                .child(paper_glyph(glyph, 13., INK_SOFT))
-                .on_click(move |_, w, cx| w.dispatch_action(action.boxed_clone(), cx))
-        };
+        let preview = self.preview.read(cx);
+        let zoom = (preview.zoom() * 100.).round() as i32;
+        let fit = preview.fit_width();
+        let zoom_button =
+            |id: &'static str, glyph: &'static str, tip: &'static str, action: Box<dyn Action>| {
+                div()
+                    .id(id)
+                    .size(px(26.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgba(0x8a6a401a)))
+                    .active(|d| d.bg(rgba(0x8a6a402e)))
+                    .tooltip(move |w, cx| Tooltip::new(tip).build(w, cx))
+                    .child(paper_glyph(glyph, 13., INK_SOFT))
+                    .on_click(move |_, w, cx| w.dispatch_action(action.boxed_clone(), cx))
+            };
         div()
             .relative()
             .size_full()
@@ -1504,7 +2350,12 @@ impl TypstEditorApp {
                         shadow(0., 1., 2., 0., 0x5a3c1e4d),
                         inset(0., 1., 0., 0xffffffcc),
                     ])
-                    .child(zoom_button("zoom-out", "min", Box::new(ZoomOut)))
+                    .child(zoom_button(
+                        "zoom-out",
+                        "min",
+                        "缩小  Ctrl+-",
+                        Box::new(ZoomOut),
+                    ))
                     .child(
                         inset_well()
                             .id("zoom-reset")
@@ -1516,10 +2367,36 @@ impl TypstEditorApp {
                             .cursor_pointer()
                             .text_size(px(11.5))
                             .text_color(rgb(INK_SOFT))
+                            .tooltip(|w, cx| Tooltip::new("实际大小  Ctrl+0").build(w, cx))
                             .child(format!("{zoom}%"))
                             .on_click(|_, w, cx| w.dispatch_action(Box::new(ZoomReset), cx)),
                     )
-                    .child(zoom_button("zoom-in", "plus", Box::new(ZoomIn))),
+                    .child(zoom_button(
+                        "zoom-in",
+                        "plus",
+                        "放大  Ctrl+=",
+                        Box::new(ZoomIn),
+                    ))
+                    .child(
+                        div()
+                            .id("zoom-fit")
+                            .h(px(26.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded(px(4.))
+                            .cursor_pointer()
+                            .text_size(px(11.5))
+                            .text_color(rgb(if fit { 0xa8763f } else { INK_SOFT }))
+                            .when(fit, |d| {
+                                d.bg(rgba(0xe9cf9f55))
+                                    .shadow(vec![inset(0., 1., 2., 0x6a4a2a33)])
+                            })
+                            .when(!fit, |d| d.hover(|d| d.bg(rgba(0x8a6a401a))))
+                            .tooltip(|w, cx| Tooltip::new("适合宽度  Ctrl+9").build(w, cx))
+                            .child("适宽")
+                            .on_click(|_, w, cx| w.dispatch_action(Box::new(FitWidth), cx)),
+                    ),
             )
     }
 
@@ -1534,6 +2411,7 @@ impl TypstEditorApp {
             }
         };
         let pages = self.preview.read(cx).page_count();
+        let dirty = self.ws.active_buffer().is_some_and(|b| b.is_dirty());
         let item = |text: String| div().child(embossed(text));
 
         walnut_bar(30.).child(
@@ -1552,7 +2430,7 @@ impl TypstEditorApp {
                         .child(embossed(status_text)),
                 )
                 .when(self.active().is_some(), |bar| {
-                    bar.child(item(if self.dirty { "未保存" } else { "已保存" }.into()))
+                    bar.child(item(if dirty { "未保存" } else { "已保存" }.into()))
                         .child(groove_v(14.))
                         .child(item(format!(
                             "行 {}  列 {}",
@@ -1568,9 +2446,11 @@ impl TypstEditorApp {
     }
 
     fn render_notice(&self, text: String) -> impl IntoElement {
-        div().absolute().top(px(16.)).right(px(24.)).child(
+        // Bottom right, clear of the zoom control at the top of the preview.
+        div().absolute().bottom(px(22.)).right(px(28.)).child(
             div()
                 .relative()
+                .max_w(px(420.))
                 .pl(px(22.))
                 .pr(px(16.))
                 .py(px(10.))
@@ -1591,17 +2471,8 @@ impl TypstEditorApp {
         )
     }
 
-    fn render_about(&self) -> impl IntoElement {
-        let rows = [
-            ("Ctrl+O", "打开文件"),
-            ("Ctrl+Shift+O", "打开文件夹"),
-            ("Ctrl+S", "保存"),
-            ("F5", "重新编译"),
-            ("Ctrl+B", "显示 / 隐藏文稿栏"),
-            ("Ctrl+Shift+E", "导出 PDF"),
-            ("Ctrl+= / Ctrl+-", "放大 / 缩小预览"),
-            ("Ctrl+0", "实际大小"),
-        ];
+    /// A modal sheet of paper over a dimmed desk.
+    fn modal(content: impl IntoElement) -> Div {
         div()
             .absolute()
             .top_0()
@@ -1610,62 +2481,167 @@ impl TypstEditorApp {
             .flex()
             .items_center()
             .justify_center()
-            .bg(rgba(0x3c28141f))
-            .child(
-                v_flex()
-                    .relative()
-                    .w(px(420.))
-                    .rounded(px(3.))
-                    .bg(rgb(PAPER))
-                    .border_1()
-                    .border_color(rgba(0xb4966c4d))
-                    .shadow(lifted_shadow())
-                    .child(
-                        h_flex()
-                            .h(px(54.))
-                            .px_5()
-                            .gap_3()
-                            .child(skin("notebook", 30., 30.))
-                            .child(
-                                v_flex()
-                                    .child(
-                                        div()
-                                            .text_size(px(17.))
-                                            .font_weight(FontWeight::BOLD)
-                                            .child("字笺 · Typst"),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(11.5))
-                                            .text_color(rgb(FAINT))
-                                            .child("一张稿纸，一桌木纹，把想法排成作品。"),
-                                    ),
-                            ),
-                    )
-                    .child(paper_divider())
-                    .children(rows.into_iter().map(|(key, what)| {
-                        h_flex()
-                            .h(px(LINE_H))
-                            .px_5()
-                            .border_b_1()
-                            .border_color(rgb(RULE))
-                            .text_size(px(13.))
-                            .child(
-                                div()
-                                    .w(px(150.))
-                                    .font_family(MONO)
-                                    .text_color(rgb(0x9a4f2c))
-                                    .child(key),
-                            )
-                            .child(div().text_color(rgb(INK_SOFT)).child(what))
-                    }))
-                    .child(
-                        h_flex().p_4().justify_end().child(
-                            paper_button("close-about", "", "收起")
-                                .on_click(|_, w, cx| w.dispatch_action(Box::new(About), cx)),
+            .bg(rgba(0x3c281433))
+            .child(content)
+    }
+
+    fn render_unsaved_dialog(&self, action: &Pending, cx: &mut Context<Self>) -> impl IntoElement {
+        let files = self.affected_dirty(action);
+        let root = self.ws.root().map(Path::to_path_buf);
+        let (title, go) = match action {
+            Pending::Switch { .. } => ("切换项目前，要保存这些修改吗？", "保存并切换"),
+            Pending::CloseTab(_) => ("关闭前，要保存这份文稿吗？", "保存并关闭"),
+            Pending::CloseWindow => ("退出前，要保存这些修改吗？", "保存并退出"),
+        };
+        let mono = fonts(cx).mono.clone();
+        Self::modal(
+            v_flex()
+                .id("unsaved-dialog")
+                .track_focus(&self.dialog_focus)
+                .relative()
+                .w(px(460.))
+                .rounded(px(3.))
+                .bg(rgb(PAPER))
+                .border_1()
+                .border_color(rgba(0xb4966c4d))
+                .shadow(lifted_shadow())
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    match event.keystroke.key.as_str() {
+                        "escape" => this.resolve_pending(None, window, cx),
+                        "enter" => this.resolve_pending(Some(true), window, cx),
+                        _ => {}
+                    }
+                }))
+                .child(
+                    h_flex()
+                        .h(px(56.))
+                        .pl(px(MARGIN_W + 8.))
+                        .pr_5()
+                        .text_size(px(15.))
+                        .font_weight(FontWeight::BOLD)
+                        .child(title),
+                )
+                .child(paper_divider())
+                .children(files.iter().map(|path| {
+                    let shown = root
+                        .as_ref()
+                        .and_then(|r| Path::new(path).strip_prefix(r).ok())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| path.clone());
+                    h_flex()
+                        .h(px(ROW_H))
+                        .pl(px(MARGIN_W + 8.))
+                        .pr_5()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(rgb(RULE))
+                        .child(div().size(px(7.)).rounded_full().bg(rgb(0xc8763a)))
+                        .child(
+                            div()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .font_family(mono.clone())
+                                .text_size(px(13.))
+                                .text_color(rgb(INK_SOFT))
+                                .child(shown),
+                        )
+                }))
+                .child(
+                    h_flex()
+                        .p_4()
+                        .gap_2()
+                        .child(
+                            paper_button("unsaved-discard", "", "不保存").on_click(cx.listener(
+                                |this, _, window, cx| this.resolve_pending(Some(false), window, cx),
+                            )),
+                        )
+                        .child(div().flex_1())
+                        .child(
+                            paper_button("unsaved-cancel", "", "取消").on_click(cx.listener(
+                                |this, _, window, cx| this.resolve_pending(None, window, cx),
+                            )),
+                        )
+                        .child(
+                            paper_button("unsaved-save", "disk", go)
+                                .border_color(rgb(AMBER))
+                                .text_color(rgb(0x8a5a2b))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.resolve_pending(Some(true), window, cx)
+                                })),
                         ),
+                ),
+        )
+    }
+
+    fn render_about(&self, cx: &App) -> impl IntoElement {
+        let rows = [
+            ("Ctrl+O / Ctrl+Shift+O", "打开文件 / 文件夹"),
+            ("Ctrl+S", "保存"),
+            ("Ctrl+W", "关闭当前文稿"),
+            ("F5", "重新编译"),
+            ("Ctrl+B", "显示 / 隐藏文稿栏"),
+            ("Ctrl+Shift+E", "导出 PDF"),
+            ("Ctrl+= / Ctrl+-", "放大 / 缩小预览"),
+            ("Ctrl+0 / Ctrl+9", "实际大小 / 适合宽度"),
+        ];
+        let mono = fonts(cx).mono.clone();
+        Self::modal(
+            v_flex()
+                .relative()
+                .w(px(440.))
+                .rounded(px(3.))
+                .bg(rgb(PAPER))
+                .border_1()
+                .border_color(rgba(0xb4966c4d))
+                .shadow(lifted_shadow())
+                .child(
+                    h_flex()
+                        .h(px(56.))
+                        .px_5()
+                        .gap_3()
+                        .child(skin("notebook", 30., 30.))
+                        .child(
+                            v_flex()
+                                .child(
+                                    div()
+                                        .text_size(px(17.))
+                                        .font_weight(FontWeight::BOLD)
+                                        .child("字笺 · Typst"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(rgb(FAINT))
+                                        .child("一张稿纸，一桌木纹，把想法排成作品。"),
+                                ),
+                        ),
+                )
+                .child(paper_divider())
+                .children(rows.into_iter().map(|(key, what)| {
+                    h_flex()
+                        .h(px(ROW_H))
+                        .px_5()
+                        .border_b_1()
+                        .border_color(rgb(RULE))
+                        .text_size(px(13.))
+                        .child(
+                            div()
+                                .w(px(190.))
+                                .font_family(mono.clone())
+                                .text_color(rgb(0x9a4f2c))
+                                .child(key),
+                        )
+                        .child(div().text_color(rgb(INK_SOFT)).child(what))
+                }))
+                .child(
+                    h_flex().p_4().justify_end().child(
+                        paper_button("close-about", "", "收起")
+                            .on_click(|_, w, cx| w.dispatch_action(Box::new(About), cx)),
                     ),
-            )
+                ),
+        )
     }
 
     fn render_empty_state(&self) -> impl IntoElement {
@@ -1706,16 +2682,16 @@ impl TypstEditorApp {
     }
 }
 
-/// Open a document from the title dropdown.
+/// Toggle the star of the open document (sheet header).
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = typst_editor, no_json)]
-struct OpenDocument {
+struct ToggleStarActive {
     path: String,
 }
 
 impl Render for TypstEditorApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body: AnyElement = if self.project_root.is_none() && self.active().is_none() {
+        let body: AnyElement = if self.ws.root().is_none() && self.active().is_none() {
             self.render_empty_state().into_any_element()
         } else {
             gpui_kit::base::h_resizable(if self.show_sidebar {
@@ -1726,38 +2702,44 @@ impl Render for TypstEditorApp {
             .when(self.show_sidebar, |group| {
                 group.child(
                     gpui_kit::base::resizable_panel()
-                        .size(px(286.))
+                        .size(px(276.))
                         .size_range(px(220.)..px(460.))
                         .child(self.render_sidebar(cx)),
                 )
             })
             .child(
                 gpui_kit::base::resizable_panel()
-                    .size(px(600.))
+                    .size(px(560.))
                     .size_range(px(320.)..px(2400.))
                     .child(self.render_notepad(cx)),
             )
             .child(
                 gpui_kit::base::resizable_panel()
-                    .size_range(px(300.)..px(3000.))
+                    .size_range(px(280.)..px(3000.))
                     .child(self.render_preview(cx)),
             )
             .into_any_element()
         };
+        let serif = fonts(cx).serif.clone();
+        let pending = self.pending.clone();
 
         v_flex()
             .id("typst-editor")
             .size_full()
-            .font_family(SERIF)
+            .font_family(serif)
             .text_size(px(14.))
             .text_color(rgb(INK))
             .bg(rgb(0xf0ddbc))
             .on_action(cx.listener(Self::on_open_file))
             .on_action(cx.listener(Self::on_open_folder))
             .on_action(cx.listener(Self::on_save))
+            .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_export_pdf))
             .on_action(cx.listener(|this, action: &OpenDocument, window, cx| {
                 this.open_document(action.path.clone(), window, cx)
+            }))
+            .on_action(cx.listener(|this, action: &ToggleStarActive, _, cx| {
+                this.toggle_star(action.path.clone(), cx)
             }))
             .on_action(cx.listener(|this, _: &UndoEdit, window, cx| {
                 this.editor.update(cx, |s, cx| s.focus(window, cx));
@@ -1770,13 +2752,34 @@ impl Render for TypstEditorApp {
             .on_action(cx.listener(|this, _: &Recompile, _, cx| {
                 this.schedule_compile(Duration::ZERO, false, cx)
             }))
+            .on_action(cx.listener(|this, _: &Rescan, _, cx| this.rescan(cx)))
+            .on_action(cx.listener(|this, _: &RevealProject, _, _| {
+                if let Some(root) = this.ws.root() {
+                    reveal_in_file_manager(root);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.show_sidebar = !this.show_sidebar;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleOutline, _, cx| {
                 this.show_sidebar = true;
-                this.show_outline = !this.show_outline;
+                this.outline_open = !this.outline_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ToggleCompact, window, cx| {
+                this.set_compact(!this.compact, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &FontBigger, _, cx| {
+                this.font_px = (this.font_px + 1.).min(24.);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &FontSmaller, _, cx| {
+                this.font_px = (this.font_px - 1.).max(11.);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &FontReset, _, cx| {
+                this.font_px = DEFAULT_FONT;
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &OpenDemo, window, cx| this.open_demo(window, cx)))
@@ -1787,6 +2790,10 @@ impl Render for TypstEditorApp {
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_by(Some(1.1), cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_by(Some(1. / 1.1), cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_by(None, cx)))
+            .on_action(cx.listener(|this, _: &FitWidth, _, cx| {
+                this.preview.update(cx, |p, cx| p.set_fit_width(cx));
+                cx.notify();
+            }))
             .child(self.render_titlebar(cx))
             .child(
                 div()
@@ -1801,7 +2808,10 @@ impl Render for TypstEditorApp {
                     .when_some(self.notice.clone(), |desk, text| {
                         desk.child(self.render_notice(text))
                     })
-                    .when(self.show_about, |desk| desk.child(self.render_about())),
+                    .when(self.show_about, |desk| desk.child(self.render_about(cx)))
+                    .when_some(pending, |desk, action| {
+                        desk.child(self.render_unsaved_dialog(&action, cx))
+                    }),
             )
             .child(self.render_status_bar(cx))
     }
@@ -1813,6 +2823,19 @@ fn count_chars(text: &str) -> usize {
     text.chars().filter(|c| !c.is_whitespace()).count()
 }
 
+fn is_typst(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("typ"))
+}
+
+fn file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_owned())
+}
+
 /// Smartisan-style relative stamp: "今天 08:12", "昨天 23:19",
 /// "13天前 10/03 12:29", or a full date for older notes.
 fn smartisan_time(time: SystemTime) -> String {
@@ -1821,7 +2844,7 @@ fn smartisan_time(time: SystemTime) -> String {
     let now = Local::now();
     let days = (now.date_naive() - then.date_naive()).num_days();
     match days {
-        0 => format!("今天 {}", then.format("%H:%M")),
+        ..=0 => format!("今天 {}", then.format("%H:%M")),
         1 => format!("昨天 {}", then.format("%H:%M")),
         2..=30 => format!("{days}天前 {}", then.format("%m/%d %H:%M")),
         _ => then.format("%Y/%m/%d").to_string(),
@@ -1833,19 +2856,69 @@ fn full_time(time: SystemTime) -> String {
     then.format("%Y/%m/%d %H:%M").to_string()
 }
 
-/// Every `.typ` under `root` as a card, plus a count of other files.
-fn scan_docs(root: &Path) -> (Vec<DocCard>, usize) {
-    fn walk(root: &Path, dir: &Path, depth: usize, cards: &mut Vec<DocCard>, other: &mut usize) {
-        let Ok(entries) = typst_core::fs::list_dir(&dir.display().to_string()) else {
-            return;
+/// Show `path` in the platform file manager.
+fn reveal_in_file_manager(path: &Path) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let arg = if path.is_dir() {
+            format!("\"{}\"", path.display())
+        } else {
+            format!("/select,\"{}\"", path.display())
         };
+        let _ = std::process::Command::new("explorer").raw_arg(arg).spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let dir = if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
+        };
+        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+    }
+}
+
+/// Scan `root`: `.typ` files as cards, the full tree, and how many other
+/// files there are.
+fn scan_project(root: &Path) -> (Vec<DocCard>, Vec<TreeNode>, usize) {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        depth: usize,
+        cards: &mut Vec<DocCard>,
+        other: &mut usize,
+    ) -> Vec<TreeNode> {
+        let Ok(entries) = typst_core::fs::list_dir(&dir.display().to_string()) else {
+            return vec![];
+        };
+        let mut nodes = Vec::new();
         for e in entries {
             let path = Path::new(&e.path);
             if e.is_dir {
-                if depth < 8 && !IGNORED_DIRS.contains(&e.name.as_str()) {
-                    walk(root, path, depth + 1, cards, other);
+                if IGNORED_DIRS.contains(&e.name.as_str()) {
+                    continue;
                 }
-            } else if e.name.ends_with(".typ") {
+                let children = if depth < 8 {
+                    walk(root, path, depth + 1, cards, other)
+                } else {
+                    vec![]
+                };
+                nodes.push(TreeNode {
+                    path: normalize(&e.path),
+                    name: e.name,
+                    children: Some(children),
+                });
+                continue;
+            }
+            if e.name.ends_with(".typ") {
                 let text = std::fs::read_to_string(path).unwrap_or_default();
                 cards.push(DocCard {
                     rel: path
@@ -1856,16 +2929,22 @@ fn scan_docs(root: &Path) -> (Vec<DocCard>, usize) {
                     title: doc_title(&text)
                         .unwrap_or_else(|| e.name.trim_end_matches(".typ").into()),
                     modified: std::fs::metadata(path).and_then(|m| m.modified()).ok(),
-                    path: e.path,
+                    path: normalize(&e.path),
                 });
             } else {
                 *other += 1;
             }
+            nodes.push(TreeNode {
+                path: normalize(&e.path),
+                name: e.name,
+                children: None,
+            });
         }
+        nodes
     }
     let mut cards = Vec::new();
     let mut other = 0;
-    walk(root, root, 0, &mut cards, &mut other);
+    let nodes = walk(root, root, 0, &mut cards, &mut other);
     // Files at the top level first, then by path.
     cards.sort_by(|a, b| {
         a.rel
@@ -1873,7 +2952,7 @@ fn scan_docs(root: &Path) -> (Vec<DocCard>, usize) {
             .cmp(&b.rel.contains('/'))
             .then_with(|| a.rel.cmp(&b.rel))
     });
-    (cards, other)
+    (cards, nodes, other)
 }
 
 /// A card title for a document: its first heading (`= Title`), else its
@@ -1952,5 +3031,26 @@ mod tests {
         );
         // Code lines never become titles; the caller falls back to the name.
         assert_eq!(super::doc_title("#show: x\nversion: \"business\",\n"), None);
+    }
+
+    #[test]
+    fn project_scan_lists_cards_tree_and_resources() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples");
+        let (cards, nodes, _) = super::scan_project(&root);
+        assert!(cards.iter().any(|c| c.rel == "main.typ"));
+        assert!(cards.iter().any(|c| c.rel == "chapters/design.typ"));
+        let chapters = nodes.iter().find(|n| n.name == "chapters").unwrap();
+        assert!(
+            chapters
+                .children
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|n| n.name == "design.typ")
+        );
+        // Filtering keeps the folder leading to a match.
+        let item = chapters.to_item(0, "design");
+        assert!(item.is_some());
+        assert!(chapters.to_item(0, "nothing-matches").is_none());
     }
 }

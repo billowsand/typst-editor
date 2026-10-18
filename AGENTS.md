@@ -87,10 +87,12 @@ Tauri 前端命令配置在 [src-tauri/tauri.conf.json](/mnt/f/typst-editor/src-
 
 - 启动、窗口、命令行参数
   - [gpui-app/src/main.rs](/mnt/f/typst-editor/gpui-app/src/main.rs)
-- 根视图：胡桃木顶栏、文稿卡片、稿纸编辑器、预览、状态栏、快捷键、编译调度、光标同步
+- 根视图：胡桃木顶栏、文稿卡片 / 文件树、大纲卡、稿纸编辑器、标签、预览、状态栏、未保存确认框、快捷键、编译调度、光标同步
   - [gpui-app/src/app.rs](/mnt/f/typst-editor/gpui-app/src/app.rs)
-  - `TypstEditorApp`、`render_titlebar()`、`render_card()`、`render_outline_card()`、`render_notepad()`、`render_ruled_paper()`、`schedule_compile()`、`pin_entry()`、`jump_to()`
-- 预览：可见页位图化、缩放、点击跳源码、光标标记、首页回形针
+  - `TypstEditorApp`、`open_path()`、`switch_project()`、`request()` / `resolve_pending()`（未保存确认）、`run_compile()`、`toggle_pin()`、`render_sidebar()`、`render_tabs()`、`render_notepad()`、`render_ruled_paper()`
+- 会话状态（缓冲区、标签顺序、当前文稿、代次），无 GPUI 依赖、可单测
+  - [gpui-app/src/workspace.rs](/mnt/f/typst-editor/gpui-app/src/workspace.rs)
+- 预览：可见页位图化、适宽/缩放、点击跳源码、光标标记、首页回形针
   - [gpui-app/src/preview.rs](/mnt/f/typst-editor/gpui-app/src/preview.rs)
 - 拟物主题：配色常量、gpui-kit 主题安装、语法墨色
   - [gpui-app/src/theme.rs](/mnt/f/typst-editor/gpui-app/src/theme.rs)

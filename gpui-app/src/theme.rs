@@ -29,13 +29,66 @@ pub const FAINT: u32 = 0xb3aba1;
 pub const WOOD_INK: u32 = 0xa0825c;
 pub const AMBER: u32 = 0xb98c57;
 
-pub const SERIF: &str = "Noto Serif SC";
-pub const MONO: &str = "LXGW Bright Code";
+/// Relative paths on cards: secondary, but they tell same-named files apart.
+pub const PATH_INK: u32 = 0x8a7864;
+
+/// Preferred faces, best first. The first one installed wins; the last
+/// entries ship with every Windows/macOS install.
+const SERIF_FACES: &[&str] = &[
+    "Noto Serif SC",
+    "Source Han Serif SC",
+    "Source Han Serif CN",
+    "Songti SC",
+    "STSong",
+    "SimSun",
+    "Microsoft YaHei UI",
+    "PingFang SC",
+];
+const MONO_FACES: &[&str] = &[
+    "LXGW Bright Code",
+    "Sarasa Mono SC",
+    "Maple Mono NF CN",
+    "Noto Sans Mono CJK SC",
+    "Cascadia Mono",
+    "Consolas",
+    "Menlo",
+    "Courier New",
+];
+
+/// Fonts chosen at startup from what is installed.
+pub struct Fonts {
+    pub serif: SharedString,
+    pub mono: SharedString,
+}
+
+impl Global for Fonts {}
+
+pub fn fonts(cx: &App) -> &Fonts {
+    cx.global::<Fonts>()
+}
+
+fn pick(installed: &[String], faces: &[&str], fallback: &str) -> SharedString {
+    faces
+        .iter()
+        .find(|face| installed.iter().any(|name| name == *face))
+        .copied()
+        .unwrap_or(fallback)
+        .to_string()
+        .into()
+}
 
 pub fn install(cx: &mut App) {
+    let installed = cx.text_system().all_font_names();
+    let fonts = Fonts {
+        serif: pick(&installed, SERIF_FACES, ".SystemUIFont"),
+        mono: pick(&installed, MONO_FACES, "monospace"),
+    };
+    let (serif, mono) = (fonts.serif.clone(), fonts.mono.clone());
+    cx.set_global(fonts);
+
     let t = Theme::global_mut(cx);
-    t.font_family = SERIF.into();
-    t.mono_font_family = MONO.into();
+    t.font_family = serif;
+    t.mono_font_family = mono;
     t.font_size = px(14.);
     t.mono_font_size = px(15.);
     t.radius = px(3.);

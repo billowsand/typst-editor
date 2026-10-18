@@ -63,6 +63,14 @@ fn compile_render_and_jump() {
     let result = state.update_file_and_compile(&chapter_str, edited);
     assert!(result.success, "compile failed: {:?}", result.errors);
     assert_eq!(result.entry_path.as_deref(), Some(main_str.as_str()));
+
+    // Route lookups never fall back to compiling a file on its own.
+    assert_eq!(state.entry_for(&chapter_str), Some(main.clone()));
+    let stray = main.with_file_name("refs.bib").display().to_string();
+    assert_eq!(state.entry_for(&stray), None);
+    state.pin_preview_entry(Some(&chapter_str)).unwrap();
+    assert_eq!(state.pinned_entry(), Some(chapter.clone()));
+    assert_eq!(state.entry_for(&stray), Some(chapter.clone()));
 }
 
 #[test]

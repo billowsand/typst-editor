@@ -8,6 +8,7 @@ mod lsp;
 mod preview;
 mod skin;
 mod theme;
+mod workspace;
 
 use std::path::PathBuf;
 

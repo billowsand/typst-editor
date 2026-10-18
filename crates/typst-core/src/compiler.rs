@@ -506,6 +506,23 @@ impl CompilerState {
         self.inner.read().preview_entry.clone()
     }
 
+    /// The entry the user pinned explicitly, if any.
+    pub fn pinned_entry(&self) -> Option<PathBuf> {
+        self.inner.read().pinned_preview_entry.clone()
+    }
+
+    /// The entry a compile of `file_path` would use, without falling back to
+    /// the file itself: the pinned entry, or the entry that imported it in a
+    /// previous compile. `None` for a file no compiled document depends on.
+    pub fn entry_for(&self, file_path: &str) -> Option<PathBuf> {
+        let abs = absolutize_editor_path(file_path).ok()?;
+        let state = self.inner.read();
+        state
+            .pinned_preview_entry
+            .clone()
+            .or_else(|| state.route_table.get(&abs).cloned())
+    }
+
     /// Get the page count of the current document.
     pub fn page_count(&self) -> usize {
         let state = self.inner.read();

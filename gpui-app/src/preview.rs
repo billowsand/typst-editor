@@ -38,6 +38,8 @@ pub struct PreviewPanel {
     compiler: Arc<CompilerState>,
     pages: Vec<PageSlot>,
     zoom: f32,
+    /// Follow the panel width: the widest page fills it, re-fit on resize.
+    fit_width: bool,
     scroll: ScrollHandle,
     /// Window-space bounds of each page from the last prepaint.
     page_bounds: Rc<RefCell<Vec<Bounds<Pixels>>>>,
@@ -55,6 +57,7 @@ impl PreviewPanel {
             compiler,
             pages: Vec::new(),
             zoom: 1.0,
+            fit_width: true,
             scroll: ScrollHandle::new(),
             page_bounds: Rc::new(RefCell::new(Vec::new())),
             markers: Vec::new(),
@@ -70,7 +73,19 @@ impl PreviewPanel {
         self.pages.len()
     }
 
+    pub fn fit_width(&self) -> bool {
+        self.fit_width
+    }
+
+    /// Fit the widest page to the panel, and keep doing so on resize.
+    pub fn set_fit_width(&mut self, cx: &mut Context<Self>) {
+        self.fit_width = true;
+        cx.notify();
+    }
+
+    /// A fixed zoom level; leaves fit-width mode.
     pub fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        self.fit_width = false;
         self.zoom = zoom.clamp(0.25, 5.0);
         cx.notify();
     }
@@ -148,6 +163,27 @@ impl PreviewPanel {
         if let (Some(file), Some(offset)) = (jump.file, jump.offset) {
             cx.emit(PreviewEvent::JumpToSource { file, offset });
         }
+    }
+
+    /// In fit-width mode, size the widest page to the panel (last frame's
+    /// width), snapped to whole percents so a resize does not re-rasterize
+    /// on every pixel.
+    fn apply_fit_width(&mut self) {
+        if !self.fit_width {
+            return;
+        }
+        let width = f32::from(self.scroll.bounds().size.width);
+        let widest = self
+            .pages
+            .iter()
+            .map(|p| p.width_pt as f32)
+            .fold(0., f32::max);
+        if width <= 0. || widest <= 0. {
+            return;
+        }
+        // Side padding on both sides plus room for the scrollbar.
+        let available = width - 2. * PAGE_GAP - 14.;
+        self.zoom = ((available / widest) * 100.).floor().clamp(25., 300.) / 100.;
     }
 
     /// Pages intersecting the viewport, from the previous frame's layout.
@@ -308,6 +344,7 @@ impl PreviewPanel {
 
 impl Render for PreviewPanel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.apply_fit_width();
         self.schedule_rasterization(window, cx);
 
         let pages: Vec<_> = self
