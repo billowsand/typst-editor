@@ -14,6 +14,9 @@ pub struct Settings {
     /// Settings file format; bump with a migration when fields change shape.
     pub version: u32,
     pub font_px: f32,
+    /// Empty selects the preferred installed font automatically.
+    pub ui_font: String,
+    pub editor_font: String,
     pub compact: bool,
     pub outline_open: bool,
     pub show_sidebar: bool,
@@ -40,6 +43,8 @@ impl Default for Settings {
         Self {
             version: 1,
             font_px: 15.,
+            ui_font: String::new(),
+            editor_font: String::new(),
             compact: false,
             outline_open: true,
             show_sidebar: true,
@@ -109,6 +114,8 @@ mod tests {
         let path = temp_file("rt");
         let mut s = Settings::default();
         s.font_px = 17.;
+        s.ui_font = "Microsoft YaHei UI".into();
+        s.editor_font = "Consolas".into();
         s.note_recent("E:/a");
         s.last_session = Some(Session {
             root: "E:/a".into(),
@@ -123,6 +130,8 @@ mod tests {
         let loaded = Settings::load_from(&path);
         assert_eq!(loaded.font_px, 24., "clamped");
         assert!(loaded.outline_open, "missing field takes its default");
+        assert!(loaded.ui_font.is_empty());
+        assert!(loaded.editor_font.is_empty());
 
         std::fs::write(&path, b"garbage").unwrap();
         assert_eq!(Settings::load_from(&path), Settings::default());

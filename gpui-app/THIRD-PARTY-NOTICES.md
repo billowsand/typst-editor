@@ -31,3 +31,7 @@ Apache-2.0 全文见 `licenses/gpui-pre-LICENSE-APACHE.txt`（Typst 与 gpui-kit
 ## 本项目原创素材
 
 木纹、纸纹纹理和拟物 SVG 图标（`assets/`）由本仓库的 `assets/gen/` 脚本生成，属于本项目。
+
+## Windows 安装程序
+
+安装程序由 Inno Setup（https://jrsoftware.org/）构建。简体中文向导翻译来自 Zhenghan Yang / kira-96 的 Inno-Setup-Chinese-Simplified-Translation（MIT），原文件保留维护者声明，许可证见 `licenses/inno-chinese-MIT.txt` 和源码 `scripts/languages/LICENSE.txt`。

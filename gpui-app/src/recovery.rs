@@ -2,9 +2,11 @@
 //! text of unsaved documents, written a moment after each edit so it can be
 //! offered back after a crash or a killed process.
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -39,13 +41,42 @@ pub struct Draft {
 }
 
 /// The recovery journal: one JSON file per document.
+#[derive(Clone)]
 pub struct Journal {
     dir: PathBuf,
+    revisions: Arc<Mutex<HashMap<String, u64>>>,
+}
+
+/// A reserved write can be invalidated before its background task runs.
+pub struct DraftWrite {
+    journal: Journal,
+    path: String,
+    text: String,
+    revision: u64,
+}
+
+impl DraftWrite {
+    pub fn commit(self) -> std::io::Result<()> {
+        // Hold the same lock as remove through the atomic replacement. Thus
+        // deletion either invalidates this write, or runs after it finishes.
+        let revisions = self
+            .journal
+            .revisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if revisions.get(&self.path) != Some(&self.revision) {
+            return Ok(());
+        }
+        self.journal.write_now(&self.path, &self.text)
+    }
 }
 
 impl Journal {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            revisions: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn default_location() -> Self {
@@ -60,7 +91,24 @@ impl Journal {
 
     /// Save the unsaved `text` of `path`. Written atomically so a crash in
     /// the middle never corrupts the previous draft.
+    #[cfg(test)]
     pub fn write(&self, path: &str, text: &str) -> std::io::Result<()> {
+        self.prepare_write(path, text).commit()
+    }
+
+    pub fn prepare_write(&self, path: &str, text: &str) -> DraftWrite {
+        let mut revisions = self.revisions.lock().unwrap_or_else(|e| e.into_inner());
+        let revision = revisions.entry(path.to_string()).or_default();
+        *revision += 1;
+        DraftWrite {
+            journal: self.clone(),
+            path: path.into(),
+            text: text.into(),
+            revision: *revision,
+        }
+    }
+
+    fn write_now(&self, path: &str, text: &str) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
         let draft = Draft {
             path: path.to_string(),
@@ -76,6 +124,8 @@ impl Journal {
 
     /// Forget the draft of `path` (saved, discarded or closed cleanly).
     pub fn remove(&self, path: &str) {
+        let mut revisions = self.revisions.lock().unwrap_or_else(|e| e.into_inner());
+        *revisions.entry(path.to_string()).or_default() += 1;
         let _ = std::fs::remove_file(self.file_for(path));
     }
 
@@ -154,6 +204,28 @@ mod tests {
         j.write("a.typ", "ok").unwrap();
         std::fs::write(j.dir.join("broken.json"), b"{not json").unwrap();
         assert_eq!(j.drafts().len(), 1);
+        let _ = std::fs::remove_dir_all(&j.dir);
+    }
+
+    #[test]
+    fn pending_write_cannot_recreate_a_saved_or_discarded_draft() {
+        let j = journal("cancel-pending");
+        j.write("main.typ", "previous draft").unwrap();
+        let pending = j.clone().prepare_write("main.typ", "queued stale draft");
+        j.remove("main.typ");
+        pending.commit().unwrap();
+        assert!(j.drafts().is_empty());
+        let _ = std::fs::remove_dir_all(&j.dir);
+    }
+
+    #[test]
+    fn newest_reserved_draft_wins_when_tasks_finish_in_reverse_order() {
+        let j = journal("write-order");
+        let old = j.prepare_write("main.typ", "old text");
+        let new = j.clone().prepare_write("main.typ", "new text");
+        new.commit().unwrap();
+        old.commit().unwrap();
+        assert_eq!(j.drafts()[0].text, "new text");
         let _ = std::fs::remove_dir_all(&j.dir);
     }
 

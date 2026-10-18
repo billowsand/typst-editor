@@ -21,6 +21,9 @@ smallvec = "1"
 typst = "0.14"
 typst-core = { path = "../crates/typst-core" }
 
+[build-dependencies]
+embed-resource = "3.0.12"
+
 # Typst compile and GPUI paint are both far too slow unoptimized; keep our own
 # crate at -O0 for fast rebuilds but optimize every dependency.
 [profile.dev.package."*"]

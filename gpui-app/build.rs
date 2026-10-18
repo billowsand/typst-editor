@@ -4,6 +4,9 @@
 use std::process::Command;
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        windows_resources();
+    }
     let commit = std::env::var("ZIJIAN_COMMIT").ok().or_else(|| {
         Command::new("git")
             .args(["rev-parse", "--short=7", "HEAD"])
@@ -37,6 +40,53 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ZIJIAN_BUILD_DATE");
     println!("cargo:rerun-if-changed=../.git/HEAD");
     println!("cargo:rerun-if-changed=../.git/index");
+}
+
+fn windows_resources() {
+    let root = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let icon = root.join("assets/icons/zijian.ico");
+    let icon_path = icon.to_string_lossy().replace('\\', "/");
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let numeric = version.split('.').take(3).collect::<Vec<_>>().join(",");
+    let rc = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("zijian.rc");
+    std::fs::write(
+        &rc,
+        format!(
+            r#"
+#include <windows.h>
+1 ICON "{icon_path}"
+1 VERSIONINFO
+FILEVERSION {numeric},0
+PRODUCTVERSION {numeric},0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "Zijian Contributors\0"
+      VALUE "FileDescription", "Zijian - Typst Editor\0"
+      VALUE "FileVersion", "{version}\0"
+      VALUE "InternalName", "zijian\0"
+      VALUE "OriginalFilename", "typst-editor-gpui.exe\0"
+      VALUE "ProductName", "Zijian Typst\0"
+      VALUE "ProductVersion", "{version}\0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END
+"#
+        ),
+    )
+    .expect("write Windows resources");
+    embed_resource::compile(&rc, embed_resource::NONE)
+        .manifest_required()
+        .expect("embed application icon and version information");
+    println!("cargo:rerun-if-changed={}", icon.display());
 }
 
 /// Howard Hinnant's days-to-civil algorithm.

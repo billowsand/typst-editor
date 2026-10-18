@@ -355,3 +355,93 @@ fn session_ids_change_on_reset() {
     state.reset_session();
     assert_ne!(state.session_id(), before);
 }
+
+fn compile_buffers(state: &CompilerState, main: &std::path::Path, buffers: &[(String, String)]) {
+    let _guard = state.compile_lock();
+    state.set_editor_overlays(buffers).unwrap();
+    let text = std::fs::read_to_string(main).unwrap();
+    let result = state.compile_file(
+        &main.display().to_string(),
+        &text,
+        typst_core::compiler::CompileOptions { force: true },
+    );
+    assert!(result.success, "{:?}", result.errors);
+}
+
+#[test]
+fn closed_dependency_returns_to_disk_and_detects_later_external_changes() {
+    let dir = tempdir::Dir::new();
+    let main = dir.path.join("main.typ");
+    let chapter = dir.path.join("chapter.typ");
+    let text = "#include \"chapter.typ\"\n";
+    std::fs::write(&main, text).unwrap();
+    std::fs::write(&chapter, "= Original\n").unwrap();
+    let state = CompilerState::new();
+    let main_buffer = (main.display().to_string(), text.to_string());
+    compile_buffers(
+        &state,
+        &main,
+        &[
+            main_buffer.clone(),
+            (chapter.display().to_string(), "= Original\n".into()),
+        ],
+    );
+    // Closing the clean chapter drops it from the editor-owned buffer set.
+    compile_buffers(&state, &main, &[main_buffer.clone()]);
+    std::fs::write(&chapter, "= External newer chapter\n").unwrap();
+    assert!(state.dependencies_changed());
+    compile_buffers(&state, &main, &[main_buffer]);
+    assert_eq!(outline_titles(&state), ["External newer chapter"]);
+}
+
+#[test]
+fn reset_and_rename_keep_inactive_unsaved_dependencies_in_preview_and_export() {
+    let dir = tempdir::Dir::new();
+    let main = dir.path.join("main.typ");
+    let chapter = dir.path.join("chapter.typ");
+    let text = "#include \"chapter.typ\"\n";
+    std::fs::write(&main, text).unwrap();
+    std::fs::write(&chapter, "= Disk chapter\n").unwrap();
+    let state = CompilerState::new();
+    let mut buffers = vec![
+        (main.display().to_string(), text.into()),
+        (chapter.display().to_string(), "= Unsaved chapter\n".into()),
+    ];
+    compile_buffers(&state, &main, &buffers);
+    let expected_pdf = state.export_pdf().unwrap();
+    // A rename invalidates routes and the World but not the editor buffers.
+    let renamed = dir.path.join("renamed-main.typ");
+    std::fs::rename(&main, &renamed).unwrap();
+    buffers[0].0 = renamed.display().to_string();
+    state.reset_session();
+    compile_buffers(&state, &renamed, &buffers);
+    assert_eq!(outline_titles(&state), ["Unsaved chapter"]);
+    assert_eq!(state.export_pdf().unwrap(), expected_pdf);
+    assert_eq!(
+        std::fs::read_to_string(&chapter).unwrap(),
+        "= Disk chapter\n"
+    );
+}
+
+#[test]
+fn closing_and_discarding_an_unsaved_dependency_releases_its_world_overlay() {
+    let dir = tempdir::Dir::new();
+    let main = dir.path.join("main.typ");
+    let chapter = dir.path.join("chapter.typ");
+    let text = "#include \"chapter.typ\"\n";
+    std::fs::write(&main, text).unwrap();
+    std::fs::write(&chapter, "= Disk chapter\n").unwrap();
+    let state = CompilerState::new();
+    let main_buffer = (main.display().to_string(), text.to_string());
+    compile_buffers(
+        &state,
+        &main,
+        &[
+            main_buffer.clone(),
+            (chapter.display().to_string(), "= Unsaved chapter\n".into()),
+        ],
+    );
+    assert_eq!(outline_titles(&state), ["Unsaved chapter"]);
+    compile_buffers(&state, &main, &[main_buffer]);
+    assert_eq!(outline_titles(&state), ["Disk chapter"]);
+}

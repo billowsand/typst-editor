@@ -82,6 +82,7 @@ impl TypstEditorApp {
                     .menu("增大字号", Box::new(FontBigger))
                     .menu("减小字号", Box::new(FontSmaller))
                     .menu("默认字号", Box::new(FontReset))
+                    .menu("设置…", Box::new(OpenSettings))
                     .separator()
                     .menu("预览适合宽度", Box::new(FitWidth))
                     .menu("预览实际大小", Box::new(ZoomReset))
@@ -1730,6 +1731,7 @@ impl Render for TypstEditorApp {
 
         v_flex()
             .id("typst-editor")
+            .track_focus(&self.app_focus)
             .size_full()
             .font_family(serif)
             .text_size(px(14.))
@@ -1896,6 +1898,14 @@ impl Render for TypstEditorApp {
                 this.show_about = !this.show_about;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                if this.pending.is_none() {
+                    this.show_settings = true;
+                    this.show_about = false;
+                    this.dialog_focus.focus(window, cx);
+                    cx.notify();
+                }
+            }))
             .on_action(cx.listener(|this, _: &ZoomIn, _, cx| this.zoom_by(Some(1.1), cx)))
             .on_action(cx.listener(|this, _: &ZoomOut, _, cx| this.zoom_by(Some(1. / 1.1), cx)))
             .on_action(cx.listener(|this, _: &ZoomReset, _, cx| this.zoom_by(None, cx)))
@@ -1921,6 +1931,7 @@ impl Render for TypstEditorApp {
                         desk.child(self.render_notice(text))
                     })
                     .when(self.show_about, |desk| desk.child(self.render_about(cx)))
+                    .when(self.show_settings, |desk| desk.child(self.render_settings(cx)))
                     .when_some(pending, |desk, action| {
                         desk.child(self.render_pending(&action, cx))
                     }),

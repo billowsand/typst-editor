@@ -204,6 +204,31 @@ impl CompilerState {
         state.session += 1;
     }
 
+    /// Replace the complete set of buffers owned by the editor. Call under
+    /// `compile_lock`, before compiling. Closed files must return to disk;
+    /// rebuilding the World also removes their cached Source overlays.
+    pub fn set_editor_overlays(&self, buffers: &[(String, String)]) -> Result<(), String> {
+        let mut overlays = HashMap::new();
+        let mut hashes = HashMap::new();
+        for (path, text) in buffers {
+            let path = absolutize_editor_path(path)?;
+            hashes.insert(path.clone(), hash_content(text));
+            overlays.insert(path, text.clone());
+        }
+        let mut state = self.inner.write();
+        if state
+            .overlays
+            .keys()
+            .any(|path| !overlays.contains_key(path))
+        {
+            state.world = None;
+            state.last_compile_ok = false;
+        }
+        state.overlays = overlays;
+        state.overlay_hashes = hashes;
+        Ok(())
+    }
+
     /// Update any file content and compile with request ID tracking for deduplication.
     pub fn update_file_and_compile_with_id(
         &self,

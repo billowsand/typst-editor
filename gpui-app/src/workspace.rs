@@ -142,6 +142,19 @@ impl Workspace {
         Ok(key)
     }
 
+    /// Recover text even when the original was moved or deleted. Keep it
+    /// dirty until the user saves it or chooses a new destination.
+    pub fn restore_draft(&mut self, path: &str, text: String) -> Result<String, String> {
+        let key = self.open(path, |p| {
+            // A missing or unreadable original must not prevent recovery.
+            Ok(crate::files::read_text(Path::new(p)).unwrap_or_default())
+        })?;
+        let buffer = self.buffers.get_mut(&key).expect("opened buffer");
+        buffer.current = text;
+        buffer.diverged = true;
+        Ok(key)
+    }
+
     /// Record editor text for `path`. Returns whether it changed.
     pub fn set_current(&mut self, path: &str, text: String) -> bool {
         match self.buffers.get_mut(&normalize(path)) {
@@ -241,6 +254,21 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_original_draft_opens_dirty_without_creating_a_disk_file() {
+        let path = std::env::temp_dir().join(format!("zj-missing-{}.typ", std::process::id()));
+        assert!(!path.exists());
+        let mut ws = Workspace::default();
+        let key = ws
+            .restore_draft(&path.display().to_string(), "恢复的内容".into())
+            .unwrap();
+        let buffer = ws.buffer(&key).unwrap();
+        assert_eq!(buffer.current, "恢复的内容");
+        assert!(buffer.is_dirty());
+        assert!(buffer.disk.is_none());
+        assert!(!path.exists());
+    }
 
     fn text(s: &str) -> impl FnOnce(&str) -> std::io::Result<(String, Option<DiskVersion>)> + '_ {
         move |_| Ok((s.to_string(), None))

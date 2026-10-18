@@ -16,7 +16,7 @@ use crate::theme::*;
 
 impl TypstEditorApp {
     /// A modal sheet of paper over a dimmed desk.
-    fn modal(content: impl IntoElement) -> Div {
+    pub(super) fn modal(content: impl IntoElement) -> Div {
         div()
             .absolute()
             .top_0()
@@ -31,7 +31,7 @@ impl TypstEditorApp {
             .child(content)
     }
 
-    fn sheet(&self, width: f32) -> Stateful<Div> {
+    pub(super) fn sheet(&self, width: f32) -> Stateful<Div> {
         v_flex()
             .id("dialog-sheet")
             .track_focus(&self.dialog_focus)
@@ -45,7 +45,7 @@ impl TypstEditorApp {
             .shadow(lifted_shadow())
     }
 
-    fn dialog_title(title: impl Into<SharedString>) -> Div {
+    pub(super) fn dialog_title(title: impl Into<SharedString>) -> Div {
         h_flex()
             .h(px(56.))
             .flex_none()
@@ -434,6 +434,7 @@ impl TypstEditorApp {
             ("Ctrl+Shift+M", "问题列表"),
             ("F5", "强制重新编译"),
             ("Ctrl+B", "显示 / 隐藏文稿栏"),
+            ("Ctrl+,", "字体设置"),
             ("Ctrl+Shift+E", "导出 PDF"),
             ("Ctrl+= / Ctrl+-", "放大 / 缩小预览"),
             ("Ctrl+0 / Ctrl+9", "实际大小 / 适合宽度"),

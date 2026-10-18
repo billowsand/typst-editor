@@ -67,6 +67,27 @@ pub fn fonts(cx: &App) -> &Fonts {
     cx.global::<Fonts>()
 }
 
+/// Resolve saved preferences against the current machine (fonts may be removed).
+pub fn apply_fonts(ui: &str, editor: &str, cx: &mut App) {
+    let installed = cx.text_system().all_font_names();
+    let resolve = |saved: &str, preferred: &[&str], fallback: &str| {
+        if installed.iter().any(|name| name == saved) {
+            SharedString::from(saved.to_owned())
+        } else {
+            pick(&installed, preferred, fallback)
+        }
+    };
+    let serif = resolve(ui, SERIF_FACES, ".SystemUIFont");
+    let mono = resolve(editor, MONO_FACES, "monospace");
+    cx.set_global(Fonts {
+        serif: serif.clone(),
+        mono: mono.clone(),
+    });
+    let theme = Theme::global_mut(cx);
+    theme.font_family = serif;
+    theme.mono_font_family = mono;
+}
+
 fn pick(installed: &[String], faces: &[&str], fallback: &str) -> SharedString {
     faces
         .iter()

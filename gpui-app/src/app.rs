@@ -10,6 +10,7 @@
 //! Views live in `views.rs`, dialogs and panels in `dialogs.rs`.
 
 mod dialogs;
+mod preferences;
 mod views;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -61,6 +62,7 @@ actions!(
         FontBigger,
         FontSmaller,
         FontReset,
+        OpenSettings,
         RevealProject,
         Rescan,
         OpenDemo,
@@ -156,6 +158,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-0", ZoomReset, None),
         KeyBinding::new("secondary-9", FitWidth, None),
         KeyBinding::new("secondary-b", ToggleSidebar, None),
+        KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-shift-e", ExportPdf, None),
         KeyBinding::new("f5", Recompile, None),
     ]);
@@ -316,10 +319,13 @@ pub struct TypstEditorApp {
     pub(crate) show_sidebar: bool,
     pub(crate) outline_open: bool,
     pub(crate) show_about: bool,
+    preferences: preferences::Preferences,
+    pub(crate) show_settings: bool,
     pub(crate) notice: Option<String>,
     pub(crate) pending: Option<Pending>,
     pub(crate) panel: Option<Panel>,
     pub(crate) dialog_focus: FocusHandle,
+    pub(crate) app_focus: FocusHandle,
     pub(crate) tabs_scroll: ScrollHandle,
     /// Compact code mode: line numbers, tighter lines, no ruling.
     pub(crate) compact: bool,
@@ -348,6 +354,10 @@ pub struct TypstEditorApp {
 
 impl TypstEditorApp {
     pub fn new(settings: Settings, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        crate::theme::apply_fonts(&settings.ui_font, &settings.editor_font, cx);
+        let preferences = Self::make_preferences(&settings, window, cx);
+        let app_focus = cx.focus_handle();
+        app_focus.focus(window, cx);
         let compiler = Arc::new(CompilerState::new());
         let preview = cx.new(|_| PreviewPanel::new(compiler.clone()));
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("搜索文稿、文件与标题"));
@@ -448,10 +458,13 @@ impl TypstEditorApp {
             show_sidebar: settings.show_sidebar,
             outline_open: settings.outline_open,
             show_about: false,
+            preferences,
+            show_settings: false,
             notice: None,
             pending: None,
             panel: None,
             dialog_focus: cx.focus_handle(),
+            app_focus,
             tabs_scroll: ScrollHandle::new(),
             compact: settings.compact,
             font_px: settings.font_px,
@@ -497,6 +510,13 @@ impl TypstEditorApp {
             .get(&key)
             .map(|e| e.state.read(cx).text().to_string())
             .or_else(|| self.ws.buffer(&key).map(|b| b.current.clone()))
+    }
+
+    fn editor_buffers(&self, cx: &App) -> Vec<(String, String)> {
+        self.ws
+            .tabs()
+            .filter_map(|(path, _)| self.text_of(path, cx).map(|text| (path.to_string(), text)))
+            .collect()
     }
 
     pub(crate) fn line_height(&self) -> f32 {
@@ -586,25 +606,33 @@ impl TypstEditorApp {
             self.switch_project(root, None, window, cx);
         }
         let mut restored = 0;
+        let mut missing = 0;
         for draft in drafts {
-            if !self.ws.contains(Path::new(&draft.path)) || !Path::new(&draft.path).exists() {
-                // Another project (offered next time), or a file that is gone:
-                // keep the draft in the journal rather than lose it.
+            let path = normalize(&draft.path);
+            if !Path::new(&path).exists() {
+                missing += 1;
+            }
+            if self.ws.restore_draft(&path, draft.text.clone()).is_err() {
                 continue;
             }
+            self.char_count = count_chars(&draft.text);
+            self.last_cursor = 0;
+            let editor = self.make_editor(&path, draft.text, window, cx);
+            editor.state.update(cx, |state, cx| state.focus(window, cx));
+            self.editors.insert(path.clone(), editor);
             self.open_document(draft.path.clone(), window, cx);
-            if let Some(editor) = self.editors.get(&normalize(&draft.path)) {
-                let text = draft.text.clone();
-                editor
-                    .state
-                    .update(cx, |state, cx| state.replace_all(text, window, cx));
-                self.ws.set_current(&draft.path, draft.text);
-                self.journaled.insert(normalize(&draft.path));
-                restored += 1;
-            }
+            self.journaled.insert(path);
+            restored += 1;
         }
+        self.schedule_journal(cx);
+        self.schedule_compile(Duration::ZERO, self.compiler.preview_entry().is_none(), cx);
+        self.persist();
         self.show_notice(
-            format!("已恢复 {restored} 份未保存的草稿，请检查后保存"),
+            if missing > 0 {
+                format!("已恢复 {restored} 份草稿；其中 {missing} 份原文件已丢失，请使用“另存为”选择位置")
+            } else {
+                format!("已恢复 {restored} 份未保存的草稿，请检查后保存")
+            },
             cx,
         );
     }
@@ -1184,14 +1212,13 @@ impl TypstEditorApp {
             Some(true) => {
                 let paths = self.affected_dirty(&action);
                 let outcome = self.save_paths(&paths, false, cx);
-                if !outcome.conflicts.is_empty() {
-                    self.pending = Some(Pending::Conflict {
-                        paths: outcome.conflicts,
-                        after: Some(Box::new(action)),
-                    });
-                    self.dialog_focus.focus(window, cx);
-                } else if outcome.failed.is_empty() {
-                    self.perform(action, false, window, cx);
+                match outcome.continuation(action) {
+                    Some(action @ Pending::Conflict { .. }) => {
+                        self.pending = Some(action);
+                        self.dialog_focus.focus(window, cx);
+                    }
+                    Some(action) => self.perform(action, false, window, cx),
+                    None => {}
                 }
                 // On failure the edits stay; the banner says what failed.
             }
@@ -1217,7 +1244,7 @@ impl TypstEditorApp {
                 let outcome = self.save_paths(&paths, true, cx);
                 if outcome.failed.is_empty() {
                     if let Some(after) = after {
-                        self.perform(*after, false, window, cx);
+                        self.request(*after, window, cx);
                     }
                 }
             }
@@ -1227,7 +1254,7 @@ impl TypstEditorApp {
                     self.reload_from_disk(path, window, cx);
                 }
                 if let Some(after) = after {
-                    self.perform(*after, false, window, cx);
+                    self.request(*after, window, cx);
                 }
             }
         }
@@ -1300,6 +1327,10 @@ impl TypstEditorApp {
                 }
             }
         }
+        // Even a clean closed tab must stop overriding its disk file.
+        if self.active().is_some() {
+            self.schedule_compile(Duration::ZERO, false, cx);
+        }
         self.persist();
         cx.notify();
     }
@@ -1359,7 +1390,7 @@ impl TypstEditorApp {
         for path in self.ws.dirty_paths() {
             if let Some(text) = self.text_of(&path, cx) {
                 self.journaled.insert(path.clone());
-                writes.push((path, text));
+                writes.push(self.journal.prepare_write(&path, &text));
             }
         }
         let clean: Vec<String> = self
@@ -1370,16 +1401,13 @@ impl TypstEditorApp {
             .collect();
         for path in &clean {
             self.journaled.remove(path);
+            self.journal.remove(path);
         }
-        let dir = Journal::default_location();
         cx.background_spawn(async move {
-            for (path, text) in writes {
-                if let Err(err) = dir.write(&path, &text) {
-                    logging::warn(&format!("journal write failed for {path}: {err}"));
+            for write in writes {
+                if let Err(err) = write.commit() {
+                    logging::warn(&format!("journal write failed: {err}"));
                 }
-            }
-            for path in clean {
-                dir.remove(&path);
             }
         })
         .detach();
@@ -1607,12 +1635,20 @@ impl TypstEditorApp {
                     _ => return Self::compile_abandoned(&this, generation, cx),
                 },
             };
+            // Snapshot every live buffer, including inactive unsaved imports.
+            let buffers = match this.update(cx, |this, cx| this.editor_buffers(cx)) {
+                Ok(buffers) => buffers,
+                Err(_) => return,
+            };
             let outcome = cx
                 .background_spawn(async move {
                     let _guard = compiler.compile_lock();
                     // Queued behind a compile of a project that is now closed.
                     if compiler.session_id() != session {
                         return None;
+                    }
+                    if let Err(err) = compiler.set_editor_overlays(&buffers) {
+                        return Some((CompileResult::error(vec![err]), vec![]));
                     }
                     if make_entry {
                         if let Err(err) = compiler.open(&path, &text) {
@@ -1833,6 +1869,8 @@ impl TypstEditorApp {
             .unwrap_or_else(|| "document.pdf".into());
         let picker = cx.prompt_for_new_path(path.parent().unwrap_or(Path::new(".")), Some(&name));
         let compiler = self.compiler.clone();
+        let buffers = self.editor_buffers(cx);
+        let session = compiler.session_id();
         cx.spawn_in(window, async move |this, cx| {
             let Some(mut target) = picker.await.ok().and_then(Result::ok).flatten() else {
                 return;
@@ -1844,6 +1882,10 @@ impl TypstEditorApp {
             let result = cx
                 .background_spawn(async move {
                     let _guard = compiler.compile_lock();
+                    if compiler.session_id() != session {
+                        return Err("项目已切换，请重新导出".to_string());
+                    }
+                    compiler.set_editor_overlays(&buffers)?;
                     if let Some((path, text)) = active {
                         let result = compiler.compile_file(&path, &text, CompileOptions::default());
                         if !result.success {
@@ -2051,8 +2093,38 @@ impl TypstEditorApp {
             self.forget_draft(&old);
         }
         // Routes and overlays name old paths: start the compiler afresh.
+        let remap = |p: PathBuf| {
+            p.strip_prefix(&from)
+                .map(|suffix| to.join(suffix))
+                .unwrap_or(p)
+        };
+        let entry = self.compiler.preview_entry().map(remap);
+        let pinned = self.compiler.pinned_entry().map(remap);
         self.compiler.reset_session();
-        self.schedule_compile(Duration::ZERO, true, cx);
+        if let Some(pinned) = pinned {
+            let _ = self
+                .compiler
+                .pin_preview_entry(Some(&pinned.display().to_string()));
+        }
+        if let Some(entry) = entry {
+            let entry = normalize(&entry.display().to_string());
+            let text = self
+                .text_of(&entry, cx)
+                .or_else(|| std::fs::read_to_string(&entry).ok());
+            if let Some(text) = text {
+                self.run_compile(
+                    entry,
+                    Some(text),
+                    Duration::ZERO,
+                    CompileOptions::default(),
+                    true,
+                    cx,
+                );
+            }
+        } else {
+            self.schedule_compile(Duration::ZERO, false, cx);
+        }
+        self.flush_journal(cx);
         self.rescan(cx);
         self.persist();
     }
@@ -2092,6 +2164,23 @@ impl TypstEditorApp {
 pub(crate) struct SaveOutcome {
     pub failed: Vec<String>,
     pub conflicts: Vec<String>,
+}
+
+impl SaveOutcome {
+    /// Never carry a destructive continuation across a failed save, even
+    /// when other files also require a conflict decision.
+    fn continuation(self, action: Pending) -> Option<Pending> {
+        if !self.failed.is_empty() {
+            None
+        } else if !self.conflicts.is_empty() {
+            Some(Pending::Conflict {
+                paths: self.conflicts,
+                after: Some(Box::new(action)),
+            })
+        } else {
+            Some(action)
+        }
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────
@@ -2349,6 +2438,31 @@ fn find_main_file(dir: &Path) -> Option<PathBuf> {
 mod tests {
     use std::path::{Path, PathBuf};
     use typst_core::CompilerState;
+
+    #[test]
+    fn failed_save_blocks_close_even_when_another_file_has_a_conflict() {
+        let outcome = super::SaveOutcome {
+            failed: vec!["readonly.typ".into()],
+            conflicts: vec!["outside.typ".into()],
+        };
+        assert!(outcome.continuation(super::Pending::CloseWindow).is_none());
+    }
+
+    #[test]
+    fn only_successful_saves_can_continue_or_ask_about_conflicts() {
+        let outcome = super::SaveOutcome {
+            failed: vec![],
+            conflicts: vec!["outside.typ".into()],
+        };
+        assert!(matches!(
+            outcome.continuation(super::Pending::CloseWindow),
+            Some(super::Pending::Conflict { after: Some(_), .. })
+        ));
+        assert!(matches!(
+            super::SaveOutcome::default().continuation(super::Pending::CloseWindow),
+            Some(super::Pending::CloseWindow)
+        ));
+    }
 
     #[test]
     fn bundled_example_has_cross_file_outline_and_exports_pdf() {

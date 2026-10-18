@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Build, test and package 字笺 · Typst (GPUI) as a portable Windows ZIP.
+  Build, test and package 字笺 · Typst (GPUI) as a Windows installer and ZIP.
 
 .DESCRIPTION
   Reproducible from a clean checkout:
@@ -22,6 +22,8 @@
 param(
     [switch]$AllowDirty,
     [switch]$SkipTests,
+    [switch]$SkipInstaller,
+    [string]$IsccPath,
     [string]$OutDir
 )
 
@@ -29,6 +31,21 @@ $ErrorActionPreference = 'Stop'
 $app = Split-Path -Parent $PSScriptRoot           # gpui-app
 $repo = Split-Path -Parent $app                    # repository root
 if (-not $OutDir) { $OutDir = Join-Path $repo 'dist' }
+$OutDir = [IO.Path]::GetFullPath($OutDir)
+$savedDataDir = $env:ZIJIAN_DATA_DIR
+$savedCommit = $env:ZIJIAN_COMMIT
+$savedDate = $env:ZIJIAN_BUILD_DATE
+$savedTemp = $env:TEMP
+$savedTmp = $env:TMP
+
+function Remove-BuildDirectory([string]$path, [string]$parent) {
+    $resolved = [IO.Path]::GetFullPath($path)
+    $boundary = [IO.Path]::GetFullPath($parent).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if (-not $resolved.StartsWith($boundary, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove a directory outside $parent : $resolved"
+    }
+    if (Test-Path -LiteralPath $resolved) { Remove-Item -LiteralPath $resolved -Recurse -Force }
+}
 
 function Step($text) { Write-Host "==> $text" -ForegroundColor Cyan }
 function Run($exe, [string[]]$arguments) {
@@ -38,6 +55,24 @@ function Run($exe, [string[]]$arguments) {
 
 Push-Location $repo
 try {
+    if (-not $SkipInstaller) {
+        if (-not $IsccPath) { $IsccPath = $env:ISCC_PATH }
+        if (-not $IsccPath) {
+            $candidates = @(
+                (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
+                (Join-Path $env:ProgramFiles 'Inno Setup 7\ISCC.exe'),
+                (Join-Path $app 'target\tools\inno\ISCC.exe')
+            )
+            $IsccPath = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+        }
+        if (-not $IsccPath -or -not (Test-Path -LiteralPath $IsccPath)) {
+            throw 'Inno Setup compiler missing. Install Inno Setup 6+, pass -IsccPath, or use -SkipInstaller for ZIP only.'
+        }
+    }
+    $testTemp = Join-Path $app 'target\package-tmp'
+    New-Item -ItemType Directory -Force -Path $testTemp | Out-Null
+    $env:TEMP = $testTemp
+    $env:TMP = $testTemp
     # ── Version and provenance ──────────────────────────────
     $dirty = (git status --porcelain --untracked-files=no) -ne $null
     if ($dirty -and -not $AllowDirty) {
@@ -47,7 +82,7 @@ try {
     if ($dirty) { $commit = "$commit-dirty" }
     $version = (Select-String -Path (Join-Path $app 'Cargo.toml') -Pattern '^version\s*=\s*"(.+)"' |
         Select-Object -First 1).Matches[0].Groups[1].Value
-    $date = (Get-Date).ToString('yyyy-MM-dd')
+    $date = [TimeZoneInfo]::ConvertTimeBySystemTimeZoneId([DateTimeOffset]::UtcNow, 'China Standard Time').ToString('yyyy-MM-dd')
     $env:ZIJIAN_COMMIT = $commit
     $env:ZIJIAN_BUILD_DATE = $date
     $name = "Zijian-$version-$commit-windows-x64"
@@ -69,15 +104,19 @@ try {
 
     # ── Stage ───────────────────────────────────────────────
     $stage = Join-Path $OutDir $name
-    if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+    Remove-BuildDirectory $stage $OutDir
     New-Item -ItemType Directory -Force -Path $stage, "$stage\docs", "$stage\licenses" | Out-Null
     Copy-Item $exe $stage
+    Copy-Item (Join-Path $app 'assets\icons\zijian.ico') $stage
     Copy-Item -Recurse (Join-Path $app 'examples') "$stage\examples"
     Copy-Item (Join-Path $app 'docs\用户指南.md') "$stage\docs\"
     Copy-Item (Join-Path $app 'THIRD-PARTY-NOTICES.md') $stage
+    Copy-Item (Join-Path $PSScriptRoot 'languages\LICENSE.txt') "$stage\licenses\inno-chinese-MIT.txt"
 
     # Original license files of bundled components, located via cargo.
-    $meta = cargo metadata --format-version 1 --manifest-path gpui-app/Cargo.toml | ConvertFrom-Json
+    $metadataJson = & cargo metadata --locked --offline --format-version 1 --manifest-path gpui-app/Cargo.toml
+    if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+    $meta = $metadataJson | ConvertFrom-Json
     foreach ($crate in 'typst-assets', 'typst', 'gpui-pre', 'gpui-kit', 'gpui-kit-assets') {
         $pkg = $meta.packages | Where-Object name -eq $crate | Select-Object -First 1
         if (-not $pkg) { continue }
@@ -117,17 +156,17 @@ try {
     $data = Join-Path ([IO.Path]::GetTempPath()) "zijian-smoke-$([guid]::NewGuid())"
     New-Item -ItemType Directory -Force -Path $data | Out-Null
     $env:ZIJIAN_DATA_DIR = $data
-    $proc = Start-Process -FilePath "$stage\typst-editor-gpui.exe" -ArgumentList "`"$stage\examples`"" -PassThru
+    $proc = Start-Process -FilePath "$stage\typst-editor-gpui.exe" -ArgumentList "`"$stage\examples`"" -WindowStyle Hidden -PassThru
     Start-Sleep -Seconds 8
     $alive = -not $proc.HasExited
     $log = Join-Path $data 'logs\zijian.log'
     $started = (Test-Path $log) -and (Select-String -Path $log -Pattern 'open project' -Quiet)
     if ($alive) { Stop-Process -Id $proc.Id -Force }
-    Remove-Item Env:\ZIJIAN_DATA_DIR
+    $env:ZIJIAN_DATA_DIR = $savedDataDir
     if (-not ($alive -and $started)) {
         throw "Smoke test failed (alive=$alive, project opened=$started). Log: $log"
     }
-    Remove-Item -Recurse -Force $data
+    Remove-BuildDirectory $data $testTemp
 
     # ── Zip and checksum ────────────────────────────────────
     Step 'Compressing'
@@ -137,9 +176,25 @@ try {
     $zipHash = (Get-FileHash -Algorithm SHA256 $zip).Hash
     "$zipHash  $name.zip" | Set-Content -Encoding ascii "$zip.sha256"
 
+    if (-not $SkipInstaller) {
+        Step 'Building Windows installer'
+        $setupName = "$name-Setup"
+        Run $IsccPath @("/DAppVersion=$version", "/DStageDir=$stage", "/DOutputPath=$OutDir",
+            "/DOutputName=$setupName", (Join-Path $PSScriptRoot 'installer.iss'))
+        $setup = Join-Path $OutDir "$setupName.exe"
+        $setupHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $setup).Hash
+        "$setupHash  $setupName.exe" | Set-Content -Encoding ascii "$setup.sha256"
+        Step "Installer: $setup"
+    }
+
     Step "Done: $zip"
     Write-Host "SHA-256 $zipHash"
 }
 finally {
+    $env:ZIJIAN_DATA_DIR = $savedDataDir
+    $env:ZIJIAN_COMMIT = $savedCommit
+    $env:ZIJIAN_BUILD_DATE = $savedDate
+    $env:TEMP = $savedTemp
+    $env:TMP = $savedTmp
     Pop-Location
 }

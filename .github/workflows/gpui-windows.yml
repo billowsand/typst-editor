@@ -1,7 +1,7 @@
 name: GPUI Windows
 
 # Test and package the GPUI front end from a clean checkout. The packaged
-# ZIP (with its checksum) is uploaded as a workflow artifact.
+# Installer and ZIP (with checksums) are uploaded as workflow artifacts.
 
 on:
   push:
@@ -34,7 +34,11 @@ jobs:
 
       - name: Test, build and package
         shell: pwsh
-        run: pwsh gpui-app/scripts/package-windows.ps1
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup --yes --no-progress }
+          if ($LASTEXITCODE) { throw 'Installing Inno Setup failed' }
+          pwsh gpui-app/scripts/package-windows.ps1 -IsccPath $iscc
 
       - name: Network test (package download)
         shell: pwsh
@@ -47,4 +51,6 @@ jobs:
           path: |
             dist/*.zip
             dist/*.zip.sha256
+            dist/*-Setup.exe
+            dist/*-Setup.exe.sha256
           if-no-files-found: error
