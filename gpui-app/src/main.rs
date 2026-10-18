@@ -2,9 +2,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod assets;
 mod highlight;
 mod lsp;
 mod preview;
+mod skin;
+mod theme;
 
 use std::path::PathBuf;
 
@@ -21,25 +24,21 @@ fn main() {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
 
     gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
+        .with_assets(assets::AppAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            // `.SystemUIFont` falls back to a serif face for Latin text on
-            // Windows; YaHei UI covers both Latin and CJK.
-            #[cfg(target_os = "windows")]
-            {
-                gpui_kit::component::Theme::global_mut(cx).font_family = "Microsoft YaHei UI".into();
-            }
+            theme::install(cx);
             app::bind_keys(cx);
             cx.activate(true);
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Typst Editor (GPUI)".into()),
-                    ..Default::default()
+                    title: Some("字笺 · Typst".into()),
+                    ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
-                ..Default::default()
+                window_min_size: Some(size(px(960.), px(640.))),
+                ..gpui_kit::component::TitleBar::window_options()
             };
 
             gpui_kit::open_window(options, cx, move |window, cx| {

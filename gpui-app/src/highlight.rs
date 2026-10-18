@@ -118,7 +118,9 @@ impl InputHighlighter for TypstHighlighter {
             if start > pos {
                 out.push((pos..start, HighlightStyle::default()));
             }
-            out.push((start..end, resolver.style(name).unwrap_or_default()));
+            let mut style = resolver.style(name).unwrap_or_default();
+            style.color = Some(crate::theme::syntax_color(name));
+            out.push((start..end, style));
             pos = end;
         }
         if pos < range.end {
@@ -183,8 +185,16 @@ mod tests {
     #[test]
     fn highlights_markup_and_code() {
         let spans = spans("= 标题\n#let x = 1\n");
-        assert!(spans.iter().any(|(t, n)| t.contains("标题") && *n == "title"));
-        assert!(spans.iter().any(|(t, n)| t.contains("let") && *n == "keyword"));
+        assert!(
+            spans
+                .iter()
+                .any(|(t, n)| t.contains("标题") && *n == "title")
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|(t, n)| t.contains("let") && *n == "keyword")
+        );
         assert!(spans.iter().any(|(t, n)| t == "1" && *n == "number"));
     }
 

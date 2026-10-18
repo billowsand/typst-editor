@@ -87,12 +87,18 @@ Tauri 前端命令配置在 [src-tauri/tauri.conf.json](/mnt/f/typst-editor/src-
 
 - 启动、窗口、命令行参数
   - [gpui-app/src/main.rs](/mnt/f/typst-editor/gpui-app/src/main.rs)
-- 根视图：文件树 | 编辑器 | 预览、状态栏、快捷键、编译调度、光标同步
+- 根视图：胡桃木顶栏、文稿卡片、稿纸编辑器、预览、状态栏、快捷键、编译调度、光标同步
   - [gpui-app/src/app.rs](/mnt/f/typst-editor/gpui-app/src/app.rs)
-  - `TypstEditorApp`、`open_path()`、`schedule_compile()`、`apply_compile_result()`、`schedule_cursor_sync()`、`jump_to()`
-- 预览：可见页位图化、缩放、点击跳源码、光标标记
+  - `TypstEditorApp`、`render_titlebar()`、`render_card()`、`render_outline_card()`、`render_notepad()`、`render_ruled_paper()`、`schedule_compile()`、`pin_entry()`、`jump_to()`
+- 预览：可见页位图化、缩放、点击跳源码、光标标记、首页回形针
   - [gpui-app/src/preview.rs](/mnt/f/typst-editor/gpui-app/src/preview.rs)
-  - `PreviewPanel`、`set_document()`、`schedule_rasterization()`、`on_page_click()`、`set_markers()`
+- 拟物主题：配色常量、gpui-kit 主题安装、语法墨色
+  - [gpui-app/src/theme.rs](/mnt/f/typst-editor/gpui-app/src/theme.rs)
+- 拟物组件：木纹条、桌面、浮雕/压印文字、凹陷输入框、纸质按钮、刻槽分隔
+  - [gpui-app/src/skin.rs](/mnt/f/typst-editor/gpui-app/src/skin.rs)
+- 内嵌素材（纹理、SVG）与 gpui-kit 图标合并
+  - [gpui-app/src/assets.rs](/mnt/f/typst-editor/gpui-app/src/assets.rs)
+  - 素材与生成脚本：`gpui-app/assets/{textures,skin,gen}`；设计说明：[gpui-app/design/README.md](/mnt/f/typst-editor/gpui-app/design/README.md)
 - Typst 语法高亮（`InputHighlighter`，基于 `typst::syntax`）
   - [gpui-app/src/highlight.rs](/mnt/f/typst-editor/gpui-app/src/highlight.rs)
 - 补全与悬停（进程内调用 typst-ide）

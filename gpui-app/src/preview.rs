@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gpui_kit::component::{ActiveTheme, v_flex};
+use gpui_kit::component::v_flex;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use smallvec::SmallVec;
@@ -16,7 +16,7 @@ use typst_core::ide::PositionResult;
 /// Pages kept rasterized beyond the visible ones, on each side.
 const KEEP_AROUND: usize = 2;
 /// Gap between pages, logical px.
-const PAGE_GAP: f32 = 16.;
+const PAGE_GAP: f32 = 18.;
 
 pub enum PreviewEvent {
     /// The user clicked text in the preview that maps to `file` at `offset`.
@@ -77,7 +77,12 @@ impl PreviewPanel {
 
     /// Adopt a fresh compile. Pages whose hash is unchanged keep their bitmap;
     /// changed pages keep showing the old bitmap until the new one is ready.
-    pub fn set_document(&mut self, sizes: Vec<(f64, f64)>, hashes: Vec<u64>, cx: &mut Context<Self>) {
+    pub fn set_document(
+        &mut self,
+        sizes: Vec<(f64, f64)>,
+        hashes: Vec<u64>,
+        cx: &mut Context<Self>,
+    ) {
         let mut old = std::mem::take(&mut self.pages).into_iter();
         for ((width_pt, height_pt), hash) in sizes.into_iter().zip(hashes) {
             let mut slot = old.next().unwrap_or(PageSlot {
@@ -202,7 +207,9 @@ impl PreviewPanel {
                     })
                     .await;
                 this.update_in(cx, |this, window, cx| {
-                    let Some(slot) = this.pages.get_mut(ix) else { return };
+                    let Some(slot) = this.pages.get_mut(ix) else {
+                        return;
+                    };
                     if slot.pending_key != Some(key) {
                         // Superseded by a newer compile or zoom level.
                         if let Some(image) = image {
@@ -228,16 +235,17 @@ impl PreviewPanel {
     fn render_page(&self, ix: usize, slot: &PageSlot, cx: &mut Context<Self>) -> impl IntoElement {
         let zoom = self.zoom;
         let bounds_store = self.page_bounds.clone();
-        let marker_color = cx.theme().primary;
+        // Cursor marks in red-brown ink, like a proofreader's pencil.
+        let marker_color: Hsla = rgb(0xc0533d).into();
 
-        div()
+        let page = div()
             .id(("page", ix))
             .relative()
             .flex_none()
             .w(px(slot.width_pt as f32 * zoom))
             .h(px(slot.height_pt as f32 * zoom))
             .bg(white())
-            .shadow_md()
+            .shadow(crate::skin::lifted_shadow())
             .child(
                 canvas(
                     move |bounds, _, _| {
@@ -276,6 +284,25 @@ impl PreviewPanel {
                     this.on_page_click(ix, event, cx);
                 }),
             )
+            // A paperclip holds the stack together at the first page.
+            .when(ix == 0, |page| {
+                page.child(
+                    crate::skin::skin("paperclip_v", 20., 40.)
+                        .absolute()
+                        .top(px(-15.))
+                        .left(px(34.)),
+                )
+            });
+
+        v_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(8.))
+            .child(page)
+            .child(div().text_size(px(11.)).child(crate::skin::letterpress(
+                format!("—  {}  —", ix + 1),
+                crate::theme::WOOD_INK,
+            )))
     }
 }
 
@@ -292,18 +319,21 @@ impl Render for PreviewPanel {
 
         div()
             .id("preview-scroll")
+            .relative()
             .size_full()
             .overflow_scroll()
             .track_scroll(&self.scroll)
-            .bg(cx.theme().muted)
             // Layout moves on scroll; re-render to rasterize newly visible pages.
             .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             .child(
                 v_flex()
+                    .relative()
                     .min_w_full()
                     .items_center()
                     .gap(px(PAGE_GAP))
-                    .py(px(PAGE_GAP))
+                    // Leave room for the zoom control floating at the top.
+                    .pt(px(56.))
+                    .pb(px(28.))
                     .px(px(PAGE_GAP))
                     .children(pages),
             )

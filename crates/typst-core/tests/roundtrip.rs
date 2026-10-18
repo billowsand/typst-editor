@@ -94,8 +94,8 @@ fn completion_and_tooltip() {
 
     // Unsaved edit: typing `#hea` should offer `heading`.
     let live = format!("{text}#hea");
-    let (from, items) = ide::autocomplete(&state, &main_str, &live, live.len(), false)
-        .expect("no completions");
+    let (from, items) =
+        ide::autocomplete(&state, &main_str, &live, live.len(), false).expect("no completions");
     assert_eq!(from, live.len() - 3);
     assert!(items.iter().any(|c| c.label == "heading"));
 
