@@ -3391,6 +3391,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
+name = "pixglyph"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47945e80a49d08350e4a007ac4294c6498d23956c18ea5e6ff480dc93d31643c"
+dependencies = [
+ "ttf-parser",
+]
+
+[[package]]
 name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5464,22 +5473,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5613cb719a6222fe9b74027c3625d107767ec187bff26b8fc931cf58942c834f"
 
 [[package]]
-name = "typst-editor"
+name = "typst-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
  "comemo 0.4.0",
  "parking_lot",
  "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
  "typst",
  "typst-ide",
  "typst-kit",
  "typst-pdf",
+ "typst-render",
  "typst-svg",
+]
+
+[[package]]
+name = "typst-editor"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "typst-core",
 ]
 
 [[package]]
@@ -5721,6 +5739,26 @@ dependencies = [
  "typst-syntax",
  "typst-timing",
  "typst-utils",
+]
+
+[[package]]
+name = "typst-render"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1baabef8c01dd7150380592811bf37af9b2498be86043834ddd629d1bcb48ccb"
+dependencies = [
+ "bytemuck",
+ "comemo 0.5.1",
+ "hayro",
+ "image",
+ "pixglyph",
+ "resvg",
+ "tiny-skia",
+ "ttf-parser",
+ "typst-assets",
+ "typst-library",
+ "typst-macros",
+ "typst-timing",
 ]
 
 [[package]]

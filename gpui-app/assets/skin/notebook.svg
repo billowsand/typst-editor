@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="72" height="72" viewBox="0 0 24 24">
+  <defs>
+    <linearGradient id="c" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#c08d58"/>
+      <stop offset="1" stop-color="#7a5230"/></linearGradient>
+    <linearGradient id="p" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#fffaf0"/>
+      <stop offset="1" stop-color="#e9dcc4"/></linearGradient>
+  </defs>
+  <rect x="4.6" y="2.6" width="15.6" height="19.4" rx="1.6" fill="#2a1c10" opacity=".35" transform="translate(.5 .7)"/>
+  <rect x="6" y="3.2" width="14.4" height="18.2" rx="1.2" fill="url(#p)"/>
+  <rect x="3.6" y="2.4" width="14.4" height="19.2" rx="1.4" fill="url(#c)" stroke="#5c3b20" stroke-width=".4"/>
+  <path d="M4.6 3.3h12.4" stroke="#e7c398" stroke-width=".4" opacity=".8"/>
+  <rect x="3.6" y="2.4" width="2.4" height="19.2" rx="1" fill="#5c3b20" opacity=".5"/>
+  <rect x="15.2" y="2.4" width="1.3" height="19.2" fill="#3b2614" opacity=".85"/>
+  <rect x="8" y="8.6" width="5.6" height="5.2" rx=".5" fill="#f3e3c4" opacity=".92"/>
+  <path d="M9 10.2h3.6M9 11.4h3.6M9 12.6h2.4" stroke="#9c7650" stroke-width=".4"/>
+</svg>

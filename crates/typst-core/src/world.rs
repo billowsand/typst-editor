@@ -12,8 +12,9 @@ use typst::Library;
 use typst::LibraryExt;
 use typst::World;
 
+use typst_kit::download::{Downloader, ProgressSink};
 use typst_kit::fonts::{FontSearcher, Fonts};
-use typst_kit::package::{default_package_cache_path, default_package_path};
+use typst_kit::package::PackageStorage;
 
 /// Global font cache – searched once, reused forever.
 static FONTS: OnceLock<Fonts> = OnceLock::new();
@@ -138,13 +139,21 @@ impl TypstWorld {
         ));
 
         if id == self.main_source.id() {
-            self.main_source.replace(content);
+            if self.main_source.text() != content {
+                self.main_source.replace(content);
+            }
+        } else if let Some(source) = self.overlays.get_mut(&id) {
+            // Identical text: nothing to do. Otherwise reparse incrementally.
+            if source.text() != content {
+                source.replace(content);
+            }
         } else {
             self.overlays
                 .insert(id, Source::new(id, content.to_string()));
-            self.overlay_paths.insert(abs.clone(), id);
         }
-        self.touched_paths.lock().insert(abs);
+        // Not marked as touched here: a file is a dependency only once the
+        // compile actually reads it (see `source` / `file`).
+        self.overlay_paths.insert(abs, id);
 
         Ok(())
     }
@@ -200,6 +209,17 @@ impl TypstWorld {
         deps
     }
 
+    /// Record that the compile read the overlay `id`.
+    fn touch_overlay(&self, id: FileId) {
+        if let Some(path) = self
+            .overlay_paths
+            .iter()
+            .find_map(|(path, oid)| (*oid == id).then(|| path.clone()))
+        {
+            self.touched_paths.lock().insert(path);
+        }
+    }
+
     fn file_id_for_path(&self, abs: &Path) -> Option<FileId> {
         let rel = VirtualPath::within_root(abs, &self.root)?;
 
@@ -233,8 +253,7 @@ impl TypstWorld {
             return Ok(local_path);
         }
 
-        let package_root = resolve_package_root(id.package().unwrap())
-            .ok_or_else(|| FileError::NotFound(local_path.clone()))?;
+        let package_root = resolve_package_root(id.package().unwrap())?;
 
         trace_import(format!(
             "resolve package-fallback file_id={:?} package_root={}",
@@ -252,7 +271,8 @@ impl TypstWorld {
         let path = self.resolve_path(id)?;
         self.touched_paths.lock().insert(path.clone());
         trace_import(format!("read source path={}", path.display()));
-        let text = std::fs::read_to_string(&path).map_err(|_| FileError::NotFound(path.clone()))?;
+        let bytes = std::fs::read(&path).map_err(|_| FileError::NotFound(path.clone()))?;
+        let text = String::from_utf8(bytes).map_err(|_| FileError::InvalidUtf8)?;
         Ok(Source::new(id, text))
     }
 
@@ -266,7 +286,7 @@ impl TypstWorld {
     }
 }
 
-pub(crate) fn discover_project_root(path: &Path) -> Option<PathBuf> {
+pub fn discover_project_root(path: &Path) -> Option<PathBuf> {
     let start = if path.is_dir() { path } else { path.parent()? };
     for dir in start.ancestors() {
         if dir.join("typst.toml").is_file() {
@@ -276,7 +296,7 @@ pub(crate) fn discover_project_root(path: &Path) -> Option<PathBuf> {
     None
 }
 
-pub(crate) fn discover_access_root(path: &Path) -> Option<PathBuf> {
+pub fn discover_access_root(path: &Path) -> Option<PathBuf> {
     discover_project_root(path).or_else(|| discover_filesystem_root(path))
 }
 
@@ -294,16 +314,27 @@ fn discover_filesystem_root(path: &Path) -> Option<PathBuf> {
         .filter(|root| !root.as_os_str().is_empty())
 }
 
-fn resolve_package_root(spec: &typst::syntax::package::PackageSpec) -> Option<PathBuf> {
-    let rel = PathBuf::from(spec.namespace.as_str())
-        .join(spec.name.as_str())
-        .join(spec.version.to_string());
+/// Package storage shared by all worlds: the local package directory, then
+/// the download cache, then (for `@preview`) Typst Universe over the network.
+fn package_storage() -> &'static PackageStorage {
+    static STORAGE: OnceLock<PackageStorage> = OnceLock::new();
+    STORAGE.get_or_init(|| {
+        PackageStorage::new(
+            None,
+            None,
+            Downloader::new(concat!("zijian-typst-editor/", env!("CARGO_PKG_VERSION"))),
+        )
+    })
+}
 
-    default_package_path()
-        .into_iter()
-        .chain(default_package_cache_path())
-        .map(|base| base.join(&rel))
-        .find(|dir| dir.exists())
+/// Locate a package on disk, downloading it on first use. Errors name the
+/// package and the reason (not found, offline, bad archive) so the editor
+/// can show them as diagnostics.
+fn resolve_package_root(spec: &typst::syntax::package::PackageSpec) -> Result<PathBuf, FileError> {
+    trace_import(format!("prepare package {spec}"));
+    package_storage()
+        .prepare_package(spec, &mut ProgressSink)
+        .map_err(FileError::Package)
 }
 
 impl typst::World for TypstWorld {
@@ -325,6 +356,7 @@ impl typst::World for TypstWorld {
             return Ok(self.main_source.clone());
         }
         if let Some(source) = self.overlays.get(&id) {
+            self.touch_overlay(id);
             return Ok(source.clone());
         }
         self.read_source(id)
@@ -336,6 +368,7 @@ impl typst::World for TypstWorld {
             return Ok(Bytes::from_string(self.main_source.text().to_string()));
         }
         if let Some(source) = self.overlays.get(&id) {
+            self.touch_overlay(id);
             return Ok(Bytes::from_string(source.text().to_string()));
         }
         self.read_file(id)

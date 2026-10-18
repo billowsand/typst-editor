@@ -1,7 +1,6 @@
 mod commands;
-mod compiler;
 
-use compiler::CompilerState;
+use typst_core::CompilerState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -10,7 +9,7 @@ pub fn run() {
         .manage(CompilerState::new())
         .setup(|_| {
             std::thread::spawn(|| {
-                let _ = crate::compiler::world::get_or_init_fonts();
+                let _ = typst_core::get_or_init_fonts();
             });
             Ok(())
         })

@@ -1,38 +1,14 @@
-use crate::compiler::{CompileResult, CompilerState, OutlineItem, OutlinePosition};
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, State};
+use typst_core::fs::FileEntry;
+use typst_core::ide::{JumpResult, PositionResult};
+use typst_core::{CompileResult, CompilerState, OutlineItem};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
-use typst::foundations::{Content, NativeElement, Packed, StyleChain};
-use typst::introspection::Introspector;
-use typst::layout::{Frame, FrameItem, Point, Position, Size};
-use typst::model::HeadingElem;
-use typst::syntax::{Span, SyntaxKind};
-use typst::visualize::Geometry;
-use typst::Document;
-use typst::World;
 
 // ── Data Types ──────────────────────────────────────────────
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct PositionResult {
-    pub page: usize,
-    pub x: f64,
-    pub y: f64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct JumpResult {
-    #[serde(rename = "type")]
-    pub jump_type: String,
-    pub file: Option<String>,
-    pub offset: Option<usize>,
-    pub url: Option<String>,
-    pub position: Option<PositionResult>,
-}
 
 /// Return type for `export_pdf_dialog`: distinguishes cancel from success.
 #[derive(Debug, Serialize)]
@@ -58,11 +34,11 @@ pub fn open_file(
     state: State<'_, CompilerState>,
     file_path: String,
     content: String,
-) -> Result<crate::compiler::CompileResult, String> {
+) -> Result<CompileResult, String> {
     let _guard = state.compile_lock();
     state.open(&file_path, &content)?;
     let mut result = state.update_file_and_compile(&file_path, &content);
-    populate_outline(&state, &mut result);
+    typst_core::ide::populate_outline(&state, &mut result);
     Ok(result)
 }
 
@@ -71,7 +47,7 @@ pub fn set_preview_entry(
     state: State<'_, CompilerState>,
     file_path: String,
     content: String,
-) -> Result<crate::compiler::CompileResult, String> {
+) -> Result<CompileResult, String> {
     let _guard = state.compile_lock();
     state.open(&file_path, &content)?;
     state.pin_preview_entry(Some(&file_path))?;
@@ -81,7 +57,7 @@ pub fn set_preview_entry(
     // sentinel like u64::MAX would corrupt current_request_id and cause
     // subsequent compile_current calls to return stale results.
     let mut result = state.update_file_and_compile(&file_path, &content);
-    populate_outline(&state, &mut result);
+    typst_core::ide::populate_outline(&state, &mut result);
     Ok(result)
 }
 
@@ -159,76 +135,18 @@ pub fn compile_current(
     state: State<'_, CompilerState>,
     file_path: String,
     content: String,
-) -> crate::compiler::CompileResult {
+) -> CompileResult {
     let request_id = COMPILE_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
     state.note_compile_request(request_id);
 
     let _guard = state.compile_lock();
-    {
-        let inner_state = state.inner.read();
-        if request_id < inner_state.current_request_id {
-            drop(inner_state);
-            let mut result = get_current_compilation_result(&state);
-            populate_outline(&state, &mut result);
-            return result;
-        }
-    }
-
-    let mut result = state.update_file_and_compile_with_id(request_id, &file_path, &content);
-    populate_outline(&state, &mut result);
-    result
-}
-
-/// Get the current compilation result from the compiler state.
-fn get_current_compilation_result(
-    state: &State<'_, CompilerState>,
-) -> crate::compiler::CompileResult {
-    let compiler_state = state.inner.read();
-    if let Some(doc) = &compiler_state.document {
-        crate::compiler::CompileResult {
-            success: compiler_state.last_compile_ok,
-            page_count: doc.pages.len(),
-            page_hashes: compiler_state.page_hashes.clone(),
-            outline: vec![],
-            errors: vec![],
-            warnings: vec![],
-            duration_ms: 0,
-            entry_path: compiler_state
-                .preview_entry
-                .clone()
-                .map(|p| p.display().to_string()),
-            pinned_entry_path: compiler_state
-                .pinned_preview_entry
-                .clone()
-                .map(|p| p.display().to_string()),
-        }
+    let mut result = if state.is_stale_request(request_id) {
+        state.current_result()
     } else {
-        crate::compiler::CompileResult {
-            success: false,
-            page_count: 0,
-            page_hashes: vec![],
-            outline: vec![],
-            errors: vec!["No document available".into()],
-            warnings: vec![],
-            duration_ms: 0,
-            entry_path: None,
-            pinned_entry_path: compiler_state
-                .pinned_preview_entry
-                .clone()
-                .map(|p| p.display().to_string()),
-        }
-    }
-}
-
-fn populate_outline(state: &State<'_, CompilerState>, result: &mut CompileResult) {
-    if !result.success {
-        result.outline.clear();
-        return;
-    }
-
-    result.outline = state
-        .with_document(|world, doc| build_document_outline(world, doc.introspector()))
-        .unwrap_or_default();
+        state.update_file_and_compile_with_id(request_id, &file_path, &content)
+    };
+    typst_core::ide::populate_outline(&state, &mut result);
+    result
 }
 
 #[tauri::command]
@@ -243,13 +161,6 @@ pub fn page_count(state: State<'_, CompilerState>) -> usize {
 
 // ── File Tree ───────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
-pub struct FileEntry {
-    pub name: String,
-    pub path: String,
-    pub is_dir: bool,
-}
-
 #[tauri::command]
 pub fn get_project_root(state: State<'_, CompilerState>) -> Option<String> {
     state.project_root().map(|p| p.display().to_string())
@@ -262,47 +173,20 @@ pub fn get_preview_entry(state: State<'_, CompilerState>) -> Option<String> {
 
 #[tauri::command]
 pub fn get_document_outline(state: State<'_, CompilerState>) -> Vec<OutlineItem> {
-    state
-        .with_document(|world, doc| build_document_outline(world, doc.introspector()))
-        .unwrap_or_default()
+    typst_core::ide::document_outline(&state)
 }
 
 #[tauri::command]
 pub fn resolve_project_root(file_path: String) -> Option<String> {
-    let abs = PathBuf::from(file_path);
-    crate::compiler::world::discover_project_root(&abs)
+    let abs = std::path::PathBuf::from(file_path);
+    typst_core::discover_project_root(&abs)
         .or_else(|| abs.parent().map(|p| p.to_path_buf()))
         .map(|p| p.display().to_string())
 }
 
 #[tauri::command]
 pub fn list_dir(path: String) -> Result<Vec<FileEntry>, String> {
-    let dir = std::fs::read_dir(&path).map_err(|e| format!("Failed to read dir: {}", e))?;
-    let mut entries: Vec<FileEntry> = dir
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            // Skip hidden files/dirs
-            if name.starts_with('.') {
-                return None;
-            }
-            let file_type = e.file_type().ok()?;
-            Some(FileEntry {
-                name,
-                path: e.path().display().to_string(),
-                is_dir: file_type.is_dir(),
-            })
-        })
-        .collect();
-
-    // Sort: directories first, then files, alphabetically within each group
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
-
-    Ok(entries)
+    typst_core::fs::list_dir(&path)
 }
 
 // ── Sync / Jump ─────────────────────────────────────────────
@@ -314,28 +198,7 @@ pub fn jump_from_cursor(
     line: u32,
     character: u32,
 ) -> Vec<PositionResult> {
-    state
-        .with_document(|world, doc| {
-            let Some(source) = world.source_by_path(&file_path) else {
-                return Vec::new();
-            };
-            let Some(cursor) = source
-                .lines()
-                .line_column_to_byte(line as usize, character as usize)
-            else {
-                return Vec::new();
-            };
-            let positions = typst_ide::jump_from_cursor(doc, &source, cursor);
-            positions
-                .into_iter()
-                .map(|pos| PositionResult {
-                    page: pos.page.get(),
-                    x: pos.point.x.to_pt(),
-                    y: pos.point.y.to_pt(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    typst_core::ide::jump_from_cursor(&state, &file_path, line as usize, character as usize)
 }
 
 #[tauri::command]
@@ -344,22 +207,7 @@ pub fn jump_from_offset(
     file_path: String,
     offset: usize,
 ) -> Vec<PositionResult> {
-    state
-        .with_document(|world, doc| {
-            let Some(source) = world.source_by_path(&file_path) else {
-                return Vec::new();
-            };
-            let cursor = offset.min(source.text().len());
-            typst_ide::jump_from_cursor(doc, &source, cursor)
-                .into_iter()
-                .map(|pos| PositionResult {
-                    page: pos.page.get(),
-                    x: pos.point.x.to_pt(),
-                    y: pos.point.y.to_pt(),
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    typst_core::ide::jump_from_offset(&state, &file_path, offset)
 }
 
 #[tauri::command]
@@ -369,202 +217,14 @@ pub fn jump_from_click(
     x: f64,
     y: f64,
 ) -> Option<JumpResult> {
-    state.with_document(|world, doc| {
-        let page_idx = page.saturating_sub(1);
-        if page_idx >= doc.pages.len() {
-            return None;
-        }
-
-        let click = typst::layout::Point::new(typst::layout::Abs::pt(x), typst::layout::Abs::pt(y));
-
-        let frame = &doc.pages[page_idx].frame;
-        let jump = typst_ide::jump_from_click(world, doc, frame, click)?;
-
-        Some(match jump {
-            typst_ide::Jump::File(file_id, offset) => {
-                let name = world
-                    .resolve_absolute_path(file_id)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| file_id.vpath().as_rootless_path().display().to_string());
-                JumpResult {
-                    jump_type: "file".into(),
-                    file: Some(name),
-                    offset: Some(offset),
-                    url: None,
-                    position: None,
-                }
-            }
-            typst_ide::Jump::Url(url) => JumpResult {
-                jump_type: "url".into(),
-                file: None,
-                offset: None,
-                url: Some(url.to_string()),
-                position: None,
-            },
-            typst_ide::Jump::Position(pos) => resolve_source_jump_from_position(world, doc, pos)
-                .unwrap_or_else(|| JumpResult {
-                    jump_type: "position".into(),
-                    file: None,
-                    offset: None,
-                    url: None,
-                    position: Some(PositionResult {
-                        page: pos.page.get(),
-                        x: pos.point.x.to_pt(),
-                        y: pos.point.y.to_pt(),
-                    }),
-                }),
-        })
-    })?
-}
-
-fn resolve_source_jump_from_position(
-    world: &crate::compiler::world::TypstWorld,
-    doc: &typst::layout::PagedDocument,
-    pos: Position,
-) -> Option<JumpResult> {
-    let page_idx = pos.page.get().checked_sub(1)?;
-    let page = doc.pages.get(page_idx)?;
-    let (span, offset) = source_span_from_click(world, &page.frame, pos.point)?;
-    let (file, offset) = resolve_span_to_file_offset(world, span, offset)?;
-
-    Some(JumpResult {
-        jump_type: "file".into(),
-        file: Some(file),
-        offset: Some(offset),
-        url: None,
-        position: None,
-    })
-}
-
-fn source_span_from_click(
-    world: &crate::compiler::world::TypstWorld,
-    frame: &Frame,
-    click: Point,
-) -> Option<(Span, usize)> {
-    for &(mut pos, ref item) in frame.items().rev() {
-        match item {
-            FrameItem::Group(group) => {
-                if let Some(hit) = source_span_from_click(world, &group.frame, click - pos) {
-                    return Some(hit);
-                }
-            }
-            FrameItem::Text(text) => {
-                for glyph in &text.glyphs {
-                    let width = glyph.x_advance.at(text.size);
-                    let hitbox_pos = Point::new(pos.x, pos.y - text.size);
-                    if is_in_rect(hitbox_pos, Size::new(width, text.size), click) {
-                        let (span, glyph_offset) = glyph.span;
-                        let mut resolved_offset = glyph_offset as usize;
-                        let source = world.source(span.id()?).ok()?;
-                        let node = source.find(span)?;
-                        if matches!(node.kind(), SyntaxKind::Text | SyntaxKind::MathText)
-                            && (click.x - pos.x) > width / 2.0
-                        {
-                            resolved_offset += glyph.range().len();
-                        }
-                        return Some((span, resolved_offset));
-                    }
-                    pos.x += width;
-                }
-            }
-            FrameItem::Shape(shape, span) => {
-                let Geometry::Rect(size) = shape.geometry else {
-                    continue;
-                };
-                if is_in_rect(pos, size, click) {
-                    return Some((*span, 0));
-                }
-            }
-            FrameItem::Image(_, size, span) if is_in_rect(pos, *size, click) => {
-                return Some((*span, 0));
-            }
-            _ => {}
-        }
-    }
-
-    None
-}
-
-fn resolve_span_to_file_offset(
-    world: &crate::compiler::world::TypstWorld,
-    span: Span,
-    extra_offset: usize,
-) -> Option<(String, usize)> {
-    let source = world.source(span.id()?).ok()?;
-    let range = source.find(span)?.range();
-    let offset = range.start.saturating_add(extra_offset.min(range.len()));
-    let path = world.resolve_absolute_path(span.id()?)?;
-    Some((path.display().to_string(), offset))
-}
-
-fn is_in_rect(pos: Point, size: Size, click: Point) -> bool {
-    pos.x <= click.x && pos.x + size.x >= click.x && pos.y <= click.y && pos.y + size.y >= click.y
-}
-
-fn build_document_outline(
-    world: &crate::compiler::world::TypstWorld,
-    introspector: &Introspector,
-) -> Vec<OutlineItem> {
-    introspector
-        .query(&HeadingElem::ELEM.select())
-        .iter()
-        .filter_map(|elem| {
-            let heading = elem.to_packed::<HeadingElem>()?;
-            let bookmarked = heading
-                .bookmarked
-                .get(StyleChain::default())
-                .unwrap_or_else(|| heading.outlined.get(StyleChain::default()));
-            if !bookmarked {
-                return None;
-            }
-
-            let title = plain_outline_title(&heading.body);
-            if title.is_empty() {
-                return None;
-            }
-
-            let location = heading.location()?;
-            let doc_pos = introspector.position(location);
-            let span = effective_heading_span(&heading);
-            let (file, offset) =
-                resolve_span_to_file_offset(world, span, 0).unwrap_or((String::new(), 0));
-            let has_location = !file.is_empty();
-
-            Some(OutlineItem {
-                title,
-                level: heading.resolve_level(StyleChain::default()).get(),
-                file: has_location.then_some(file),
-                offset: has_location.then_some(offset),
-                position: Some(OutlinePosition {
-                    page: doc_pos.page.get(),
-                    x: doc_pos.point.x.to_pt(),
-                    y: doc_pos.point.y.to_pt(),
-                }),
-            })
-        })
-        .collect()
-}
-
-fn plain_outline_title(content: &Content) -> String {
-    content.plain_text().trim().to_string()
+    typst_core::ide::jump_from_click(&state, page, x, y)
 }
 
 // ── Font Discovery ──────────────────────────────────────────
 
-/// Return all font family names discovered by typst-kit's font searcher.
-/// Triggers font discovery if it hasn't run yet (uses the same global cache
-/// that the compiler uses, so there's no double-scan penalty).
 #[tauri::command]
 pub fn list_system_fonts() -> Vec<String> {
-    let fonts = crate::compiler::world::get_or_init_fonts();
-    let mut families: Vec<String> = fonts
-        .book
-        .families()
-        .map(|(name, _)| name.to_string())
-        .collect();
-    families.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-    families.dedup();
-    families
+    typst_core::fs::list_system_fonts()
 }
 
 // ── File System Operations ───────────────────────────────────
@@ -645,13 +305,4 @@ pub fn reveal_in_explorer(path: String) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-fn effective_heading_span(heading: &Packed<HeadingElem>) -> Span {
-    let span = heading.span();
-    if span.is_detached() {
-        heading.body.span()
-    } else {
-        span
-    }
 }

@@ -6,3 +6,6 @@ template
 .claude
 CLAUDE.md
 tinymist-main
+
+# Library crate: lock files are not committed
+crates/typst-core/Cargo.lock

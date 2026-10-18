@@ -1,0 +1,17 @@
+[package]
+name = "typst-core"
+version = "0.1.0"
+edition = "2021"
+description = "Typst compiler state, world and IDE helpers shared by the Tauri and GPUI front ends."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+typst = "0.14"
+typst-kit = { version = "0.14", features = ["embed-fonts"] }
+typst-svg = "0.14"
+typst-pdf = "0.14"
+typst-render = "0.14"
+typst-ide = "0.14"
+comemo = "0.4"
+chrono = { version = "0.4", features = ["clock"] }
+parking_lot = "0.12"
