@@ -102,8 +102,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
+          # `--notes-from-tag` falls back to the commit message when the tag
+          # object is not fetched; read the annotation from the tag itself and
+          # fall back to generated notes when the tag carries no message.
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          if notes=$(git tag -l --format='%(contents)' "$TAG") && [ -n "${notes//[[:space:]]/}" ]; then
+            printf '%s\n' "$notes" > notes.md
+          else
+            gh release create "$TAG" --generate-notes --verify-tag \
+              --title "字笺 · Typst ${TAG#gpui-v}" \
+              dist/*.zip dist/*.zip.sha256 dist/*-Setup.exe dist/*-Setup.exe.sha256
+            exit 0
+          fi
           gh release create "$TAG" \
             --verify-tag \
             --title "字笺 · Typst ${TAG#gpui-v}" \
-            --notes-from-tag \
+            --notes-file notes.md \
             dist/*.zip dist/*.zip.sha256 dist/*-Setup.exe dist/*-Setup.exe.sha256
