@@ -114,7 +114,10 @@ try {
     Copy-Item (Join-Path $PSScriptRoot 'languages\LICENSE.txt') "$stage\licenses\inno-chinese-MIT.txt"
 
     # Original license files of bundled components, located via cargo.
-    $metadataJson = & cargo metadata --locked --offline --format-version 1 --manifest-path gpui-app/Cargo.toml
+    # `cargo metadata` resolves packages for every target, so a clean runner
+    # must be allowed to download non-Windows entries; --locked still pins
+    # every version to Cargo.lock.
+    $metadataJson = & cargo metadata --locked --format-version 1 --manifest-path gpui-app/Cargo.toml
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
     $meta = $metadataJson | ConvertFrom-Json
     foreach ($crate in 'typst-assets', 'typst', 'gpui-pre', 'gpui-kit', 'gpui-kit-assets') {
