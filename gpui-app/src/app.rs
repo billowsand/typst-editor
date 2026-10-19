@@ -71,7 +71,14 @@ actions!(
         CopyDiagnostics,
         OpenLogFolder,
         OpenGuide,
-        About
+        About,
+        Quit,
+        HideApp,
+        HideOthers,
+        UnhideOthers,
+        MinimizeWindow,
+        ZoomWindow,
+        ToggleFullScreen
     ]
 );
 
@@ -161,6 +168,17 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("secondary-,", OpenSettings, None),
         KeyBinding::new("secondary-shift-e", ExportPdf, None),
         KeyBinding::new("f5", Recompile, None),
+    ]);
+
+    // macOS-only bindings: these keys are claimed by the native menu bar
+    // (Hide/Quit/window commands live there), so Windows keeps its own uses.
+    #[cfg(target_os = "macos")]
+    cx.bind_keys([
+        KeyBinding::new("secondary-q", Quit, None),
+        KeyBinding::new("secondary-h", HideApp, None),
+        KeyBinding::new("secondary-alt-h", HideOthers, None),
+        KeyBinding::new("secondary-m", MinimizeWindow, None),
+        KeyBinding::new("secondary-ctrl-f", ToggleFullScreen, None),
     ]);
 }
 
@@ -324,6 +342,8 @@ pub struct TypstEditorApp {
     pub(crate) notice: Option<String>,
     pub(crate) pending: Option<Pending>,
     pub(crate) panel: Option<Panel>,
+    /// The app is terminating; window-close checks must not run again.
+    quitting: bool,
     pub(crate) dialog_focus: FocusHandle,
     pub(crate) app_focus: FocusHandle,
     pub(crate) tabs_scroll: ScrollHandle,
@@ -433,7 +453,7 @@ impl TypstEditorApp {
         } else {
             Nav::Drafts
         };
-        Self {
+        let this = Self {
             compiler,
             editors: HashMap::new(),
             preview,
@@ -463,6 +483,7 @@ impl TypstEditorApp {
             notice: None,
             pending: None,
             panel: None,
+            quitting: false,
             dialog_focus: cx.focus_handle(),
             app_focus,
             tabs_scroll: ScrollHandle::new(),
@@ -483,7 +504,9 @@ impl TypstEditorApp {
             search_task: Task::ready(()),
             _watch_task,
             _subscriptions,
-        }
+        };
+        this.refresh_macos_menus(cx);
+        this
     }
 
     // ── Accessors ───────────────────────────────────────────
@@ -533,6 +556,13 @@ impl TypstEditorApp {
 
     pub(crate) fn recent_projects(&self) -> Vec<String> {
         self.settings.recent_projects.clone()
+    }
+
+    /// Rebuild the macOS menu bar from the current state (checked items,
+    /// recent projects). No-op on other platforms.
+    pub(crate) fn refresh_macos_menus(&self, cx: &App) {
+        #[cfg(target_os = "macos")]
+        crate::macos_menu::rebuild(self, cx);
     }
 
     // ── Settings and session ────────────────────────────────
@@ -708,6 +738,7 @@ impl TypstEditorApp {
             self.open_document(file.display().to_string(), window, cx);
         }
         self.persist();
+        self.refresh_macos_menus(cx);
         cx.notify();
     }
 
@@ -1190,6 +1221,14 @@ impl TypstEditorApp {
                     self.journal.remove(&path);
                 }
                 logging::info("exit");
+                #[cfg(target_os = "macos")]
+                {
+                    // Closing the window ends the app; quit() re-enters
+                    // `on_close_requested` with `quitting` already set.
+                    self.quitting = true;
+                    cx.quit();
+                }
+                #[cfg(not(target_os = "macos"))]
                 window.remove_window();
             }
             // Decisions with their own dialogs never reach here.
@@ -1284,18 +1323,32 @@ impl TypstEditorApp {
     }
 
     fn on_close_requested(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.ws.dirty_paths().is_empty() {
-            self.persist();
-            for path in self.journaled.drain() {
-                self.journal.remove(&path);
-            }
-            logging::info("exit");
+        if self.quitting {
             return true;
         }
-        self.pending = Some(Pending::CloseWindow);
-        self.dialog_focus.focus(window, cx);
-        cx.notify();
-        false
+        if !self.ws.dirty_paths().is_empty() {
+            self.pending = Some(Pending::CloseWindow);
+            self.dialog_focus.focus(window, cx);
+            cx.notify();
+            return false;
+        }
+        // Clean close. On macOS the app exits with its window: route through
+        // quit() so the terminating close passes this check via `quitting`.
+        self.persist();
+        for path in self.journaled.drain() {
+            self.journal.remove(&path);
+        }
+        logging::info("exit");
+        #[cfg(target_os = "macos")]
+        {
+            self.quitting = true;
+            cx.quit();
+            false
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            true
+        }
     }
 
     pub(crate) fn close_tab_now(
@@ -1828,6 +1881,7 @@ impl TypstEditorApp {
                 .update(cx, |state, cx| state.set_line_number(compact, window, cx));
         }
         self.persist();
+        self.refresh_macos_menus(cx);
         cx.notify();
     }
 

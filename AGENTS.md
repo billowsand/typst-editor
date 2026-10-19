@@ -43,6 +43,8 @@
   - `settings.rs`：`Settings`、`Session`、`path()`、`load_from()`、`save_to()`
 - 本地日志、崩溃报告、诊断信息；版本/提交号来自 `build.rs`
   - `logging.rs`：`init()`、`info()`/`warn()`/`error()`、`diagnostics()`、`log_dir()`
+- macOS 原生菜单栏与 Dock 右键菜单（仅 macOS 编译；菜单结构、快捷键来自 keymap，勾选态/最近项目变化后重建）
+  - `macos_menu.rs`：`install()`、`build()`、`rebuild()`
 - 预览：可见页位图化、适宽/缩放、点击跳源码、光标标记、页面密度上限
   - `preview.rs`：`PreviewPanel`、`page_density()`、`set_document()`、`set_markers()`、`on_page_click()`、`apply_fit_width()`、`visible_range()`、`schedule_rasterization()`
 - Typst 语法高亮（增量 `Source::edit`，只遍历可见范围）
@@ -247,10 +249,21 @@
 - 内嵌素材
   - `gpui-app/src/assets.rs`：`AppAssets`；生成脚本 `gpui-app/assets/gen/{textures.py,skin_svgs.py}`
 
+### 20. macOS 原生菜单与窗口生命周期
+
+- 原生菜单栏（字笺/文件/编辑/视图/文档/Window/帮助）与 Dock 右键菜单；快捷键由 `bind_keys` 的 `secondary-*` 自动生成；勾选态与最近项目变化后重建
+  - `gpui-app/src/macos_menu.rs`：`install()`、`build()`、`rebuild()`；重建触发 `gpui-app/src/app.rs`：`refresh_macos_menus()`
+- 关窗即退出：`quitting` 标记避免终止时重复弹确认；Cmd+Q / 菜单"退出字笺"复用未保存确认流程；Cmd+W 在无文稿时关窗口
+  - `gpui-app/src/app.rs`：`on_close_requested()`、`perform()`
+- 紧凑顶栏（40px，红绿灯垂直居中）与平台分流（Windows 保持 54px + 窗口内菜单）；标题栏拖拽与双击缩放
+  - `gpui-app/src/main.rs`（`traffic_light_position`）、`gpui-app/src/app/views.rs`：`render_titlebar()`、`drag_area()`
+
 ## 调试建议
 
 - 界面布局、卡片、文件树、稿纸、状态栏问题
   - `gpui-app/src/app/views.rs`、`gpui-app/src/skin.rs`、`gpui-app/src/theme.rs`
+- macOS 菜单栏、Dock 菜单、关窗/退出、标题栏拖拽问题
+  - `gpui-app/src/macos_menu.rs`、`gpui-app/src/app.rs`（`on_close_requested` / `perform`）、`gpui-app/src/app/views.rs`（`render_titlebar` / `drag_area`）
 - 会话 / 标签 / 保存 / 冲突逻辑
   - `gpui-app/src/app.rs`、`gpui-app/src/workspace.rs`、`gpui-app/src/files.rs`
 - 编译结果异常、缓存不生效、旧结果回写

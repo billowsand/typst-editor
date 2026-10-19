@@ -1,7 +1,9 @@
 //! The desk: walnut title bar, sidebar (search, cards or file tree, outline),
 //! the notepad with its banners, the preview column and the status strip.
 
+use std::cell::Cell;
 use std::path::Path;
+use std::rc::Rc;
 
 use gpui_kit::component::input::{Editor, Input};
 use gpui_kit::component::list::ListItem;
@@ -9,6 +11,7 @@ use gpui_kit::component::menu::DropdownMenu;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::tree::tree;
 use gpui_kit::component::{Sizable, h_flex, v_flex};
+use gpui_kit::base::InteractiveElementExt;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
@@ -106,6 +109,8 @@ impl TypstEditorApp {
     }
 
     fn render_title(&self, cx: &App) -> impl IntoElement {
+        let macos = cfg!(target_os = "macos");
+        let tri = if macos { 12. } else { 14. };
         let docs: Vec<(String, String)> = self
             .cards
             .iter()
@@ -114,15 +119,15 @@ impl TypstEditorApp {
         bar_button("title-menu", cx)
             .compact()
             .px_3()
-            .h(px(36.))
+            .h(px(if macos { 28. } else { 36. }))
             .child(
                 h_flex()
                     .gap_2()
                     .child(
                         div()
-                            .max_w(px(360.))
+                            .max_w(px(if macos { 320. } else { 360. }))
                             .overflow_hidden()
-                            .text_size(px(19.))
+                            .text_size(px(if macos { 15. } else { 19. }))
                             .font_weight(FontWeight::BOLD)
                             .child(embossed(self.title_text())),
                     )
@@ -130,20 +135,20 @@ impl TypstEditorApp {
                     .child(
                         div()
                             .relative()
-                            .size(px(14.))
+                            .size(px(tri))
                             .child(
                                 svg()
                                     .path("skin/g_triangle.svg")
                                     .absolute()
                                     .top(px(1.))
-                                    .size(px(14.))
+                                    .size(px(tri))
                                     .text_color(rgba(0xfff0dc33)),
                             )
                             .child(
                                 svg()
                                     .path("skin/g_triangle.svg")
                                     .absolute()
-                                    .size(px(14.))
+                                    .size(px(tri))
                                     .text_color(rgb(0x51423a)),
                             ),
                     ),
@@ -161,14 +166,46 @@ impl TypstEditorApp {
             })
     }
 
-    fn render_titlebar(&self, cx: &App) -> impl IntoElement {
+    /// Empty title-bar space that drags the window. Windows and Linux let
+    /// the platform hit-test it; macOS owns the drag itself (the window
+    /// options set `app_owns_titlebar_drag`), and double-click follows the
+    /// system title-bar preference.
+    fn drag_area(&self, id: &'static str) -> Stateful<Div> {
+        let area = div().id(id).flex_1().h_full();
+        if cfg!(target_os = "macos") {
+            let should_move = Rc::new(Cell::new(false));
+            let down = should_move.clone();
+            let up = should_move.clone();
+            let leave = should_move.clone();
+            area.on_mouse_down(MouseButton::Left, move |_, _, _| down.set(true))
+                .on_mouse_up(MouseButton::Left, move |_, _, _| up.set(false))
+                .on_mouse_down_out(move |_, _, _| leave.set(false))
+                .on_mouse_move(move |_, window, _| {
+                    if should_move.get() {
+                        should_move.set(false);
+                        window.start_window_move();
+                    }
+                })
+                .on_double_click(|_, window, _| window.titlebar_double_click())
+        } else {
+            area.window_control_area(WindowControlArea::Drag)
+        }
+    }
+
+    fn render_titlebar(&self, window: &mut Window, cx: &App) -> impl IntoElement {
+        let macos = cfg!(target_os = "macos");
+        // macOS gets a compact bar under the native menu bar; Windows keeps
+        // the chunky walnut strip with the in-window menus.
+        let tool_size = if macos { 28. } else { 34. };
+        let glyph_size = if macos { 15. } else { 19. };
+        let tip = |mac: &'static str, win: &'static str| if macos { mac } else { win };
         let tool =
             |id: &'static str, glyph: &'static str, tip: &'static str, action: Box<dyn Action>| {
                 bar_button(id, cx)
                     .compact()
-                    .size(px(34.))
+                    .size(px(tool_size))
                     .tooltip(tip)
-                    .child(bar_glyph(glyph, 19.))
+                    .child(bar_glyph(glyph, glyph_size))
                     .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
             };
         let window_button = |id: &'static str, glyph: &'static str, area: WindowControlArea| {
@@ -189,8 +226,10 @@ impl TypstEditorApp {
                 })
                 .child(bar_glyph(glyph, 14.))
         };
+        // In macOS fullscreen the traffic lights are hidden with the menu bar.
+        let left_pad = if macos && !window.is_fullscreen() { 78. } else { 12. };
 
-        walnut_bar(54.).child(
+        walnut_bar(if macos { 40. } else { 54. }).child(
             h_flex()
                 .relative()
                 .size_full()
@@ -198,23 +237,18 @@ impl TypstEditorApp {
                     h_flex()
                         .flex_1()
                         .h_full()
-                        .pl_3()
+                        .pl(px(left_pad))
                         .gap_2()
-                        .child(skin("notebook", 26., 26.))
+                        .child(skin("notebook", if macos { 20. } else { 26. }, if macos { 20. } else { 26. }))
                         .child(
                             div()
                                 .mr_2()
-                                .text_size(px(15.))
+                                .text_size(px(if macos { 13. } else { 15. }))
                                 .font_weight(FontWeight::BOLD)
                                 .child(embossed("字笺")),
                         )
-                        .child(self.render_menus(cx))
-                        .child(
-                            div()
-                                .flex_1()
-                                .h_full()
-                                .window_control_area(WindowControlArea::Drag),
-                        ),
+                        .when(!macos, |left| left.child(self.render_menus(cx)))
+                        .child(self.drag_area("title-drag-left")),
                 )
                 .child(self.render_title(cx))
                 .child(
@@ -222,25 +256,25 @@ impl TypstEditorApp {
                         .flex_1()
                         .h_full()
                         .gap_1()
-                        .child(
-                            div()
-                                .flex_1()
-                                .h_full()
-                                .window_control_area(WindowControlArea::Drag),
-                        )
+                        .child(self.drag_area("title-drag-right"))
                         .child(tool(
                             "tool-new",
                             "compose",
-                            "新建文稿  Ctrl+N",
+                            tip("新建文稿  ⌘N", "新建文稿  Ctrl+N"),
                             Box::new(NewDocument),
                         ))
                         .child(tool(
                             "tool-open",
                             "folder",
-                            "打开文件夹  Ctrl+Shift+O",
+                            tip("打开文件夹  ⌘⇧O", "打开文件夹  Ctrl+Shift+O"),
                             Box::new(OpenFolder),
                         ))
-                        .child(tool("tool-save", "disk", "保存  Ctrl+S", Box::new(Save)))
+                        .child(tool(
+                            "tool-save",
+                            "disk",
+                            tip("保存  ⌘S", "保存  Ctrl+S"),
+                            Box::new(Save),
+                        ))
                         .child(tool(
                             "tool-compile",
                             "compile",
@@ -250,14 +284,14 @@ impl TypstEditorApp {
                         .child(tool(
                             "tool-export",
                             "plane",
-                            "导出 PDF  Ctrl+Shift+E",
+                            tip("导出 PDF  ⌘⇧E", "导出 PDF  Ctrl+Shift+E"),
                             Box::new(ExportPdf),
                         ))
-                        .child(groove_v(24.).mx_1())
+                        .child(groove_v(if macos { 18. } else { 24. }).mx_1())
                         .child(tool(
                             "tool-sidebar",
                             "sidebar",
-                            "文稿栏  Ctrl+B",
+                            tip("文稿栏  ⌘B", "文稿栏  Ctrl+B"),
                             Box::new(ToggleSidebar),
                         ))
                         .when(cfg!(target_os = "windows"), |bar| {
@@ -1762,6 +1796,9 @@ impl Render for TypstEditorApp {
             .on_action(cx.listener(|this, _: &CloseTab, w, cx| {
                 if let Some(active) = this.active() {
                     this.request(Pending::CloseTab(active), w, cx);
+                } else {
+                    // No tab left: close the window (Cmd+W a second time).
+                    this.request(Pending::CloseWindow, w, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &Find, w, cx| this.open_search(false, w, cx)))
@@ -1860,12 +1897,14 @@ impl Render for TypstEditorApp {
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.show_sidebar = !this.show_sidebar;
                 this.persist();
+                this.refresh_macos_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleOutline, _, cx| {
                 this.show_sidebar = true;
                 this.outline_open = !this.outline_open;
                 this.persist();
+                this.refresh_macos_menus(cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ToggleCompact, window, cx| {
@@ -1898,6 +1937,21 @@ impl Render for TypstEditorApp {
                 this.show_about = !this.show_about;
                 cx.notify();
             }))
+            // The native macOS menu bar routes here too; on other platforms
+            // these simply have no key bindings and no in-window menu items.
+            .on_action(cx.listener(|this, _: &Quit, w, cx| {
+                this.request(Pending::CloseWindow, w, cx)
+            }))
+            .on_action(cx.listener(|_, _: &HideApp, _, cx| cx.hide()))
+            .on_action(cx.listener(|_, _: &HideOthers, _, cx| cx.hide_other_apps()))
+            .on_action(cx.listener(|_, _: &UnhideOthers, _, cx| cx.unhide_other_apps()))
+            .on_action(cx.listener(|_, _: &MinimizeWindow, window, _| {
+                window.minimize_window()
+            }))
+            .on_action(cx.listener(|_, _: &ZoomWindow, window, _| window.zoom_window()))
+            .on_action(cx.listener(|_, _: &ToggleFullScreen, window, _| {
+                window.toggle_fullscreen()
+            }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
                 if this.pending.is_none() {
                     this.show_settings = true;
@@ -1913,7 +1967,7 @@ impl Render for TypstEditorApp {
                 this.preview.update(cx, |p, cx| p.set_fit_width(cx));
                 cx.notify();
             }))
-            .child(self.render_titlebar(cx))
+            .child(self.render_titlebar(_window, cx))
             .child(
                 div()
                     .relative()

@@ -7,6 +7,8 @@ mod files;
 mod highlight;
 mod logging;
 mod lsp;
+#[cfg(target_os = "macos")]
+mod macos_menu;
 mod preview;
 mod recovery;
 mod settings;
@@ -41,11 +43,16 @@ fn main() {
             theme::install(cx);
             app::bind_keys(cx);
             cx.activate(true);
+            #[cfg(target_os = "macos")]
+            macos_menu::install(cx);
 
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1440.), px(900.)), cx)),
                 titlebar: Some(TitlebarOptions {
                     title: Some("字笺 · Typst".into()),
+                    #[cfg(target_os = "macos")]
+                    // Vertically center the traffic lights in the 40px bar.
+                    traffic_light_position: Some(point(px(10.), px(12.))),
                     ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
                 window_min_size: Some(size(px(960.), px(640.))),
