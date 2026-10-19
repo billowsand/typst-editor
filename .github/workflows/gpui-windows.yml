@@ -68,6 +68,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - name: Check tag matches Cargo.toml version
         shell: bash
         env:
