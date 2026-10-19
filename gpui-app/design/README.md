@@ -121,7 +121,7 @@ python skin_svgs.py ../skin
 | 卡片元素 id 按序号，置顶后悬停状态错位 | 改为按路径 | — |
 | 扫描期间显示“还没有文稿” | 扫描中显示“正在读取项目…” | — |
 | 窗口创建失败时发布版无任何痕迹 | 写入日志后退出 | — |
-| `AGENTS.md` 仍写 CodeMirror | 改为 Monaco / `MonacoEditor.ts`，函数索引按实际代码更正 | — |
+| `AGENTS.md` 仍写 CodeMirror | Tauri + Monaco 版本已删除，`AGENTS.md` 重写为纯 Rust（GPUI + typst-core）索引，函数索引按实际代码更正 | — |
 
 ## 已知限制
 

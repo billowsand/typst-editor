@@ -2,7 +2,7 @@
 name = "typst-core"
 version = "0.1.0"
 edition = "2021"
-description = "Typst compiler state, world and IDE helpers shared by the Tauri and GPUI front ends."
+description = "Typst compiler state, world and IDE helpers used by the GPUI editor."
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

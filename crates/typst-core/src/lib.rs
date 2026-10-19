@@ -1,4 +1,4 @@
-//! Typst compiler core shared by the Tauri and GPUI front ends.
+//! Typst compiler core used by the GPUI editor.
 //!
 //! - [`compiler`]: compiler state, overlays, incremental compile and page cache.
 //! - [`world`]: `typst::World` implementation, project root discovery, fonts.
