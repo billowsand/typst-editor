@@ -302,9 +302,18 @@ mod tests {
     #[test]
     fn paths_are_normalized() {
         let mut ws = Workspace::default();
-        ws.open(r"E:\p\chapters/intro.typ", text("x")).unwrap();
-        assert!(ws.is_active(r"E:\p\chapters\intro.typ"));
-        assert!(ws.buffer("E:/p/chapters/intro.typ").is_some() || cfg!(not(windows)));
+        #[cfg(windows)]
+        {
+            ws.open(r"E:\p\chapters/intro.typ", text("x")).unwrap();
+            assert!(ws.is_active(r"E:\p\chapters\intro.typ"));
+            assert!(ws.buffer("E:/p/chapters/intro.typ").is_some());
+        }
+        #[cfg(not(windows))]
+        {
+            ws.open("p/chapters/./intro.typ", text("x")).unwrap();
+            assert!(ws.is_active("p/chapters/intro.typ"));
+            assert!(ws.buffer("p/chapters/intro.typ").is_some());
+        }
         assert_eq!(ws.tabs().count(), 1);
     }
 
