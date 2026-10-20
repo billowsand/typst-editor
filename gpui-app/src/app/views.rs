@@ -108,9 +108,8 @@ impl TypstEditorApp {
             }))
     }
 
-    fn render_title(&self, cx: &App) -> impl IntoElement {
-        let macos = cfg!(target_os = "macos");
-        let tri = if macos { 12. } else { 14. };
+    fn render_title(&self, max_width: f32, cx: &App) -> impl IntoElement {
+        let tri = 10.;
         let docs: Vec<(String, String)> = self
             .cards
             .iter()
@@ -118,18 +117,19 @@ impl TypstEditorApp {
             .collect();
         bar_button("title-menu", cx)
             .compact()
-            .px_3()
-            .h(px(if macos { 28. } else { 36. }))
+            .px_2()
+            .h(px(28.))
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap(px(6.))
                     .child(
                         div()
-                            .max_w(px(if macos { 320. } else { 360. }))
-                            .overflow_hidden()
-                            .text_size(px(if macos { 15. } else { 19. }))
-                            .font_weight(FontWeight::BOLD)
-                            .child(embossed(self.title_text())),
+                            .max_w(px(max_width))
+                            .truncate()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(CREAM))
+                            .child(self.title_text()),
                     )
                     // Smartisan's recessed folder triangle.
                     .child(
@@ -194,10 +194,13 @@ impl TypstEditorApp {
 
     fn render_titlebar(&self, window: &mut Window, cx: &App) -> impl IntoElement {
         let macos = cfg!(target_os = "macos");
-        // macOS gets a compact bar under the native menu bar; Windows keeps
-        // the chunky walnut strip with the in-window menus.
-        let tool_size = if macos { 28. } else { 34. };
-        let glyph_size = if macos { 15. } else { 19. };
+        // Keep the walnut chrome quiet: menus, title and tools share one scale.
+        let tool_size = 28.;
+        let glyph_size = 15.;
+        // Reserve room for menus and tools before sizing the centered title.
+        let title_width = (f32::from(window.viewport_size().width)
+            - if macos { 540. } else { 740. })
+            .clamp(120., 360.);
         let tip = |mac: &'static str, win: &'static str| if macos { mac } else { win };
         let tool =
             |id: &'static str, glyph: &'static str, tip: &'static str, action: Box<dyn Action>| {
@@ -229,7 +232,7 @@ impl TypstEditorApp {
         // In macOS fullscreen the traffic lights are hidden with the menu bar.
         let left_pad = if macos && !window.is_fullscreen() { 78. } else { 12. };
 
-        walnut_bar(if macos { 40. } else { 54. }).child(
+        walnut_bar(38.).child(
             h_flex()
                 .relative()
                 .size_full()
@@ -239,18 +242,18 @@ impl TypstEditorApp {
                         .h_full()
                         .pl(px(left_pad))
                         .gap_2()
-                        .child(skin("notebook", if macos { 20. } else { 26. }, if macos { 20. } else { 26. }))
+                        .child(skin("notebook", 20., 20.))
                         .child(
                             div()
                                 .mr_2()
-                                .text_size(px(if macos { 13. } else { 15. }))
+                                .text_size(px(13.))
                                 .font_weight(FontWeight::BOLD)
                                 .child(embossed("字笺")),
                         )
                         .when(!macos, |left| left.child(self.render_menus(cx)))
                         .child(self.drag_area("title-drag-left")),
                 )
-                .child(self.render_title(cx))
+                .child(self.render_title(title_width, cx))
                 .child(
                     h_flex()
                         .flex_1()
@@ -287,7 +290,7 @@ impl TypstEditorApp {
                             tip("导出 PDF  ⌘⇧E", "导出 PDF  Ctrl+Shift+E"),
                             Box::new(ExportPdf),
                         ))
-                        .child(groove_v(if macos { 18. } else { 24. }).mx_1())
+                        .child(groove_v(18.).mx_1())
                         .child(tool(
                             "tool-sidebar",
                             "sidebar",

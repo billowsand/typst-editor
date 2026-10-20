@@ -51,8 +51,8 @@ fn main() {
                 titlebar: Some(TitlebarOptions {
                     title: Some("字笺 · Typst".into()),
                     #[cfg(target_os = "macos")]
-                    // Vertically center the traffic lights in the 40px bar.
-                    traffic_light_position: Some(point(px(10.), px(12.))),
+                    // Vertically center the traffic lights in the 38px bar.
+                    traffic_light_position: Some(point(px(10.), px(11.))),
                     ..gpui_kit::component::TitleBar::title_bar_options()
                 }),
                 window_min_size: Some(size(px(960.), px(640.))),
