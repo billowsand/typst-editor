@@ -26,6 +26,19 @@ const EDITOR_TOP_PAD: f32 = 4.;
 /// Height of a row on lined cards (outline, file tree, dialogs).
 pub(super) const ROW_H: f32 = 30.;
 
+/// Bound dynamic menu labels before layout; PopupMenu's outer max width alone
+/// does not clip its default text item. Keep the full label available on hover.
+fn path_menu_label(label: String, window: &Window) -> impl IntoElement + use<> {
+    let width = (f32::from(window.viewport_size().width) - 64.).clamp(160., 440.);
+    div()
+        .id(SharedString::from(label.clone()))
+        .w(px(width))
+        .min_w_0()
+        .truncate()
+        .child(label.clone())
+        .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+}
+
 impl TypstEditorApp {
     // ── Title bar ───────────────────────────────────────────
 
@@ -57,7 +70,10 @@ impl TypstEditorApp {
                             .file_name()
                             .map(|n| format!("{}    {root}", n.to_string_lossy()))
                             .unwrap_or_else(|| root.clone());
-                        m = m.menu(label, Box::new(OpenRecent { root: root.clone() }));
+                        m = m.menu_element(
+                            Box::new(OpenRecent { root: root.clone() }),
+                            move |window, _| path_menu_label(label.clone(), window),
+                        );
                     }
                 }
                 m.separator()
@@ -155,7 +171,11 @@ impl TypstEditorApp {
             )
             .dropdown_menu(move |mut m, _, _| {
                 for (path, label) in &docs {
-                    m = m.menu(label.clone(), Box::new(OpenDocument { path: path.clone() }));
+                    let label = label.clone();
+                    m = m.menu_element(
+                        Box::new(OpenDocument { path: path.clone() }),
+                        move |window, _| path_menu_label(label.clone(), window),
+                    );
                 }
                 if !docs.is_empty() {
                     m = m.separator();
@@ -1160,9 +1180,10 @@ impl TypstEditorApp {
                         .child(paper_glyph("triangle", 12., 0x9c8f7e))
                         .dropdown_menu(move |mut m, _, _| {
                             for (path, label) in &menu_items {
-                                m = m.menu(
-                                    label.clone(),
+                                let label = label.clone();
+                                m = m.menu_element(
                                     Box::new(OpenDocument { path: path.clone() }),
+                                    move |window, _| path_menu_label(label.clone(), window),
                                 );
                             }
                             m
